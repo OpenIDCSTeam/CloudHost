@@ -290,3 +290,85 @@ jobs:
             dist/checksums.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================================
+  # opidcs 桌面客户端（Tauri：Windows NSIS / Linux AppImage / macOS app+dmg）
+  # ==========================================================================
+  build-gui:
+    needs: [prepare, release]
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            triple: x86_64-pc-windows-msvc
+            goos: windows
+            goarch: amd64
+            ext: .exe
+            args: --target x86_64-pc-windows-msvc --bundles nsis
+          - runner: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+            goos: linux
+            goarch: amd64
+            ext: ""
+            args: --bundles appimage
+          - runner: macos-latest
+            triple: aarch64-apple-darwin
+            goos: darwin
+            goarch: arm64
+            ext: ""
+            args: --target aarch64-apple-darwin --bundles app,dmg
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: tools/opidcs-gui/package-lock.json
+
+      - name: Install Linux dependencies
+        if: matrix.runner == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - name: Install frontend dependencies
+        working-directory: tools/opidcs-gui
+        run: npm ci
+
+      - name: Generate icons
+        working-directory: tools/opidcs-gui
+        run: npm run icon
+
+      - name: Build opidcs sidecar
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tools/opidcs-gui/src-tauri/binaries
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags "-s -w -X github.com/OpenIDCSTeam/HostAgent-Go/internal/cli/version.Version=${{ needs.prepare.outputs.version }}" \
+            -o "tools/opidcs-gui/src-tauri/binaries/opidcs-${{ matrix.triple }}${{ matrix.ext }}" ./cmd/opidcs
+
+      - name: Build desktop client and upload
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: tools/opidcs-gui
+          tagName: ${{ needs.prepare.outputs.tag }}
+          releaseName: ${{ needs.prepare.outputs.tag }}
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          includeUpdaterJson: false
+          args: ${{ matrix.args }}
