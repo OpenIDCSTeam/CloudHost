@@ -2,14 +2,17 @@
 package api
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -182,6 +185,10 @@ func (app *App) handleVMDetail(c *gin.Context) {
 		return
 	}
 
+	// 存量虚拟机可能没有 vc_pass（早期创建时未保存），
+	// 详情页「远程密码」不应为空，这里补齐一次。
+	app.ensureVMVncPassword(hsName, vmUUID, vm)
+
 	view := app.buildVMView(hsName, vmUUID, vm, uc)
 	view["current_user"] = uc.Username
 	utils.Success(c, view)
@@ -247,6 +254,37 @@ func (app *App) handleVMCreate(c *gin.Context) {
 	}
 	if v, ok := req["speed_d"]; ok {
 		cfg.SpeedD = toIntVal(v)
+	}
+
+	// 系统账号与密码：原实现完全没有解析这两个字段，
+	// 创建出来的虚拟机 os_pass / vc_pass 恒为空，
+	// 表现为「创建时填了密码，详情里却没有」。
+	if v, ok := req["os_user"].(string); ok && strings.TrimSpace(v) != "" {
+		cfg.OsUser = strings.TrimSpace(v)
+	}
+	for _, key := range []string{"os_pass", "password", "vm_password"} {
+		if v, ok := req[key].(string); ok && v != "" {
+			cfg.OsPass = v
+			break
+		}
+	}
+	if cfg.OsPass == "" {
+		// 前端提示「留空自动生成密码」，这里落实该承诺，
+		// 避免创建出来的虚拟机既没有账号密码也没有可展示的初始口令。
+		cfg.OsPass = generateVNCPassword()
+	}
+
+	// VNC 密码：未显式指定时按规则生成，避免详情页/控制台出现空口令
+	if v, ok := req["vc_pass"].(string); ok && strings.TrimSpace(v) != "" {
+		cfg.VcPass = strings.TrimSpace(v)
+	} else {
+		cfg.VcPass = generateVNCPassword()
+	}
+	switch v := req["vc_port"].(type) {
+	case string:
+		cfg.VcPort = strings.TrimSpace(v)
+	case float64:
+		cfg.VcPort = strconv.Itoa(int(v))
 	}
 
 	// 补全网卡、NAT、反向代理等字段（从请求中解析）
@@ -541,7 +579,11 @@ func (app *App) handleVMPowers(c *gin.Context) {
 		return
 	}
 
-	action := model.VMPowers(req.Action)
+	action, ok := normalizePowerAction(req.Action)
+	if !ok {
+		utils.BadRequest(c, fmt.Sprintf("不支持的电源操作: %s", req.Action))
+		return
+	}
 	result, err := d.PowerControl(vmUUID, action)
 	if err != nil {
 		app.logEvent(c, "vm", "电源操作").Host(hsName).VM(vmUUID, "").
@@ -580,6 +622,35 @@ func (app *App) handleVMPowers(c *gin.Context) {
 		Detail("power_action", string(action)).
 		Info("虚拟机电源操作已执行：%s", action)
 	utils.SuccessMsg(c, "电源操作已执行", nil)
+}
+
+// normalizePowerAction 把外部传入的电源操作归一化为驱动使用的指令常量。
+//
+// 驱动（Proxmox / Hyper-V / 青州云 等）只认 model 里的 S_START / S_CLOSE /
+// S_RESET / H_CLOSE / H_RESET / A_PAUSE / A_WAKED；而前端部分页面发送的是
+// 语义值（start / stop / hard_stop / reset / pause / resume），直接透传会
+// 全部落到驱动的 default 分支，报「不支持的电源操作」。
+//
+// 归一化放在 API 入口而不是各驱动内：所有调用方（前端各页面、第三方 API）
+// 都会经过这里，避免逐平台重复实现、也避免新驱动再踩同一个坑。
+func normalizePowerAction(raw string) (model.VMPowers, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "s_start", "start", "on", "boot", "poweron":
+		return model.VMPowerSStart, true
+	case "s_close", "stop", "shutdown", "poweroff":
+		return model.VMPowerSClose, true
+	case "h_close", "hard_stop", "hardstop", "force_stop", "forceshutdown":
+		return model.VMPowerHClose, true
+	case "s_reset", "reset", "reboot":
+		return model.VMPowerSReset, true
+	case "h_reset", "hard_reset", "hardreset", "force_reset", "forcereset":
+		return model.VMPowerHReset, true
+	case "a_pause", "pause", "suspend":
+		return model.VMPowerAPause, true
+	case "a_waked", "resume", "wake":
+		return model.VMPowerAWaked, true
+	}
+	return model.VMPowerUnknown, false
 }
 
 // handleVMRemote GET /api/client/remote/:hs_name/:vm_uuid
@@ -647,12 +718,35 @@ func (app *App) handleVMRemote(c *gin.Context) {
 
 	// 拼装 noVNC 控制台地址
 	if _, ok := out["console_url"]; !ok {
-		if consoleURL := app.buildConsoleURL(d, hsName, vmUUID, results); consoleURL != "" {
+		if consoleURL := app.buildConsoleURL(c, d, hsName, vmUUID, results); consoleURL != "" {
 			out["console_url"] = consoleURL
 		}
 	}
 
+	// 仍然没有地址时给出可读原因：前端统一提示「地址无效」会把
+	// 「平台只提供命令行控制台」和「VNC 未启用」混为一谈，难以排查。
+	if _, ok := out["console_url"]; !ok {
+		out["console_error"] = consoleUnavailableReason(results)
+	}
+
 	utils.Success(c, out)
+}
+
+// consoleUnavailableReason 说明为什么没有可用的图形控制台地址。
+func consoleUnavailableReason(results map[string]interface{}) string {
+	typ, _ := results["type"].(string)
+	switch strings.ToLower(typ) {
+	case "tty":
+		return "该平台仅提供命令行控制台，请使用终端入口"
+	case "vmconnect":
+		return "Hyper-V 需使用 VMConnect 客户端连接，浏览器控制台不可用"
+	case "vmrc", "webmks":
+		return "ESXi 需使用 VMRC 客户端连接，浏览器控制台不可用"
+	}
+	if toPortInt(results["port"]) <= 0 {
+		return "平台未返回可用的控制台端口，请确认虚拟机已启用 VNC"
+	}
+	return "无法生成控制台地址"
 }
 
 // consoleHostFromRequest 推导控制台对外可访问的主机名。
@@ -682,8 +776,13 @@ func consoleHostFromRequest(c *gin.Context, cfg *model.HSConfig) string {
 // buildConsoleURL 组装 noVNC 访问地址（与 Python VMRemote 行为一致）。
 //
 // 当驱动直接给出了可用地址（Results.url / console_url）时优先采用；
-// 否则依据 remote_port + VNC 主机端口注册一次性 token 并拼装。
-func (app *App) buildConsoleURL(d driver.HostDriver, hsName, vmUUID string, results map[string]interface{}) string {
+// 否则依据 host + port 注册一次性 token 并拼装。
+//
+// port 的取值类型在各驱动间并不统一：Proxmox 返回命名类型
+// proxmox.StringOrInt、ESXi 返回 int32、部分驱动返回字符串。
+// 早期只认 int/int64/float64，这些平台的地址会恒为空，
+// 前端表现为「获取的控制台地址无效」，因此统一走 toPortInt。
+func (app *App) buildConsoleURL(c *gin.Context, d driver.HostDriver, hsName, vmUUID string, results map[string]interface{}) string {
 	// 1. 驱动已给出完整地址
 	for _, key := range []string{"console_url", "url"} {
 		if v, ok := results[key].(string); ok && strings.HasPrefix(v, "http") {
@@ -691,33 +790,136 @@ func (app *App) buildConsoleURL(d driver.HostDriver, hsName, vmUUID string, resu
 		}
 	}
 
+	// ESXi 的票据走 WebMKS（wss），websockify 只能做 TCP→VNC 转发，
+	// 拼出 noVNC 地址只会得到黑屏，如实交给 console_error 说明限制。
+	if typ, _ := results["type"].(string); strings.EqualFold(typ, "vmrc") || strings.EqualFold(typ, "webmks") {
+		return ""
+	}
+
 	cfg := d.GetConfig()
-	host, port := "", 0
+
+	// Proxmox：走官方 vncwebsocket 通道。
+	// vncproxy 返回的端口只绑在节点本地，且该通道用 ticket 鉴权、
+	// 不需要（也没有）VNC 密码。原实现按裸 TCP 连接这个端口，
+	// 并把这串 ticket 当作 VNC 密码塞给 noVNC，
+	// 表现为「连不上」或「no valid credentials available」。
+	if typ, _ := results["type"].(string); strings.EqualFold(typ, "proxmox") {
+		apiHost := strings.TrimSpace(strOf(results["api_host"]))
+		node := strings.TrimSpace(strOf(results["node"]))
+		vmid := toPortInt(results["vmid"])
+		cookie := strOf(results["cookie"])
+		csrf := strOf(results["csrf"])
+		if apiHost == "" || node == "" || vmid <= 0 || cookie == "" {
+			return ""
+		}
+		token := registerPVEVNCToken(hsName, vmUUID, apiHost, node, vmid, cookie, csrf)
+		return composeConsoleURL("http", consoleHostFromRequest(c, cfg), vncProxyPort, token, "")
+	}
+
+	host := ""
 	if v, ok := results["host"].(string); ok {
-		host = v
+		host = strings.TrimSpace(v)
 	}
-	switch v := results["port"].(type) {
-	case int:
-		port = v
-	case int64:
-		port = int(v)
-	case float64:
-		port = int(v)
+	// 驱动未给 host 时退回主机地址：这里是后端连接 VNC 服务的目标，
+	// 与浏览器访问 6080 用的 consoleHost 不是同一个视角。
+	if host == "" && cfg != nil {
+		host = strings.TrimSpace(cfg.ServerAddr)
 	}
+	port := toPortInt(results["port"])
 	if host == "" || port <= 0 {
 		return ""
 	}
 
-	// VNC 代理端口：默认 6080（与 cmd/server/main.go 中 NewVNCProxyServer(6080) 一致）
-	proxyPort := vncProxyPort
-	scheme := "http"
-	consoleHost := consoleHostFromRequest(nil, cfg)
+	// 其余平台（QEMU/VirtualBox 等）直连裸 VNC 端口，密码可能必需
+	password := ""
+	for _, key := range []string{"password", "ticket"} {
+		if v, ok := results[key].(string); ok && v != "" {
+			password = v
+			break
+		}
+	}
 
 	// 注册一次性 token，供 6080 的 /websockify 校验
 	token := registerVNCBridgeToken(hsName, vmUUID, host, port)
+	return composeConsoleURL("http", consoleHostFromRequest(c, cfg), vncProxyPort, token, password)
+}
 
-	return fmt.Sprintf("%s://%s:%d/vnc.html?autoconnect=true&path=websockify&token=%s",
-		scheme, consoleHost, proxyPort, token)
+// generateVNCPassword 生成 8 位随机 VNC 密码（去掉易混淆字符）。
+func generateVNCPassword() string {
+	const alphabet = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789"
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%08d", time.Now().UnixNano()%100000000)
+	}
+	for i := range buf {
+		buf[i] = alphabet[int(buf[i])%len(alphabet)]
+	}
+	return string(buf)
+}
+
+// strOf 取字符串结果字段（不存在时返回空串）。
+func strOf(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+// composeConsoleURL 拼接 noVNC 页面地址。
+//
+// token 必须拼进 path（即 `path=websockify?token=xxx`）而不是作为独立查询参数：
+// noVNC 只把 path 当 WebSocket 路径透传，独立参数不会进入握手请求，
+// 6080 的 /websockify 收不到 token 会直接 401，表现为「VNC 页面能打开但连不上」。
+// 这与 Python 版 get_url 的形式一致。
+func composeConsoleURL(scheme, host string, proxyPort int, token, password string) string {
+	// 只对整段 path 做一次编码：token 在内层再次编码会变成双重转义，
+	// noVNC 解出来就不是原始 token 了。
+	wsPath := "websockify"
+	if token != "" {
+		wsPath += "?token=" + token
+	}
+	u := fmt.Sprintf("%s://%s:%d/vnc.html?autoconnect=true&path=%s",
+		scheme, host, proxyPort, url.QueryEscape(wsPath))
+	if password != "" {
+		u += "&password=" + url.QueryEscape(password)
+	}
+	return u
+}
+
+// toPortInt 把驱动返回的端口值统一转成 int，无法识别或非正数时返回 0。
+// 用 reflect 覆盖所有整数种类与命名类型（如 proxmox.StringOrInt、int32），
+// 否则这些平台拼不出控制台地址。
+func toPortInt(v interface{}) int {
+	switch n := v.(type) {
+	case nil:
+		return 0
+	case string:
+		if p, err := strconv.Atoi(strings.TrimSpace(n)); err == nil && p > 0 {
+			return p
+		}
+		return 0
+	}
+
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if p := rv.Int(); p > 0 {
+			return int(p)
+		}
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if p := rv.Uint(); p > 0 {
+			return int(p)
+		}
+	case reflect.Float32, reflect.Float64:
+		if p := rv.Float(); p > 0 {
+			return int(p)
+		}
+	case reflect.String:
+		if p, err := strconv.Atoi(strings.TrimSpace(rv.String())); err == nil && p > 0 {
+			return p
+		}
+	}
+	return 0
 }
 
 // handleVMScreenshot GET /api/client/screenshot/:hs_name/:vm_uuid
@@ -733,41 +935,131 @@ func (app *App) handleVMScreenshot(c *gin.Context) {
 
 	screenshot, err := d.GetScreenshot(vmUUID)
 	if err != nil {
-		utils.InternalError(c, "获取截图失败")
+		// 截图失败原因必须透出：前端只显示「获取截图失败」时，
+		// 无法区分是虚拟机未运行、SSH 不通还是平台不支持，排查成本极高。
+		app.Logger.Log(hsName, "WARNING", "虚拟机截图", "截图失败: "+err.Error(), false)
+		utils.Fail(c, 502, "获取截图失败: "+err.Error())
 		return
 	}
-	utils.Success(c, gin.H{"screenshot": screenshot})
+	utils.Success(c, gin.H{"screenshot": normalizeScreenshot(screenshot)})
+}
+
+// normalizeScreenshot 统一截图返回格式为纯 base64（不含 data: 前缀）。
+//
+// 各驱动历史上返回两种形态：裸 base64（Python 契约）与 data URL。
+// 前端固定按 data:image/png;base64,<base64> 拼接，多一层前缀会让
+// 图片解码失败、界面只显示占位图，因此在这里收敛。
+func normalizeScreenshot(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if idx := strings.Index(raw, "base64,"); idx >= 0 {
+		return raw[idx+len("base64,"):]
+	}
+	return raw
 }
 
 // handleVMPassword POST /api/client/password/:hs_name/:vm_uuid
+//
+// 前端按 type 区分三类修改：os_password（默认）、vnc_password、vnc_port。
+// 原实现只有 password 一个字段，改「远程密码（VNC）」时会被当成系统密码
+// 下发给来宾系统，既改了错误的对象，vc_pass 也不会被保存。
 func (app *App) handleVMPassword(c *gin.Context) {
 	hsName := c.Param("hs_name")
 	vmUUID := c.Param("vm_uuid")
 
 	var req struct {
-		Password string `json:"password"`
+		Type        string `json:"type"`
+		Password    string `json:"password"`
+		VncPassword string `json:"vnc_password"`
+		VncPort     *int   `json:"vnc_port"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.Password == "" {
-		utils.BadRequest(c, "密码不能为空")
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, "请求参数错误")
 		return
 	}
 
+	vm, err := app.loadVMConfig(hsName, vmUUID)
+	if err != nil || vm == nil {
+		utils.NotFound(c, "虚拟机不存在")
+		return
+	}
+
+	switch strings.ToLower(strings.TrimSpace(req.Type)) {
+	case "vnc_password":
+		pwd := strings.TrimSpace(req.Password)
+		if pwd == "" {
+			pwd = strings.TrimSpace(req.VncPassword)
+		}
+		if pwd == "" {
+			utils.BadRequest(c, "密码不能为空")
+			return
+		}
+		vm.VcPass = pwd
+		if err := app.DB.UpsertVMConfig(hsName, vmUUID, vm); err != nil {
+			utils.InternalError(c, "保存VNC密码失败")
+			return
+		}
+		utils.SuccessMsg(c, "远程密码设置成功", nil)
+		return
+	case "vnc_port":
+		if req.VncPort == nil {
+			utils.BadRequest(c, "端口不能为空")
+			return
+		}
+		vm.VcPort = strconv.Itoa(*req.VncPort)
+		if err := app.DB.UpsertVMConfig(hsName, vmUUID, vm); err != nil {
+			utils.InternalError(c, "保存VNC端口失败")
+			return
+		}
+		utils.SuccessMsg(c, "远程端口设置成功", nil)
+		return
+	}
+
+	// 系统密码：下发到平台/来宾系统
+	if req.Password == "" {
+		utils.BadRequest(c, "密码不能为空")
+		return
+	}
 	d := app.HostSvc.GetDriver(hsName)
 	if d == nil {
 		utils.NotFound(c, "主机不存在或未启用")
 		return
 	}
-
 	result, err := d.SetPassword(vmUUID, req.Password)
 	if err != nil {
 		utils.InternalError(c, "设置密码失败")
 		return
 	}
-	if !result.Success {
+	if result != nil && !result.Success {
 		utils.Fail(c, 500, result.Message)
 		return
 	}
+	// 下发成功后同步记录，避免详情页仍显示旧密码
+	vm.OsPass = req.Password
+	if err := app.DB.UpsertVMConfig(hsName, vmUUID, vm); err != nil {
+		utils.Fail(c, 500, "密码已修改但保存记录失败，请联系管理员核对")
+		return
+	}
 	utils.SuccessMsg(c, "密码设置成功", nil)
+}
+
+// ensureVMVncPassword 为历史虚拟机补齐 VNC 密码。
+//
+// 早期版本创建时没有保存 vc_pass，详情页「远程密码」显示为空。
+// 这里在读取详情时补齐并落库（只补一次，后续稳定返回同一值）。
+func (app *App) ensureVMVncPassword(hsName, vmUUID string, vm *model.VMConfig) {
+	if vm == nil || strings.TrimSpace(vm.VcPass) != "" {
+		return
+	}
+	vm.VcPass = generateVNCPassword()
+
+	// 必须同时写回驱动内存：详情读取优先取驱动内的配置，
+	// 只写数据库会导致「每次刷新都生成一个新密码」。
+	if d := app.HostSvc.GetDriver(hsName); d != nil {
+		d.UpsertVMSaving(vmUUID, vm)
+	}
+	if err := app.DB.UpsertVMConfig(hsName, vmUUID, vm); err != nil {
+		app.Logger.Log(hsName, "WARNING", "虚拟机配置", "补充VNC密码失败: "+err.Error(), false)
+	}
 }
 
 // handleVMStatus GET /api/client/status/:hs_name/:vm_uuid
@@ -816,12 +1108,20 @@ func (app *App) handleVMStatus(c *gin.Context) {
 		return
 	}
 
-	history := []interface{}{}
+	history := make([]interface{}, 0, len(statusList))
 	for _, s := range statusList {
 		var data interface{}
 		if err := json.Unmarshal([]byte(s), &data); err == nil {
 			history = append(history, data)
 		}
+	}
+
+	// DB 查询按 on_update DESC 取最近 100 条，但前端与图表都按升序消费：
+	//   - DockDetail 用 status[length-1] 当作「最新状态」；
+	//   - 监控图表按数组顺序绘制时间轴。
+	// 不反转会出现「最新状态取到最旧的一条」「曲线左右颠倒」。
+	for i, j := 0, len(history)-1; i < j; i, j = i+1, j-1 {
+		history[i], history[j] = history[j], history[i]
 	}
 
 	// 最新电源状态取自 VMConfig.vm_flag（与 Python 一致）
@@ -1394,10 +1694,28 @@ func (app *App) handleVMUpload(c *gin.Context) {
 	}
 	hsName, _ := req["hs_name"].(string)
 	vmUUID, _ := req["vm_uuid"].(string)
+
+	// 虚拟机内的上报脚本沿用的是 Python 版契约：POST /api/client/upload?nic=<MAC>，
+	// body 只有状态字段，靠 MAC 反查虚拟机。
+	// 原实现只认 body 里的 hs_name/vm_uuid，按 Python 契约上报会被判成
+	// 「hs_name和vm_uuid不能为空」，表现为「虚拟机内服务正常但收不到数据」。
 	if hsName == "" || vmUUID == "" {
-		utils.BadRequest(c, "hs_name和vm_uuid不能为空")
-		return
+		mac := strings.ToLower(strings.TrimSpace(c.Query("nic")))
+		if !looksLikeMAC(mac) {
+			utils.BadRequest(c, "缺少虚拟机标识（hs_name/vm_uuid 或 nic 参数）")
+			return
+		}
+		var found bool
+		hsName, vmUUID, found = app.findVMByMAC(mac)
+		if !found {
+			utils.NotFound(c, "未找到该 MAC 对应的虚拟机")
+			return
+		}
+		// 这两个字段不属于状态数据，避免写进历史状态
+		delete(req, "hs_name")
+		delete(req, "vm_uuid")
 	}
+
 	if !vmUUIDLooksSafe(vmUUID) || !vmUUIDLooksSafe(hsName) {
 		utils.BadRequest(c, "标识格式无效")
 		return
@@ -1407,13 +1725,248 @@ func (app *App) handleVMUpload(c *gin.Context) {
 		utils.NotFound(c, "虚拟机不存在")
 		return
 	}
+
+	// rdp_info（ToDesk 等远程桌面信息）合并进虚拟机配置，不写入状态历史
+	if rdp, ok := req["rdp_info"].(map[string]interface{}); ok && len(rdp) > 0 {
+		app.mergeVMRdpInfo(hsName, vmUUID, rdp)
+		delete(req, "rdp_info")
+	}
+
 	acStatus, _ := req["ac_status"].(string)
 	now := time.Now().Unix()
+	// on_update 必须写进状态体：前端按它排序/判断数据新鲜度，
+	// Python 版在 vm_upload 里同样会补这个字段。
+	req["on_update"] = now
 	if err := app.DB.AddVMStatus(hsName, vmUUID, req, acStatus, now, 0); err != nil {
 		utils.InternalError(c, "状态保存失败")
 		return
 	}
-	utils.SuccessMsg(c, "状态已上报", nil)
+
+	// 上报本身可作为「虚拟机已开机/已关机」的佐证，推进尚未收敛的中间状态
+	app.advanceVMPowerFromUpload(hsName, vmUUID)
+
+	// 返回体与 Python 版一致：上报脚本据此拿到密码、电源态与待执行命令
+	payload := gin.H{"hs_name": hsName, "vm_uuid": vmUUID}
+	if vm := app.HostSvc.MustGetVMConfig(hsName, vmUUID); vm != nil {
+		payload["vm_pass"] = vm.OsPass
+		payload["vm_flag"] = string(vm.VmFlag)
+		if len(vm.VmCmd) > 0 {
+			payload["vm_cmd"] = vm.VmCmd
+			// 命令是一次性的：取出后立即清空，避免重复执行
+			_ = app.HostSvc.SetVMCmd(hsName, vmUUID, nil)
+		}
+	}
+	utils.SuccessMsg(c, "状态已上报", payload)
+}
+
+// looksLikeMAC 校验 MAC 是否形如 aa:bb:cc:dd:ee:ff
+func looksLikeMAC(mac string) bool {
+	if len(mac) != 17 {
+		return false
+	}
+	for i, ch := range mac {
+		if i%3 == 2 {
+			if ch != ':' {
+				return false
+			}
+			continue
+		}
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// macVMRef MAC -> 虚拟机 的缓存条目
+type macVMRef struct {
+	hsName string
+	vmUUID string
+	at     time.Time
+}
+
+var (
+	macVMCacheMu sync.RWMutex
+	macVMCache   = map[string]macVMRef{}
+)
+
+// macVMCacheTTL MAC 与虚拟机的绑定关系很稳定，缓存 5 分钟即可，
+// 避免每次上报都遍历全部主机与虚拟机（VM 多时是明显的放大开销）。
+const macVMCacheTTL = 5 * time.Minute
+
+// findVMByMAC 按网卡 MAC 反查虚拟机（对应 Python vm_upload 的匹配逻辑）。
+func (app *App) findVMByMAC(mac string) (hsName, vmUUID string, found bool) {
+	macVMCacheMu.RLock()
+	ref, ok := macVMCache[mac]
+	macVMCacheMu.RUnlock()
+	if ok && time.Since(ref.at) < macVMCacheTTL {
+		return ref.hsName, ref.vmUUID, true
+	}
+
+	hosts, err := app.HostSvc.GetAllHosts()
+	if err != nil {
+		return "", "", false
+	}
+	for name := range hosts {
+		raw, err := app.DB.GetVMSaving(name)
+		if err != nil {
+			continue
+		}
+		for uuid, js := range raw {
+			cfg, err := service.DecodeVMConfig(js)
+			if err != nil || cfg == nil {
+				continue
+			}
+			for _, nic := range cfg.NicAll {
+				if strings.EqualFold(strings.TrimSpace(nic.MacAddr), mac) {
+					macVMCacheMu.Lock()
+					macVMCache[mac] = macVMRef{hsName: name, vmUUID: uuid, at: time.Now()}
+					macVMCacheMu.Unlock()
+					return name, uuid, true
+				}
+			}
+		}
+	}
+	return "", "", false
+}
+
+// allowedRdpClients 允许写入的远程桌面客户端标识。
+//
+// 上报接口无需认证，必须限定键名，避免被用来往配置里塞任意结构。
+var allowedRdpClients = map[string]struct{}{
+	"ms_rdp":   {}, // Windows RDP
+	"todesk":   {}, // ToDesk
+	"anydesk":  {}, // AnyDesk（Any远程控制）
+	"sunlogin": {}, // 向日葵
+}
+
+// sanitizeRdpInfo 过滤远程桌面信息：仅保留已知客户端，字段值统一为字符串并限长。
+func sanitizeRdpInfo(rdp map[string]interface{}) map[string]interface{} {
+	cleaned := make(map[string]interface{}, len(rdp))
+
+	for client, value := range rdp {
+		if _, ok := allowedRdpClients[client]; !ok {
+			continue
+		}
+		entry, ok := value.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		fields := make(map[string]interface{}, len(entry))
+		for key, fieldValue := range entry {
+			if len(key) > 32 {
+				continue
+			}
+			text, okText := fieldValue.(string)
+			if !okText || strings.TrimSpace(text) == "" {
+				continue
+			}
+			fields[key] = truncateRunes(text, 256)
+		}
+
+		if len(fields) > 0 {
+			cleaned[client] = fields
+		}
+	}
+
+	return cleaned
+}
+
+// truncateRunes 按字符截断，避免把多字节字符切成乱码
+func truncateRunes(value string, limit int) string {
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit])
+}
+
+// mergeVMRdpInfo 把上报的远程桌面信息合并进虚拟机配置。
+//
+// 必须深合并且「空值不覆盖」：上报脚本并不每次都带全字段
+// （ToDesk 的临时密码通常只在变更时上报），整对象覆盖会把
+// 之前保存的临时密码清空，用户就再也看不到有效口令。
+func (app *App) mergeVMRdpInfo(hsName, vmUUID string, rdp map[string]interface{}) {
+	cleaned := sanitizeRdpInfo(rdp)
+	if len(cleaned) == 0 {
+		return
+	}
+
+	vm, err := app.loadVMConfig(hsName, vmUUID)
+	if err != nil || vm == nil {
+		return
+	}
+	if vm.RdpInfo == nil {
+		vm.RdpInfo = map[string]interface{}{}
+	}
+	mergeNonEmptyMap(vm.RdpInfo, cleaned)
+	if err := app.DB.UpsertVMConfig(hsName, vmUUID, vm); err != nil {
+		app.Logger.Log(hsName, "WARNING", "虚拟机上报", "保存远程桌面信息失败: "+err.Error(), false)
+	}
+}
+
+// mergeNonEmptyMap 递归合并 src 到 dst：nil、空串、空对象、空数组都不覆盖已有值。
+//
+// 这样「这次上报没带临时密码」等同于「本次不更新该字段」，
+// 而不是把它清空。
+func mergeNonEmptyMap(dst, src map[string]interface{}) {
+	for k, v := range src {
+		switch val := v.(type) {
+		case nil:
+			continue
+		case string:
+			if strings.TrimSpace(val) == "" {
+				continue
+			}
+			dst[k] = val
+		case map[string]interface{}:
+			if len(val) == 0 {
+				continue
+			}
+			sub, _ := dst[k].(map[string]interface{})
+			if sub == nil {
+				sub = make(map[string]interface{}, len(val))
+			}
+			mergeNonEmptyMap(sub, val)
+			dst[k] = sub
+		case []interface{}:
+			if len(val) == 0 {
+				continue
+			}
+			dst[k] = val
+		default:
+			dst[k] = v
+		}
+	}
+}
+
+// advanceVMPowerFromUpload 把「启动中/关机中」等中间态推进到稳定态。
+// 只在当前仍是中间态时改写，避免与调度器采集互相覆盖。
+func (app *App) advanceVMPowerFromUpload(hsName, vmUUID string) {
+	vm, err := app.loadVMConfig(hsName, vmUUID)
+	if err != nil || vm == nil {
+		return
+	}
+	var next model.VMPowers
+	switch vm.VmFlag {
+	case model.VMPowerSClose, model.VMPowerOnStop:
+		next = model.VMPowerStopped
+	case model.VMPowerSStart, model.VMPowerOnOpen:
+		next = model.VMPowerStarted
+	default:
+		return
+	}
+	if d := app.HostSvc.GetDriver(hsName); d != nil {
+		if live, err := d.GetVMDetail(vmUUID); err == nil && live != nil {
+			live.VmFlag = next
+			_, _ = d.UpdateVM(live, live)
+		}
+	}
+	vm.VmFlag = next
+	if err := app.DB.UpsertVMConfig(hsName, vmUUID, vm); err != nil {
+		app.Logger.Log(hsName, "WARNING", "虚拟机上报", "保存电源状态失败: "+err.Error(), false)
+	}
 }
 
 // ============================================================
@@ -1437,13 +1990,39 @@ func (app *App) handleNATGet(c *gin.Context) {
 	utils.Success(c, vm.NatAll)
 }
 
+// bindPortData 解析端口映射请求体。
+//
+// 前端「外网端口留空自动分配」会把 wan_port 传成空字符串，
+// 直接绑定到 int 字段会失败并返回「请求参数错误」；
+// 这里先把端口字段归一化为数字再解码。
+func bindPortData(c *gin.Context) (model.PortData, error) {
+	var p model.PortData
+	raw := map[string]interface{}{}
+	if err := c.ShouldBindJSON(&raw); err != nil {
+		return p, err
+	}
+	for _, key := range []string{"wan_port", "lan_port"} {
+		if v, ok := raw[key]; ok {
+			raw[key] = toPortInt(v)
+		}
+	}
+	buf, err := json.Marshal(raw)
+	if err != nil {
+		return p, err
+	}
+	if err := json.Unmarshal(buf, &p); err != nil {
+		return p, err
+	}
+	return p, nil
+}
+
 // handleNATAdd POST /api/client/natadd/:hs_name/:vm_uuid
 func (app *App) handleNATAdd(c *gin.Context) {
 	hsName := c.Param("hs_name")
 	vmUUID := c.Param("vm_uuid")
-	var req model.PortData
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.BadRequest(c, "请求参数错误")
+	req, bindErr := bindPortData(c)
+	if bindErr != nil {
+		utils.BadRequest(c, "请求参数错误: "+bindErr.Error())
 		return
 	}
 	d := app.HostSvc.GetDriver(hsName)
@@ -1554,12 +2133,74 @@ func (app *App) handleIPCreate(c *gin.Context) {
 		return
 	}
 	if req.NicName == "" {
-		req.NicName = "nic" + strconv.Itoa(len(vm.NicAll))
+		req.NicName = nextNicName(vm.NicAll)
 	}
+	oldVM := driver.CloneVMConfig(vm)
 	vm.NicAll[req.NicName] = req
-	_, _ = d.UpdateVM(vm, vm)
-	_ = app.DB.UpsertVMConfig(hsName, vmUUID, vm)
-	utils.SuccessMsg(c, "网卡添加成功", nil)
+
+	if !app.applyNICChange(c, hsName, vmUUID, d, oldVM, vm) {
+		return
+	}
+	// 返回实际生效的网卡（含自动分配的 IP/MAC），便于前端直接展示
+	utils.SuccessMsg(c, "网卡添加成功", gin.H{"nic": vm.NicAll[req.NicName]})
+}
+
+// nextNicName 生成一个未被占用的网卡名。
+// 原实现用 "nic"+len(nic_all)，删除过网卡后会与现有名字冲突，
+// 导致「新增」变成覆盖已有网卡。
+func nextNicName(existing map[string]model.NCConfig) string {
+	for i := 0; ; i++ {
+		name := "nic" + strconv.Itoa(i)
+		if _, ok := existing[name]; !ok {
+			return name
+		}
+	}
+}
+
+// applyNICChange 网卡增改的统一流程：
+//
+//	自动分配 IP/MAC（对应 Python BasicServer.NetCheck）
+//	→ 下发平台更新 → 落库 → 重新下发静态绑定（对应 Python IPBinder(vm_conf, True)）
+//
+// 原实现直接改内存并忽略 UpdateVM 的错误：新网卡既拿不到地址，
+// 下发失败也照样返回「成功」，表现为「加了网卡但没有 IP」。
+//
+// 返回 false 表示已经写入了错误响应，调用方直接 return。
+func (app *App) applyNICChange(c *gin.Context, hsName, vmUUID string, d driver.HostDriver,
+	oldVM, newVM *model.VMConfig) bool {
+	if app.IPAllocSvc != nil {
+		if err := app.IPAllocSvc.NetCheck(hsName, newVM); err != nil {
+			app.Logger.Log(hsName, "ERROR", "网卡配置", "自动分配IP失败: "+err.Error(), false)
+			utils.Fail(c, 400, "网卡地址分配失败: "+err.Error())
+			return false
+		}
+	}
+
+	result, err := d.UpdateVM(newVM, oldVM)
+	if err != nil {
+		app.Logger.Log(hsName, "ERROR", "网卡配置", "平台下发失败: "+err.Error(), false)
+		utils.Fail(c, 502, "网卡下发失败: "+err.Error())
+		return false
+	}
+	if result != nil && !result.Success {
+		app.Logger.Log(hsName, "ERROR", "网卡配置", "平台拒绝: "+result.Message, false)
+		utils.Fail(c, 502, "网卡下发失败: "+result.Message)
+		return false
+	}
+
+	if err := app.DB.UpsertVMConfig(hsName, vmUUID, newVM); err != nil {
+		app.Logger.Log(hsName, "ERROR", "网卡配置", "保存配置失败: "+err.Error(), false)
+		utils.Fail(c, 500, "网卡已下发但保存配置失败，请联系管理员核对")
+		return false
+	}
+
+	// 静态绑定：未配置爱快的主机会静默跳过（NotConfigured），不阻断网卡变更
+	if app.NATService != nil {
+		if _, bindErr := app.NATService.BindStaticForVM(hsName, vmUUID, newVM); bindErr != nil {
+			app.Logger.Log(hsName, "WARNING", "网卡配置", "静态绑定失败: "+bindErr.Error(), false)
+		}
+	}
+	return true
 }
 
 // handleIPDelete DELETE /api/client/ipaddr/delete/:hs_name/:vm_uuid/:ip_index
@@ -1577,9 +2218,33 @@ func (app *App) handleIPDelete(c *gin.Context) {
 		utils.NotFound(c, "虚拟机不存在")
 		return
 	}
+	removed, exists := vm.NicAll[ipIndex]
+	oldVM := driver.CloneVMConfig(vm)
 	delete(vm.NicAll, ipIndex)
-	_, _ = d.UpdateVM(vm, vm)
-	_ = app.DB.UpsertVMConfig(hsName, vmUUID, vm)
+
+	result, err := d.UpdateVM(vm, oldVM)
+	if err != nil {
+		utils.Fail(c, 502, "网卡下发失败: "+err.Error())
+		return
+	}
+	if result != nil && !result.Success {
+		utils.Fail(c, 502, "网卡下发失败: "+result.Message)
+		return
+	}
+	if err := app.DB.UpsertVMConfig(hsName, vmUUID, vm); err != nil {
+		utils.Fail(c, 500, "网卡已下发但保存配置失败，请联系管理员核对")
+		return
+	}
+
+	// 删除网卡后同步解除路由器上的静态绑定，避免残留（不存在时幂等）。
+	// 网卡本来就没有 IP/MAC（例如旧版本添加、未分配地址）时无需解绑，
+	// 否则会打印「解绑静态绑定需要 ip 或 mac」这类无意义告警。
+	if removedIP, removedMAC := strings.TrimSpace(removed.IP4Addr), strings.TrimSpace(removed.MacAddr);
+		exists && app.NATService != nil && (removedIP != "" || removedMAC != "") {
+		if unbindErr := app.NATService.UnbindStatic(hsName, removedIP, removedMAC); unbindErr != nil {
+			app.Logger.Log(hsName, "WARNING", "网卡配置", "解除静态绑定失败: "+unbindErr.Error(), false)
+		}
+	}
 	utils.SuccessMsg(c, "网卡删除成功", nil)
 }
 
@@ -1604,10 +2269,13 @@ func (app *App) handleIPUpdate(c *gin.Context) {
 		return
 	}
 	req.NicName = nicName
+	oldVM := driver.CloneVMConfig(vm)
 	vm.NicAll[nicName] = req
-	_, _ = d.UpdateVM(vm, vm)
-	_ = app.DB.UpsertVMConfig(hsName, vmUUID, vm)
-	utils.SuccessMsg(c, "网卡更新成功", nil)
+
+	if !app.applyNICChange(c, hsName, vmUUID, d, oldVM, vm) {
+		return
+	}
+	utils.SuccessMsg(c, "网卡更新成功", gin.H{"nic": vm.NicAll[nicName]})
 }
 
 // handleIPDeleteByName DELETE /api/hosts/:hs_name/vms/:vm_uuid/ip_addresses/:nic_name
@@ -2139,16 +2807,22 @@ func (app *App) handleHDDMount(c *gin.Context) {
 		utils.NotFound(c, "主机不存在")
 		return
 	}
+	// 磁盘名由系统生成，不再让用户填写：前端已移除该输入项，
+	// 这里兜底保证 HddAll 的 key 非空（空 key 会让后续挂载/卸载互相覆盖）。
+	req.HddName = autoResourceName("data", req.HddName)
 	result, err := d.MountHDD(vmUUID, &req, true)
 	if err != nil {
 		utils.InternalError(c, "挂载磁盘失败")
 		return
 	}
-	vm, _ := app.loadVMConfig(hsName, vmUUID)
-	if vm != nil {
-		_ = app.DB.UpsertVMConfig(hsName, vmUUID, vm)
+	if result != nil && !result.Success {
+		utils.Fail(c, 502, "挂载磁盘失败: "+result.Message)
+		return
 	}
-	utils.Success(c, result)
+	app.persistDriverResources(hsName, vmUUID, d, func(vm, live *model.VMConfig) {
+		vm.HddAll = live.HddAll
+	})
+	utils.SuccessMsg(c, "磁盘挂载成功", nil)
 }
 
 func (app *App) handleHDDUnmount(c *gin.Context) {
@@ -2169,11 +2843,14 @@ func (app *App) handleHDDUnmount(c *gin.Context) {
 		utils.InternalError(c, "卸载磁盘失败")
 		return
 	}
-	vm, _ := app.loadVMConfig(hsName, vmUUID)
-	if vm != nil {
-		_ = app.DB.UpsertVMConfig(hsName, vmUUID, vm)
+	if result != nil && !result.Success {
+		utils.Fail(c, 502, "卸载磁盘失败: "+result.Message)
+		return
 	}
-	utils.Success(c, result)
+	app.persistDriverResources(hsName, vmUUID, d, func(vm, live *model.VMConfig) {
+		vm.HddAll = live.HddAll
+	})
+	utils.SuccessMsg(c, "磁盘卸载成功", nil)
 }
 
 func (app *App) handleHDDTransfer(c *gin.Context) {
@@ -2271,6 +2948,68 @@ func (app *App) handleISOList(c *gin.Context) {
 	utils.Success(c, vm.IsoAll)
 }
 
+// syncISOToBootList 在挂载/卸载光盘后增量维护 efi_all（启动顺序管理的数据源）。
+//
+// 只在需要时增删对应项，保留用户手工调整过的顺序；
+// 全量重建会把用户排序冲掉。
+func syncISOToBootList(vm *model.VMConfig, isoName string, add bool) {
+	if vm == nil || strings.TrimSpace(isoName) == "" {
+		return
+	}
+	if add {
+		for _, b := range vm.EfiAll {
+			if b.EfiType && b.EfiName == isoName {
+				return
+			}
+		}
+		vm.EfiAll = append(vm.EfiAll, model.BootOpts{EfiType: true, EfiName: isoName})
+		return
+	}
+
+	kept := make([]model.BootOpts, 0, len(vm.EfiAll))
+	for _, b := range vm.EfiAll {
+		if b.EfiType && b.EfiName == isoName {
+			continue
+		}
+		kept = append(kept, b)
+	}
+	vm.EfiAll = kept
+}
+
+// autoResourceName 生成自动资源名：<prefix>-<年月日时分秒>。
+//
+// current 非空时原样返回，兼容第三方直接指定名称的调用。
+// 磁盘/光盘的名称只在本平台内作为标识（PVE 卷名由平台自己生成），
+// 因此不需要用户理解命名规则。
+func autoResourceName(prefix, current string) string {
+	if strings.TrimSpace(current) != "" {
+		return current
+	}
+	return fmt.Sprintf("%s-%s", prefix, time.Now().Format("20060102150405"))
+}
+
+// persistDriverResources 把驱动侧的资源清单（iso_all / hdd_all 等）写回数据库。
+//
+// loadVMConfig 以数据库为权威，只用驱动覆盖电源状态等运行时字段；
+// MountISO / MountHDD 在驱动内存里更新的资源清单不会被带回来。
+// 原实现直接 Upsert 数据库版本，等于把刚挂载成功的记录丢掉，
+// 表现为「提示挂载成功，但列表里什么都没有」。
+func (app *App) persistDriverResources(hsName, vmUUID string, d driver.HostDriver,
+	apply func(vm, live *model.VMConfig)) {
+	vm, err := app.loadVMConfig(hsName, vmUUID)
+	if err != nil || vm == nil {
+		return
+	}
+	live, liveErr := d.GetVMDetail(vmUUID)
+	if liveErr != nil || live == nil {
+		return
+	}
+	apply(vm, live)
+	if err := app.DB.UpsertVMConfig(hsName, vmUUID, vm); err != nil {
+		app.Logger.Log(hsName, "ERROR", "存储资源", "保存虚拟机配置失败: "+err.Error(), false)
+	}
+}
+
 func (app *App) handleISOMount(c *gin.Context) {
 	hsName := c.Param("hs_name")
 	vmUUID := c.Param("vm_uuid")
@@ -2284,16 +3023,28 @@ func (app *App) handleISOMount(c *gin.Context) {
 		utils.NotFound(c, "主机不存在")
 		return
 	}
+	// 挂载名称由系统生成（前端已移除输入项）：IsoAll 以它作为 key，
+	// 卸载接口也按它定位，空值会导致多张光盘互相覆盖。
+	req.IsoName = autoResourceName("iso", req.IsoName)
 	result, err := d.MountISO(vmUUID, &req, true)
 	if err != nil {
 		utils.InternalError(c, "挂载ISO失败")
 		return
 	}
-	vm, _ := app.loadVMConfig(hsName, vmUUID)
-	if vm != nil {
-		_ = app.DB.UpsertVMConfig(hsName, vmUUID, vm)
+	// 驱动返回 Success=false 也是失败：原实现无条件回 200，
+	// 前端显示「成功」但对端根本没挂上。
+	if result != nil && !result.Success {
+		app.Logger.Log(hsName, "ERROR", "ISO挂载", result.Message, false)
+		utils.Fail(c, 502, "挂载ISO失败: "+result.Message)
+		return
 	}
-	utils.Success(c, result)
+	app.persistDriverResources(hsName, vmUUID, d, func(vm, live *model.VMConfig) {
+		vm.IsoAll = live.IsoAll
+		// 「启动顺序管理」展示的是 efi_all：挂载光盘后要同步加进去，
+		// 否则界面上永远看不到这张光盘（PVE 的 boot 里其实已经有 ide2）。
+		syncISOToBootList(vm, req.IsoName, true)
+	})
+	utils.SuccessMsg(c, "ISO挂载成功", nil)
 }
 
 func (app *App) handleISOUnmount(c *gin.Context) {
@@ -2311,11 +3062,16 @@ func (app *App) handleISOUnmount(c *gin.Context) {
 		utils.InternalError(c, "卸载ISO失败")
 		return
 	}
-	vm, _ := app.loadVMConfig(hsName, vmUUID)
-	if vm != nil {
-		_ = app.DB.UpsertVMConfig(hsName, vmUUID, vm)
+	if result != nil && !result.Success {
+		app.Logger.Log(hsName, "ERROR", "ISO卸载", result.Message, false)
+		utils.Fail(c, 502, "卸载ISO失败: "+result.Message)
+		return
 	}
-	utils.Success(c, result)
+	app.persistDriverResources(hsName, vmUUID, d, func(vm, live *model.VMConfig) {
+		vm.IsoAll = live.IsoAll
+		syncISOToBootList(vm, isoName, false)
+	})
+	utils.SuccessMsg(c, "ISO卸载成功", nil)
 }
 
 // handleUSBMount POST /api/client/usb/mount/:hs_name/:vm_uuid
@@ -2391,6 +3147,15 @@ func (app *App) handleBackupList(c *gin.Context) {
 		utils.NotFound(c, "主机不存在")
 		return
 	}
+	// 平台能直接列出备份文件时以平台为准：
+	// 备份是后台长任务，本地记录要等任务结束才写入，
+	// 期间列表为空会让人误以为「没备份成功」。
+	if bs, ok := d.(interface{ SyncBackups(string) }); ok {
+		bs.SyncBackups(vmUUID)
+		app.persistDriverResources(hsName, vmUUID, d, func(vm, live *model.VMConfig) {
+			vm.Backups = live.Backups
+		})
+	}
 	vm, err := app.loadVMConfig(hsName, vmUUID)
 	if err != nil {
 		utils.NotFound(c, "虚拟机不存在")
@@ -2436,12 +3201,33 @@ func (app *App) handleBackupCreate(c *gin.Context) {
 		utils.NotFound(c, "主机不存在")
 		return
 	}
-	result, err := d.CreateBackup(vmUUID, req.tipText())
-	if err != nil {
-		utils.InternalError(c, "创建备份失败")
-		return
+	// 备份名由系统生成：<虚拟机名>-backup-<年月日时分秒>。
+	// 前端已移除手填输入框，这里兜底（第三方调用不传时同样有可读名称）。
+	tips := strings.TrimSpace(req.tipText())
+	if tips == "" {
+		tips = fmt.Sprintf("%s-backup-%s", vmUUID, time.Now().Format("20060102150405"))
 	}
-	utils.Success(c, result)
+
+	// 备份是分钟级的长任务：同步等待会让浏览器请求超时，
+	// 表现为「提示创建失败，但 PVE 上其实备份已成功」。
+	// 这里立即返回受理结果，由后台协程等待完成后把记录写回配置。
+	go func() {
+		result, err := d.CreateBackup(vmUUID, tips)
+		if err != nil {
+			app.Logger.Log(hsName, "ERROR", "虚拟机备份", "创建失败: "+err.Error(), false)
+			return
+		}
+		if result != nil && !result.Success {
+			app.Logger.Log(hsName, "ERROR", "虚拟机备份", "创建失败: "+result.Message, false)
+			return
+		}
+		app.persistDriverResources(hsName, vmUUID, d, func(vm, live *model.VMConfig) {
+			vm.Backups = live.Backups
+		})
+		app.Logger.Log(hsName, "INFO", "虚拟机备份", "备份完成并已记录", false)
+	}()
+
+	utils.SuccessMsg(c, "备份任务已提交，正在后台执行，完成后可在列表查看", nil)
 }
 
 func (app *App) handleBackupRestore(c *gin.Context) {
@@ -2534,9 +3320,10 @@ func (app *App) handleOSImages(c *gin.Context) {
 		"messages":    meta.Messages,
 		"tab_lock":    meta.TabLock,
 		"enable_host": cfg.EnableHost,
-		"ipaddr_maps": cfg.IPAddrMaps,
-		"ipaddr_ddns": cfg.IPAddrDDNS,
-		"public_addr": cfg.PublicAddr,
+		"ipaddr_maps":  cfg.IPAddrMaps,
+		"ipaddr_ddns":  cfg.IPAddrDDNS,
+		"public_addr":  cfg.PublicAddr,
+		"capabilities": service.PlatformCapabilities(cfg.ServerType),
 	})
 }
 
@@ -2689,9 +3476,23 @@ func (app *App) handleEFISetup(c *gin.Context) {
 		utils.NotFound(c, "虚拟机不存在")
 		return
 	}
+	// 用快照做 old：UpdateVM 以新旧对比决定下发内容，
+	// 传同一个对象会让变更被判定为「无变化」而静默丢弃。
+	oldVM := driver.CloneVMConfig(vm)
 	vm.EfiAll = req.EfiList
-	_, _ = d.UpdateVM(vm, vm)
-	_ = app.DB.UpsertVMConfig(hsName, vmUUID, vm)
+	result, err := d.UpdateVM(vm, oldVM)
+	if err != nil {
+		utils.Fail(c, 502, "下发启动顺序失败: "+err.Error())
+		return
+	}
+	if result != nil && !result.Success {
+		utils.Fail(c, 502, "下发启动顺序失败: "+result.Message)
+		return
+	}
+	if err := app.DB.UpsertVMConfig(hsName, vmUUID, vm); err != nil {
+		utils.Fail(c, 500, "启动顺序已下发但保存配置失败，请联系管理员核对")
+		return
+	}
 	utils.SuccessMsg(c, "启动顺序设置成功", nil)
 }
 

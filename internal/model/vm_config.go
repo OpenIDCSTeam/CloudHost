@@ -255,6 +255,63 @@ type VMBackup struct {
 	BackupTips string    `json:"backup_tips"` // 备份说明
 }
 
+// MarshalJSON 把 backup_time 输出为 Unix 秒。
+//
+// 前端按 Python 版契约做 `new Date(backup_time * 1000)`；
+// 直接序列化 time.Time 会得到 RFC3339 字符串，乘以 1000 变成 NaN，
+// 页面显示「Invalid Date」。
+func (b VMBackup) MarshalJSON() ([]byte, error) {
+	var ts int64
+	if !b.BackupTime.IsZero() {
+		ts = b.BackupTime.Unix()
+	}
+	return json.Marshal(struct {
+		BackupName string `json:"backup_name"`
+		BackupTime int64  `json:"backup_time"`
+		BackupTips string `json:"backup_tips"`
+	}{b.BackupName, ts, b.BackupTips})
+}
+
+// UnmarshalJSON 兼容三种历史写法：Unix 秒、RFC3339、以及本地时间字符串，
+// 保证已经落库的旧配置仍能读出来。
+func (b *VMBackup) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		BackupName string          `json:"backup_name"`
+		BackupTime json.RawMessage `json:"backup_time"`
+		BackupTips string          `json:"backup_tips"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	b.BackupName = raw.BackupName
+	b.BackupTips = raw.BackupTips
+	b.BackupTime = time.Time{}
+
+	if len(raw.BackupTime) == 0 || string(raw.BackupTime) == "null" {
+		return nil
+	}
+
+	var secs int64
+	if err := json.Unmarshal(raw.BackupTime, &secs); err == nil {
+		if secs > 0 {
+			b.BackupTime = time.Unix(secs, 0)
+		}
+		return nil
+	}
+
+	var s string
+	if err := json.Unmarshal(raw.BackupTime, &s); err != nil || s == "" {
+		return nil
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05Z07:00", "2006-01-02 15:04:05"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			b.BackupTime = t
+			return nil
+		}
+	}
+	return nil
+}
+
 // BootOpts EFI启动项
 type BootOpts struct {
 	EfiType bool   `json:"efi_type"` // true=ISO, false=HDD
@@ -476,6 +533,10 @@ type VMConfig struct {
 	// 命令执行相关（新增）
 	VmCmd       map[string]interface{} `json:"vm_cmd,omitempty"`        // 待执行命令
 	VmCmdResult map[string]interface{} `json:"vm_cmd_result,omitempty"` // 命令执行结果
+	// RdpInfo 远程桌面信息，由虚拟机内上报脚本推送：
+	// {"ms_rdp":{"user","password"},"todesk":{"code","password"},
+	//  "anydesk":{"code","password"},"sunlogin":{"code","password"}}
+	RdpInfo map[string]interface{} `json:"rdp_info,omitempty"`
 	// 驱动扩展数据（不持久化，运行时缓存）
 	ExtData map[string]interface{} `json:"-"` // 驱动扩展数据
 }
