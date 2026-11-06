@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/gin-contrib/sessions"
@@ -19,6 +21,7 @@ import (
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/data"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/i18n"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/logger"
+	"github.com/OpenIDCSTeam/HostAgent-Go/internal/middleware"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/service"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/task"
 )
@@ -50,6 +53,18 @@ func loadSessionSecret(db *data.DB) []byte {
 		log.Printf("[session] 持久化会话密钥失败，本次启动使用临时密钥: %v", err)
 	}
 	return secret
+}
+
+// cookieSecure 会话 Cookie 是否只在 HTTPS 链路回传。
+// HTTP 部署（默认）必须关闭，否则浏览器不会回传 Cookie，登录失去会话；
+// HTTPS 部署应设置 OPENIDCS_COOKIE_SECURE=1。
+func cookieSecure() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("OPENIDCS_COOKIE_SECURE"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func init() {
@@ -118,6 +133,14 @@ func NewApp(db *data.DB, dataDir string) *App {
 	app.NATService = service.NewNATService(db)
 	app.IPAllocSvc = service.NewIPAllocService(db)
 	app.ProxyService = service.NewProxyService(db, dataDir)
+	// 启动时确认 Caddy 是否可用：反向代理依赖它，缺失时在启动日志里提示一次，
+	// 而不是等到补偿任务反复失败才暴露。
+	if bin := app.ProxyService.BinaryPath(); bin == "" {
+		app.Logger.Warning("", "反向代理", "未找到 caddy 可执行文件，Web 反向代理无法下发；"+
+			"请安装 Caddy 并把 caddy(.exe) 放到程序目录或 bin 子目录，或设置环境变量 CADDY_BIN")
+	} else {
+		app.Logger.Info("", "反向代理", "使用 Caddy: "+bin)
+	}
 	// 平台自有下发通道（如青州云）优先：注入驱动解析器（未加载时惰性创建）
 	app.NATService.SetDriverResolver(app.HostSvc.GetOrCreateDriver)
 	app.ProxyService.SetDriverResolver(app.HostSvc.GetOrCreateDriver)
@@ -162,8 +185,16 @@ func NewApp(db *data.DB, dataDir string) *App {
 	// 创建Gin引擎
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	// 请求追踪号放在最外层：panic 恢复与访问日志都要能拿到 rid
+	r.Use(middleware.RequestID())
 	r.Use(auth.RecoveryMiddleware())
-	r.Use(gin.Logger())
+	// 访问日志带请求号，一次请求的全链路日志可按 rid 串联
+	r.Use(gin.LoggerWithFormatter(func(p gin.LogFormatterParams) string {
+		rid, _ := p.Keys[middleware.ContextRequestID].(string)
+		return fmt.Sprintf("[GIN] %s | %3d | %13v | %15s | %-7s %-30s | rid=%s\n",
+			p.TimeStamp.Format("2006-01-02 15:04:05"),
+			p.StatusCode, p.Latency, p.ClientIP, p.Method, p.Path, rid)
+	}))
 
 	// CORS中间件（允许前端携带Cookie）
 	r.Use(func(c *gin.Context) {
@@ -186,11 +217,16 @@ func NewApp(db *data.DB, dataDir string) *App {
 	})
 
 	// Session中间件：签名密钥持久化在数据库中，首次启动自动生成
+	//
+	// Secure 属性不能无条件开启：默认部署是 http://<ip>:8080，一旦给 Cookie
+	// 打上 Secure，浏览器会拒绝回传，登录会直接失效。HTTPS 部署时通过
+	// OPENIDCS_COOKIE_SECURE=1 打开，防止会话 Cookie 在明文链路中泄露。
 	store := cookie.NewStore(loadSessionSecret(db))
 	store.Options(sessions.Options{
 		Path:     "/",
 		MaxAge:   86400 * 7, // 7天
 		HttpOnly: true,
+		Secure:   cookieSecure(),
 		SameSite: http.SameSiteLaxMode,
 	})
 	r.Use(sessions.Sessions("openidcs_session", store))

@@ -55,7 +55,7 @@ func (app *App) handleVMCmdSend(c *gin.Context) {
 
 	// 存储到虚拟机配置
 	if err := app.HostSvc.SetVMCmd(hsName, vmUUID, cmdData); err != nil {
-		utils.InternalError(c, "下发命令失败: "+err.Error())
+		utils.InternalErrorf(c, "下发命令失败", err)
 		return
 	}
 

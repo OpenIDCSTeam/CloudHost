@@ -200,6 +200,9 @@ func run(cmd *cobra.Command, args []string) error {
 		log.Printf("[server] 任务管理器关闭失败: %v", err)
 	}
 	sched.Stop()
+	// 取消驱动生命周期 context：让仍在等待平台返回的调用立即结束，
+	// 而不是让进程在 goroutine 阻塞下被迫等待超时。
+	app.HostSvc.ShutdownAll()
 	app.Logger.Close()
 
 	log.Println("[server] 已安全退出")

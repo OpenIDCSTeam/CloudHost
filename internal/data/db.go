@@ -11,8 +11,11 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/bcrypt"
+
+	// 纯 Go 实现的 SQLite 驱动：不依赖 CGO，CGO_ENABLED=0 也可正常工作，
+	// 同时支持从任意平台交叉编译出 linux/windows/darwin 单文件二进制。
+	_ "modernc.org/sqlite"
 )
 
 // DB 数据库连接封装
@@ -29,7 +32,9 @@ func NewDB(dataDir string) (*DB, error) {
 	}
 
 	dbPath := filepath.Join(dataDir, "hostmanage.db")
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on")
+	// modernc 驱动用 _pragma 传 PRAGMA，且对每个新建连接都会生效：
+	// WAL 提升读写并发，busy_timeout 缓解写锁竞争，foreign_keys 保证级联删除。
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
 	if err != nil {
 		return nil, fmt.Errorf("打开数据库失败: %w", err)
 	}
@@ -64,6 +69,33 @@ func (d *DB) Close() error {
 	return d.db.Close()
 }
 
+// sqlTime 把 SQLite 的时间列统一读成 "2006-01-02 15:04:05" 文本。
+//
+// 不同驱动对 TIMESTAMP/DATETIME 声明类型的列返回类型不一致：
+// modernc 驱动会直接解析成 time.Time，而 CGO 驱动返回原始字符串。
+// 统一在此收敛，查询代码只关心字符串，接口输出格式也保持稳定。
+type sqlTime struct {
+	s string
+}
+
+const sqlTimeLayout = "2006-01-02 15:04:05"
+
+func (t *sqlTime) Scan(src interface{}) error {
+	switch v := src.(type) {
+	case nil:
+		t.s = ""
+	case time.Time:
+		t.s = v.Format(sqlTimeLayout)
+	case string:
+		t.s = v
+	case []byte:
+		t.s = string(v)
+	default:
+		t.s = fmt.Sprint(v)
+	}
+	return nil
+}
+
 // initSchema 初始化数据库表结构
 func (d *DB) initSchema() error {
 	schema := `
@@ -95,6 +127,7 @@ CREATE TABLE IF NOT EXISTS hs_config (
     i_kuai_addr TEXT      DEFAULT '',
     i_kuai_user TEXT      DEFAULT '',
     i_kuai_pass TEXT      DEFAULT '',
+    i_kuai_token TEXT     DEFAULT '',
     ports_start INTEGER   DEFAULT 0,
     ports_close INTEGER   DEFAULT 0,
     remote_port INTEGER   DEFAULT 0,
@@ -304,6 +337,8 @@ CREATE INDEX IF NOT EXISTS idx_web_proxies_user ON web_proxies (user_id);
 func (d *DB) migrate() error {
 	migrations := []string{
 		`ALTER TABLE hs_config ADD COLUMN server_area TEXT DEFAULT ''`,
+		// 爱快 4.0+ 的个人 API 令牌：该固件已移除 /Action/login，只能用 OpenAPI
+		`ALTER TABLE hs_config ADD COLUMN i_kuai_token TEXT DEFAULT ''`,
 		`ALTER TABLE hs_config ADD COLUMN server_plan TEXT DEFAULT '{}'`,
 		`ALTER TABLE hs_config ADD COLUMN n_cpu_price REAL DEFAULT 0`,
 		`ALTER TABLE hs_config ADD COLUMN n_mem_price REAL DEFAULT 0`,
@@ -312,6 +347,8 @@ func (d *DB) migrate() error {
 		// 异步任务增加主机与虚拟机标识，用于按资源过滤与并发互斥
 		`ALTER TABLE async_tasks ADD COLUMN hs_name TEXT DEFAULT ''`,
 		`ALTER TABLE async_tasks ADD COLUMN vm_uuid TEXT DEFAULT ''`,
+		// 任务乐观锁版本号：进度回退/终态被覆盖的旧写入会被 UPSERT 的 WHERE 拒绝
+		`ALTER TABLE async_tasks ADD COLUMN version INTEGER DEFAULT 0`,
 
 		// 外部资源补偿任务：把无法与本地事务一起提交的外部调用持久化，后台重试
 		`CREATE TABLE IF NOT EXISTS resource_outbox (
@@ -378,13 +415,16 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_hs_logger_operator ON hs_logger (operator)`,
 	}
 	for _, m := range migrations {
-		// 忽略"duplicate column"错误（字段已存在）
 		if _, err := d.db.Exec(m); err != nil {
-			// SQLite返回"duplicate column name"时忽略
-			if err.Error() != "" {
-				// 继续，字段可能已存在
+			// 只跳过「对象已存在」这一类幂等错误。
+			// 原实现用 `err.Error() != ""` 判断，等于把所有迁移失败都吞掉：
+			// 磁盘满、库被锁、语法错误都会静默通过，启动后功能才莫名缺失。
+			msg := strings.ToLower(err.Error())
+			if strings.Contains(msg, "duplicate column") ||
+				strings.Contains(msg, "already exists") {
 				continue
 			}
+			return fmt.Errorf("数据库迁移失败 [%s]: %w", m, err)
 		}
 	}
 
@@ -516,6 +556,7 @@ type HSConfigRow struct {
 	IKuaiAddr  string `db:"i_kuai_addr"`
 	IKuaiUser  string `db:"i_kuai_user"`
 	IKuaiPass  string `db:"i_kuai_pass"`
+	IKuaiToken string `db:"i_kuai_token"`
 	PortsStart int    `db:"ports_start"`
 	PortsClose int    `db:"ports_close"`
 	RemotePort int    `db:"remote_port"`
@@ -542,7 +583,7 @@ func (d *DB) GetAllHosts() ([]*HSConfigRow, error) {
 	rows, err := d.db.Query(`SELECT id, hs_name, server_name, server_type, server_addr,
 		server_user, server_pass, server_port, images_path, dvdrom_path, system_path,
 		backup_path, extern_path, launch_path, network_nat, network_pub, filter_name,
-		i_kuai_addr, i_kuai_user, i_kuai_pass, ports_start, ports_close, remote_port,
+		i_kuai_addr, i_kuai_user, i_kuai_pass, i_kuai_token, ports_start, ports_close, remote_port,
 		system_maps, images_maps, public_addr, extend_data, limits_nums, ipaddr_maps,
 		ipaddr_ddns, enable_host, server_area,
 		COALESCE(n_cpu_price,0), COALESCE(n_mem_price,0), COALESCE(n_hdd_price,0), COALESCE(n_net_price,0),
@@ -556,19 +597,21 @@ func (d *DB) GetAllHosts() ([]*HSConfigRow, error) {
 	var result []*HSConfigRow
 	for rows.Next() {
 		row := &HSConfigRow{}
+		var createdAt, updatedAt sqlTime
 		if err := rows.Scan(
 			&row.ID, &row.HsName, &row.ServerName, &row.ServerType, &row.ServerAddr,
 			&row.ServerUser, &row.ServerPass, &row.ServerPort, &row.ImagesPath, &row.DvdromPath,
 			&row.SystemPath, &row.BackupPath, &row.ExternPath, &row.LaunchPath, &row.NetworkNat,
-			&row.NetworkPub, &row.FilterName, &row.IKuaiAddr, &row.IKuaiUser, &row.IKuaiPass,
+			&row.NetworkPub, &row.FilterName, &row.IKuaiAddr, &row.IKuaiUser, &row.IKuaiPass, &row.IKuaiToken,
 			&row.PortsStart, &row.PortsClose, &row.RemotePort, &row.SystemMaps, &row.ImagesMaps,
 			&row.PublicAddr, &row.ExtendData, &row.LimitsNums, &row.IPAddrMaps, &row.IPAddrDDNS,
 			&row.EnableHost, &row.ServerArea,
 			&row.NCpuPrice, &row.NMemPrice, &row.NHddPrice, &row.NNetPrice,
-			&row.ServerPlan, &row.CreatedAt, &row.UpdatedAt,
+			&row.ServerPlan, &createdAt, &updatedAt,
 		); err != nil {
 			return nil, err
 		}
+		row.CreatedAt, row.UpdatedAt = createdAt.s, updatedAt.s
 		result = append(result, row)
 	}
 	return result, rows.Err()
@@ -577,10 +620,11 @@ func (d *DB) GetAllHosts() ([]*HSConfigRow, error) {
 // GetHost 获取单个主机配置
 func (d *DB) GetHost(hsName string) (*HSConfigRow, error) {
 	row := &HSConfigRow{}
+	var createdAt, updatedAt sqlTime
 	err := d.db.QueryRow(`SELECT id, hs_name, server_name, server_type, server_addr,
 		server_user, server_pass, server_port, images_path, dvdrom_path, system_path,
 		backup_path, extern_path, launch_path, network_nat, network_pub, filter_name,
-		i_kuai_addr, i_kuai_user, i_kuai_pass, ports_start, ports_close, remote_port,
+		i_kuai_addr, i_kuai_user, i_kuai_pass, i_kuai_token, ports_start, ports_close, remote_port,
 		system_maps, images_maps, public_addr, extend_data, limits_nums, ipaddr_maps,
 		ipaddr_ddns, enable_host, server_area,
 		COALESCE(n_cpu_price,0), COALESCE(n_mem_price,0), COALESCE(n_hdd_price,0), COALESCE(n_net_price,0),
@@ -589,16 +633,17 @@ func (d *DB) GetHost(hsName string) (*HSConfigRow, error) {
 		&row.ID, &row.HsName, &row.ServerName, &row.ServerType, &row.ServerAddr,
 		&row.ServerUser, &row.ServerPass, &row.ServerPort, &row.ImagesPath, &row.DvdromPath,
 		&row.SystemPath, &row.BackupPath, &row.ExternPath, &row.LaunchPath, &row.NetworkNat,
-		&row.NetworkPub, &row.FilterName, &row.IKuaiAddr, &row.IKuaiUser, &row.IKuaiPass,
+		&row.NetworkPub, &row.FilterName, &row.IKuaiAddr, &row.IKuaiUser, &row.IKuaiPass, &row.IKuaiToken,
 		&row.PortsStart, &row.PortsClose, &row.RemotePort, &row.SystemMaps, &row.ImagesMaps,
 		&row.PublicAddr, &row.ExtendData, &row.LimitsNums, &row.IPAddrMaps, &row.IPAddrDDNS,
 		&row.EnableHost, &row.ServerArea,
 		&row.NCpuPrice, &row.NMemPrice, &row.NHddPrice, &row.NNetPrice,
-		&row.ServerPlan, &row.CreatedAt, &row.UpdatedAt,
+		&row.ServerPlan, &createdAt, &updatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
+	row.CreatedAt, row.UpdatedAt = createdAt.s, updatedAt.s
 	return row, err
 }
 
@@ -615,16 +660,16 @@ func createHostRow(executor hostConfigExecutor, row *HSConfigRow) error {
 	_, err := executor.Exec(`INSERT INTO hs_config (hs_name, server_name, server_type, server_addr,
 		server_user, server_pass, server_port, images_path, dvdrom_path, system_path,
 		backup_path, extern_path, launch_path, network_nat, network_pub, filter_name,
-		i_kuai_addr, i_kuai_user, i_kuai_pass, ports_start, ports_close, remote_port,
+		i_kuai_addr, i_kuai_user, i_kuai_pass, i_kuai_token, ports_start, ports_close, remote_port,
 		system_maps, images_maps, public_addr, extend_data, limits_nums, ipaddr_maps,
 		ipaddr_ddns, enable_host, server_area,
 		n_cpu_price, n_mem_price, n_hdd_price, n_net_price,
 		server_plan)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		row.HsName, row.ServerName, row.ServerType, row.ServerAddr,
 		row.ServerUser, row.ServerPass, row.ServerPort, row.ImagesPath, row.DvdromPath,
 		row.SystemPath, row.BackupPath, row.ExternPath, row.LaunchPath, row.NetworkNat,
-		row.NetworkPub, row.FilterName, row.IKuaiAddr, row.IKuaiUser, row.IKuaiPass,
+		row.NetworkPub, row.FilterName, row.IKuaiAddr, row.IKuaiUser, row.IKuaiPass, row.IKuaiToken,
 		row.PortsStart, row.PortsClose, row.RemotePort, row.SystemMaps, row.ImagesMaps,
 		row.PublicAddr, row.ExtendData, row.LimitsNums, row.IPAddrMaps, row.IPAddrDDNS,
 		row.EnableHost, row.ServerArea,
@@ -643,7 +688,7 @@ func updateHostRow(executor hostConfigExecutor, row *HSConfigRow) error {
 	_, err := executor.Exec(`UPDATE hs_config SET server_name=?, server_type=?, server_addr=?,
 		server_user=?, server_pass=?, server_port=?, images_path=?, dvdrom_path=?, system_path=?,
 		backup_path=?, extern_path=?, launch_path=?, network_nat=?, network_pub=?, filter_name=?,
-		i_kuai_addr=?, i_kuai_user=?, i_kuai_pass=?, ports_start=?, ports_close=?, remote_port=?,
+		i_kuai_addr=?, i_kuai_user=?, i_kuai_pass=?, i_kuai_token=?, ports_start=?, ports_close=?, remote_port=?,
 		system_maps=?, images_maps=?, public_addr=?, extend_data=?, limits_nums=?, ipaddr_maps=?,
 		ipaddr_ddns=?, enable_host=?, server_area=?,
 		n_cpu_price=?, n_mem_price=?, n_hdd_price=?, n_net_price=?,
@@ -652,7 +697,7 @@ func updateHostRow(executor hostConfigExecutor, row *HSConfigRow) error {
 		row.ServerName, row.ServerType, row.ServerAddr,
 		row.ServerUser, row.ServerPass, row.ServerPort, row.ImagesPath, row.DvdromPath,
 		row.SystemPath, row.BackupPath, row.ExternPath, row.LaunchPath, row.NetworkNat,
-		row.NetworkPub, row.FilterName, row.IKuaiAddr, row.IKuaiUser, row.IKuaiPass,
+		row.NetworkPub, row.FilterName, row.IKuaiAddr, row.IKuaiUser, row.IKuaiPass, row.IKuaiToken,
 		row.PortsStart, row.PortsClose, row.RemotePort, row.SystemMaps, row.ImagesMaps,
 		row.PublicAddr, row.ExtendData, row.LimitsNums, row.IPAddrMaps, row.IPAddrDDNS,
 		row.EnableHost, row.ServerArea,
@@ -1024,7 +1069,8 @@ func (d *DB) QueryLoggers(q LogQuery) ([]map[string]interface{}, error) {
 	for rows.Next() {
 		var id, durationMS int
 		var success int
-		var hn, ld, ll, ca, action, message, module, operator, vmUUID, vmName, clientIP, detail string
+		var ca sqlTime
+		var hn, ld, ll, action, message, module, operator, vmUUID, vmName, clientIP, detail string
 		if err := rows.Scan(&id, &hn, &ld, &ll, &ca, &action, &message, &module,
 			&operator, &vmUUID, &vmName, &clientIP, &success, &durationMS, &detail); err != nil {
 			return nil, err
@@ -1107,7 +1153,7 @@ func (d *DB) QueryLoggers(q LogQuery) ([]map[string]interface{}, error) {
 			"hs_name":     hn,
 			"log_data":    logDataObj,
 			"log_level":   ll,
-			"created_at":  ca,
+			"created_at":  ca.s,
 			"action":      action,
 			"message":     message,
 			"module":      module,
@@ -1124,7 +1170,7 @@ func (d *DB) QueryLoggers(q LogQuery) ([]map[string]interface{}, error) {
 			// 缺失时会显示「未知操作 / 无消息内容 / 系统」，这正是此前
 			// 数据库日志「没有任何意义」的直接原因。
 			"level":     ll,
-			"timestamp": ca,
+			"timestamp": ca.s,
 			"content":   message,
 			"host":      hn,
 			"actions":   action,
@@ -1273,14 +1319,15 @@ func (d *DB) GetTasks(hsName string, limit int) ([]map[string]interface{}, error
 	var result []map[string]interface{}
 	for rows.Next() {
 		var id int
-		var hn, td, ca string
+		var ca sqlTime
+		var hn, td string
 		if err := rows.Scan(&id, &hn, &td, &ca); err != nil {
 			return nil, err
 		}
 		var taskDataObj interface{}
 		_ = json.Unmarshal([]byte(td), &taskDataObj)
 		result = append(result, map[string]interface{}{
-			"id": id, "hs_name": hn, "task_data": taskDataObj, "created_at": ca,
+			"id": id, "hs_name": hn, "task_data": taskDataObj, "created_at": ca.s,
 		})
 	}
 	return result, rows.Err()
@@ -1330,7 +1377,8 @@ func (d *DB) scanUser(row *sql.Row) (map[string]interface{}, error) {
 		usedNatPorts, usedWebProxy, usedNatIPs, usedPubIPs int
 		usedBandwidthUp, usedBandwidthDown, usedTraffic int
 		username, password, email, verifyToken, resetToken string
-		assignedHosts, createdAt, updatedAt, lastLogin string
+		assignedHosts string
+		createdAt, updatedAt, lastLogin sqlTime
 	)
 	err := row.Scan(
 		&id, &username, &password, &email, &isAdmin, &isActive,
@@ -1367,20 +1415,40 @@ func (d *DB) scanUser(row *sql.Row) (map[string]interface{}, error) {
 		"used_nat_ports": usedNatPorts, "used_web_proxy": usedWebProxy,
 		"used_nat_ips": usedNatIPs, "used_pub_ips": usedPubIPs,
 		"used_bandwidth_up": usedBandwidthUp, "used_bandwidth_down": usedBandwidthDown, "used_traffic": usedTraffic,
-		"assigned_hosts": hosts, "created_at": createdAt, "updated_at": updatedAt, "last_login": lastLogin,
+		"assigned_hosts": hosts, "created_at": createdAt.s, "updated_at": updatedAt.s, "last_login": lastLogin.s,
 	}, nil
 }
 
-// GetAllUsers 获取所有用户
+// GetAllUsers 获取所有用户。
+//
+// 用户量过万时一次加载全部记录会占用大量内存（每条含配额/用量等数十个字段），
+// 列表类接口应改用 GetAllUsersPage；此函数保留给确实需要全量的内部场景
+// （如批量分配主机、配额重算）。
 func (d *DB) GetAllUsers() ([]map[string]interface{}, error) {
-	rows, err := d.db.Query(`SELECT id, username, password, email, is_admin, is_active,
+	return d.GetAllUsersPage(0, 0)
+}
+
+// GetAllUsersPage 分页获取用户。
+// limit <= 0 表示不分页；offset 仅在 limit > 0 时生效。
+func (d *DB) GetAllUsersPage(limit, offset int) ([]map[string]interface{}, error) {
+	query := `SELECT id, username, password, email, is_admin, is_active,
 		email_verified, verify_token, reset_token, can_create_vm, can_delete_vm, can_modify_vm,
 		quota_cpu, quota_ram, quota_ssd, quota_gpu, quota_nat_ports, quota_web_proxy,
 		quota_nat_ips, quota_pub_ips, quota_bandwidth_up, quota_bandwidth_down, quota_traffic,
 		used_cpu, used_ram, used_ssd, used_gpu, used_nat_ports, used_web_proxy,
 		used_nat_ips, used_pub_ips, used_bandwidth_up, used_bandwidth_down, used_traffic,
 		assigned_hosts, created_at, updated_at, COALESCE(last_login,'') as last_login
-		FROM web_users ORDER BY id`)
+		FROM web_users ORDER BY id`
+	args := []interface{}{}
+	if limit > 0 {
+		if offset < 0 {
+			offset = 0
+		}
+		query += " LIMIT ? OFFSET ?"
+		args = append(args, limit, offset)
+	}
+
+	rows, err := d.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1398,7 +1466,8 @@ func (d *DB) GetAllUsers() ([]map[string]interface{}, error) {
 			usedNatPorts, usedWebProxy, usedNatIPs, usedPubIPs int
 			usedBandwidthUp, usedBandwidthDown, usedTraffic int
 			username, password, email, verifyToken, resetToken string
-			assignedHosts, createdAt, updatedAt, lastLogin string
+			assignedHosts string
+			createdAt, updatedAt, lastLogin sqlTime
 		)
 		if err := rows.Scan(
 			&id, &username, &password, &email, &isAdmin, &isActive,
@@ -1429,10 +1498,19 @@ func (d *DB) GetAllUsers() ([]map[string]interface{}, error) {
 			"used_nat_ports": usedNatPorts, "used_web_proxy": usedWebProxy,
 			"used_nat_ips": usedNatIPs, "used_pub_ips": usedPubIPs,
 			"used_bandwidth_up": usedBandwidthUp, "used_bandwidth_down": usedBandwidthDown, "used_traffic": usedTraffic,
-			"assigned_hosts": hosts, "created_at": createdAt, "updated_at": updatedAt, "last_login": lastLogin,
+			"assigned_hosts": hosts, "created_at": createdAt.s, "updated_at": updatedAt.s, "last_login": lastLogin.s,
 		})
 	}
 	return result, rows.Err()
+}
+
+// CountUsers 返回用户总数（配合 GetAllUsersPage 做分页元信息）
+func (d *DB) CountUsers() (int, error) {
+	var total int
+	if err := d.db.QueryRow("SELECT COUNT(*) FROM web_users").Scan(&total); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 // CreateUser 创建用户
@@ -1751,6 +1829,7 @@ func (d *DB) GetHostByName(hsName string) (map[string]interface{}, error) {
 		"i_kuai_addr":    row.IKuaiAddr,
 		"i_kuai_user":    row.IKuaiUser,
 		"i_kuai_pass":    row.IKuaiPass,
+		"i_kuai_token":   row.IKuaiToken,
 		"system_path":    row.SystemPath,
 		"images_path":    row.ImagesPath,
 		"backup_path":    row.BackupPath,

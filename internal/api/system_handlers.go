@@ -100,7 +100,7 @@ func (app *App) handleSystemSave(c *gin.Context) {
 // handleSystemLoad POST /api/system/loader
 func (app *App) handleSystemLoad(c *gin.Context) {
 	if err := app.HostSvc.LoadAllDrivers(); err != nil {
-		utils.InternalError(c, "加载配置失败: "+err.Error())
+		utils.InternalErrorf(c, "加载配置失败", err)
 		return
 	}
 	utils.SuccessMsg(c, "配置已加载", nil)
@@ -537,7 +537,7 @@ func (app *App) handleHostCreate(c *gin.Context) {
 		app.logEvent(c, "host", "创建主机").Host(serverName).
 			Detail("server_type", serverType).Err(err).
 			Errorf("创建主机失败：%v", err)
-		utils.InternalError(c, "创建主机失败: "+err.Error())
+		utils.InternalErrorf(c, "创建主机失败", err)
 		return
 	}
 
@@ -829,6 +829,7 @@ var protectedEmptyKeys = map[string]bool{
 	"server_plan": true,
 	"server_pass": true,
 	"i_kuai_pass": true,
+	"i_kuai_token": true,
 }
 
 // configFieldString 从请求体中安全读取字符串字段

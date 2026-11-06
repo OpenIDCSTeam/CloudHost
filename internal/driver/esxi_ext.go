@@ -37,7 +37,7 @@ func (d *ESXiDriver) esxiDefaultDatastore() (*object.Datastore, error) {
 	if err := d.apiConn(); err != nil {
 		return nil, err
 	}
-	return d.finder.DefaultDatastore(d.ctx)
+	return d.finder.DefaultDatastore(d.Ctx(""))
 }
 
 // esxiDefaultHost 返回默认主机
@@ -45,23 +45,23 @@ func (d *ESXiDriver) esxiDefaultHost() (*object.HostSystem, error) {
 	if err := d.apiConn(); err != nil {
 		return nil, err
 	}
-	return d.finder.DefaultHostSystem(d.ctx)
+	return d.finder.DefaultHostSystem(d.Ctx(""))
 }
 
 // ensurePoweredOff 确保虚拟机处于关机状态，返回原状态以便恢复
 func (d *ESXiDriver) ensurePoweredOff(vm *object.VirtualMachine) (bool, error) {
-	power, err := vm.PowerState(d.ctx)
+	power, err := vm.PowerState(d.Ctx(""))
 	if err != nil {
 		return false, err
 	}
 	if power != types.VirtualMachinePowerStatePoweredOn {
 		return false, nil
 	}
-	task, err := vm.PowerOff(d.ctx)
+	task, err := vm.PowerOff(d.Ctx(""))
 	if err != nil {
 		return true, fmt.Errorf("关闭虚拟机失败: %w", err)
 	}
-	if err := task.Wait(d.ctx); err != nil {
+	if err := task.Wait(d.Ctx("")); err != nil {
 		return true, fmt.Errorf("等待关机失败: %w", err)
 	}
 	return true, nil
@@ -69,7 +69,7 @@ func (d *ESXiDriver) ensurePoweredOff(vm *object.VirtualMachine) (bool, error) {
 
 // esxiFindDisk 按名称查找虚拟磁盘设备
 func (d *ESXiDriver) esxiFindDisk(vm *object.VirtualMachine, hddName string) (*types.VirtualDisk, error) {
-	devices, err := vm.Device(d.ctx)
+	devices, err := vm.Device(d.Ctx(""))
 	if err != nil {
 		return nil, fmt.Errorf("读取设备列表失败: %w", err)
 	}
@@ -110,7 +110,7 @@ func (d *ESXiDriver) MountHDD(vmUUID string, hdd *model.SDConfig, mount bool) (*
 		return &model.ZMessage{Success: false, Action: "HDDMount", Message: err.Error()}, nil
 	}
 
-	devices, err := vm.Device(d.ctx)
+	devices, err := vm.Device(d.Ctx(""))
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "HDDMount", Message: err.Error()}, nil
 	}
@@ -121,7 +121,7 @@ func (d *ESXiDriver) MountHDD(vmUUID string, hdd *model.SDConfig, mount bool) (*
 			return &model.ZMessage{Success: false, Action: "HDDMount", Message: err.Error()}, nil
 		}
 		// keepFiles=true：卸载不删文件，删除由 DeleteHDD 负责
-		if err := vm.RemoveDevice(d.ctx, true, disk); err != nil {
+		if err := vm.RemoveDevice(d.Ctx(""), true, disk); err != nil {
 			return &model.ZMessage{Success: false, Action: "HDDMount",
 				Message: fmt.Sprintf("卸载数据盘失败: %v", err)}, nil
 		}
@@ -154,7 +154,7 @@ func (d *ESXiDriver) MountHDD(vmUUID string, hdd *model.SDConfig, mount bool) (*
 	disk := devices.CreateDisk(controller, ds.Reference(), ds.Path(fmt.Sprintf("%s-%s.vmdk", vmUUID, hdd.HddName)))
 	disk.CapacityInKB = int64(sizeMB) * 1024
 
-	if err := vm.AddDevice(d.ctx, disk); err != nil {
+	if err := vm.AddDevice(d.Ctx(""), disk); err != nil {
 		return &model.ZMessage{Success: false, Action: "HDDMount",
 			Message: fmt.Sprintf("挂载数据盘失败: %v", err)}, nil
 	}
@@ -191,7 +191,7 @@ func (d *ESXiDriver) DeleteHDD(vmUUID string, hddName string) (*model.ZMessage, 
 		return &model.ZMessage{Success: false, Action: "RMMounts", Message: err.Error()}, nil
 	}
 	// keepFiles=false：连同 VMDK 文件一起删除，避免空间泄漏
-	if err := vm.RemoveDevice(d.ctx, false, disk); err != nil {
+	if err := vm.RemoveDevice(d.Ctx(""), false, disk); err != nil {
 		return &model.ZMessage{Success: false, Action: "RMMounts",
 			Message: fmt.Sprintf("删除数据盘失败: %v", err)}, nil
 	}
@@ -240,13 +240,13 @@ func (d *ESXiDriver) TransferHDD(vmUUID string, hdd *model.SDConfig, targetVM st
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "HDDTrans", Message: err.Error()}, nil
 	}
-	if err := srcVM.RemoveDevice(d.ctx, true, disk); err != nil {
+	if err := srcVM.RemoveDevice(d.Ctx(""), true, disk); err != nil {
 		return &model.ZMessage{Success: false, Action: "HDDTrans",
 			Message: fmt.Sprintf("源虚拟机卸载失败: %v", err)}, nil
 	}
 
 	// 2) 目标以既有 VMDK 附加
-	devices, err := dstVM.Device(d.ctx)
+	devices, err := dstVM.Device(d.Ctx(""))
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "HDDTrans", Message: err.Error()}, nil
 	}
@@ -268,9 +268,9 @@ func (d *ESXiDriver) TransferHDD(vmUUID string, hdd *model.SDConfig, targetVM st
 	}
 	devices.AssignController(newDisk, controller)
 
-	if err := dstVM.AddDevice(d.ctx, newDisk); err != nil {
+	if err := dstVM.AddDevice(d.Ctx(""), newDisk); err != nil {
 		// 回滚：把磁盘挂回源虚拟机
-		if devs, derr := srcVM.Device(d.ctx); derr == nil {
+		if devs, derr := srcVM.Device(d.Ctx("")); derr == nil {
 			if ctl, cerr := devs.FindDiskController(""); cerr == nil {
 				rollback := &types.VirtualDisk{
 					VirtualDevice: types.VirtualDevice{
@@ -281,7 +281,7 @@ func (d *ESXiDriver) TransferHDD(vmUUID string, hdd *model.SDConfig, targetVM st
 					},
 				}
 				devs.AssignController(rollback, ctl)
-				_ = srcVM.AddDevice(d.ctx, rollback)
+				_ = srcVM.AddDevice(d.Ctx(""), rollback)
 			}
 		}
 		return &model.ZMessage{Success: false, Action: "HDDTrans",
@@ -316,7 +316,7 @@ func (d *ESXiDriver) MountISO(vmUUID string, iso *model.IMConfig, mount bool) (*
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "ISOMount", Message: err.Error()}, nil
 	}
-	devices, err := vm.Device(d.ctx)
+	devices, err := vm.Device(d.Ctx(""))
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "ISOMount", Message: err.Error()}, nil
 	}
@@ -334,11 +334,11 @@ func (d *ESXiDriver) MountISO(vmUUID string, iso *model.IMConfig, mount bool) (*
 			return &model.ZMessage{Success: false, Action: "ISOMount",
 				Message: "创建光驱失败: " + err.Error()}, nil
 		}
-		if err := vm.AddDevice(d.ctx, cdrom); err != nil {
+		if err := vm.AddDevice(d.Ctx(""), cdrom); err != nil {
 			return &model.ZMessage{Success: false, Action: "ISOMount",
 				Message: "添加光驱失败: " + err.Error()}, nil
 		}
-		devices, _ = vm.Device(d.ctx)
+		devices, _ = vm.Device(d.Ctx(""))
 		cdrom, _ = devices.FindCdrom("")
 	}
 
@@ -353,7 +353,7 @@ func (d *ESXiDriver) MountISO(vmUUID string, iso *model.IMConfig, mount bool) (*
 			}
 		}
 		devices.InsertIso(cdrom, isoPath)
-		if err := vm.EditDevice(d.ctx, cdrom); err != nil {
+		if err := vm.EditDevice(d.Ctx(""), cdrom); err != nil {
 			return &model.ZMessage{Success: false, Action: "ISOMount",
 				Message: fmt.Sprintf("挂载ISO失败: %v", err)}, nil
 		}
@@ -369,7 +369,7 @@ func (d *ESXiDriver) MountISO(vmUUID string, iso *model.IMConfig, mount bool) (*
 	}
 
 	devices.EjectIso(cdrom)
-	if err := vm.EditDevice(d.ctx, cdrom); err != nil {
+	if err := vm.EditDevice(d.Ctx(""), cdrom); err != nil {
 		return &model.ZMessage{Success: false, Action: "ISOMount",
 			Message: fmt.Sprintf("卸载ISO失败: %v", err)}, nil
 	}
@@ -401,7 +401,7 @@ func (d *ESXiDriver) ReinstallVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	}
 
 	// 1) 移除现有磁盘（连同文件）
-	devices, err := vm.Device(d.ctx)
+	devices, err := vm.Device(d.Ctx(""))
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "VMReinstall", Message: err.Error()}, nil
 	}
@@ -428,7 +428,7 @@ func (d *ESXiDriver) ReinstallVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	}
 
 	// 2) 新建系统盘
-	devices, err = vm.Device(d.ctx)
+	devices, err = vm.Device(d.Ctx(""))
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "VMReinstall", Message: err.Error()}, nil
 	}
@@ -456,8 +456,8 @@ func (d *ESXiDriver) ReinstallVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 			src = fmt.Sprintf("[%s] %s", tpl, cfg.OsName)
 		}
 		fm := object.NewFileManager(vm.Client())
-		if task, err := fm.CopyDatastoreFile(d.ctx, src, d.datacenter, newPath, d.datacenter, true); err == nil && task != nil {
-			if task.Wait(d.ctx) == nil {
+		if task, err := fm.CopyDatastoreFile(d.Ctx(""), src, d.datacenter, newPath, d.datacenter, true); err == nil && task != nil {
+			if task.Wait(d.Ctx("")) == nil {
 				copied = true
 			}
 		}
@@ -479,15 +479,15 @@ func (d *ESXiDriver) ReinstallVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 		disk.CapacityInKB = int64(sizeMB) * 1024
 	}
 
-	if err := vm.AddDevice(d.ctx, disk); err != nil {
+	if err := vm.AddDevice(d.Ctx(""), disk); err != nil {
 		return &model.ZMessage{Success: false, Action: "VMReinstall",
 			Message: fmt.Sprintf("创建系统盘失败: %v", err)}, nil
 	}
 
 	// 3) 恢复电源
 	if wasRunning {
-		if task, err := vm.PowerOn(d.ctx); err == nil {
-			_ = task.Wait(d.ctx)
+		if task, err := vm.PowerOn(d.Ctx("")); err == nil {
+			_ = task.Wait(d.Ctx(""))
 		}
 	}
 
@@ -504,16 +504,16 @@ func (d *ESXiDriver) RestoreBackup(vmUUID string, backupName string) (*model.ZMe
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "Restores", Message: err.Error()}, nil
 	}
-	if _, err := vm.FindSnapshot(d.ctx, backupName); err != nil {
+	if _, err := vm.FindSnapshot(d.Ctx(""), backupName); err != nil {
 		return &model.ZMessage{Success: false, Action: "Restores",
 			Message: "快照不存在: " + backupName}, nil
 	}
-	task, err := vm.RevertToSnapshot(d.ctx, backupName, false)
+	task, err := vm.RevertToSnapshot(d.Ctx(""), backupName, false)
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "Restores",
 			Message: fmt.Sprintf("还原失败: %v", err)}, nil
 	}
-	if err := task.Wait(d.ctx); err != nil {
+	if err := task.Wait(d.Ctx("")); err != nil {
 		return &model.ZMessage{Success: false, Action: "Restores",
 			Message: fmt.Sprintf("等待还原任务失败: %v", err)}, nil
 	}
@@ -526,12 +526,12 @@ func (d *ESXiDriver) DeleteBackup(vmUUID string, backupName string) (*model.ZMes
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "RMBackup", Message: err.Error()}, nil
 	}
-	task, err := vm.RemoveSnapshot(d.ctx, backupName, true, nil)
+	task, err := vm.RemoveSnapshot(d.Ctx(""), backupName, true, nil)
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "RMBackup",
 			Message: fmt.Sprintf("删除快照失败: %v", err)}, nil
 	}
-	if err := task.Wait(d.ctx); err != nil {
+	if err := task.Wait(d.Ctx("")); err != nil {
 		return &model.ZMessage{Success: false, Action: "RMBackup",
 			Message: fmt.Sprintf("等待删除任务失败: %v", err)}, nil
 	}
@@ -564,7 +564,7 @@ func (d *ESXiDriver) GetPCIList() (map[string]*model.VFConfig, error) {
 		return result, nil
 	}
 	var hs mo.HostSystem
-	if err := host.Properties(d.ctx, host.Reference(), []string{"hardware.pciDevice"}, &hs); err != nil {
+	if err := host.Properties(d.Ctx(""), host.Reference(), []string{"hardware.pciDevice"}, &hs); err != nil {
 		return result, nil
 	}
 	for i := range hs.Hardware.PciDevice {
@@ -642,7 +642,7 @@ func (d *ESXiDriver) GetScreenshot(vmUUID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	power, err := vm.PowerState(d.ctx)
+	power, err := vm.PowerState(d.Ctx(""))
 	if err != nil {
 		return "", err
 	}
@@ -650,7 +650,7 @@ func (d *ESXiDriver) GetScreenshot(vmUUID string) (string, error) {
 		return "", fmt.Errorf("虚拟机未运行，无法截图")
 	}
 
-	resp, err := methods.CreateScreenshot_Task(d.ctx, vm.Client(), &types.CreateScreenshot_Task{
+	resp, err := methods.CreateScreenshot_Task(d.Ctx(""), vm.Client(), &types.CreateScreenshot_Task{
 		This: vm.Reference(),
 	})
 	if err != nil {
@@ -658,7 +658,7 @@ func (d *ESXiDriver) GetScreenshot(vmUUID string) (string, error) {
 	}
 
 	task := object.NewTask(vm.Client(), resp.Returnval)
-	info, err := task.WaitForResult(d.ctx, nil)
+	info, err := task.WaitForResult(d.Ctx(""), nil)
 	if err != nil {
 		return "", fmt.Errorf("等待截图任务失败: %w", err)
 	}
@@ -672,7 +672,7 @@ func (d *ESXiDriver) GetScreenshot(vmUUID string) (string, error) {
 		targetURL = fmt.Sprintf("https://%s%s", d.Config.ServerAddr, targetURL)
 	}
 
-	req, err := http.NewRequestWithContext(d.ctx, http.MethodGet, targetURL, nil)
+	req, err := http.NewRequestWithContext(d.Ctx(""), http.MethodGet, targetURL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -715,7 +715,7 @@ func (d *ESXiDriver) SetPassword(vmUUID string, password string) (*model.ZMessag
 	}
 
 	var moVM mo.VirtualMachine
-	if err := vm.Properties(d.ctx, vm.Reference(),
+	if err := vm.Properties(d.Ctx(""), vm.Reference(),
 		[]string{"guest.toolsRunningStatus", "guest.guestOperationsReady"}, &moVM); err != nil {
 		return &model.ZMessage{Success: false, Action: "VMPasswd",
 			Message: "读取来宾状态失败: " + err.Error()}, nil
@@ -739,7 +739,7 @@ func (d *ESXiDriver) SetPassword(vmUUID string, password string) (*model.ZMessag
 	auth := &types.NamePasswordAuthentication{Username: user, Password: oldPass}
 
 	om := guest.NewOperationsManager(vm.Client(), vm.Reference())
-	procMgr, err := om.ProcessManager(d.ctx)
+	procMgr, err := om.ProcessManager(d.Ctx(""))
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "VMPasswd",
 			Message: "获取来宾进程管理器失败: " + err.Error()}, nil
@@ -747,7 +747,7 @@ func (d *ESXiDriver) SetPassword(vmUUID string, password string) (*model.ZMessag
 
 	// 通过 StartProgramInGuest 调用 chpasswd
 	cmd := fmt.Sprintf("echo '%s:%s' | chpasswd", user, password)
-	pid, err := procMgr.StartProgram(d.ctx, auth, &types.GuestProgramSpec{
+	pid, err := procMgr.StartProgram(d.Ctx(""), auth, &types.GuestProgramSpec{
 		ProgramPath: "/bin/sh",
 		Arguments:   "-c \"" + cmd + "\"",
 	})
@@ -759,7 +759,7 @@ func (d *ESXiDriver) SetPassword(vmUUID string, password string) (*model.ZMessag
 	// 等待执行完成（最多 30 秒）
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		status, err := procMgr.ListProcesses(d.ctx, auth, []int64{pid})
+		status, err := procMgr.ListProcesses(d.Ctx(""), auth, []int64{pid})
 		if err == nil {
 			done := true
 			for i := range status {

@@ -6,7 +6,6 @@
 package driver
 
 import (
-	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -42,7 +41,7 @@ func (d *ProxmoxDriver) MountUSB(vmUUID string, usbKey string, mount bool) (*mod
 	}
 
 	if mount {
-		if _, err := vm.Config(context.Background(), proxmox.VirtualMachineOption{
+		if _, err := vm.Config(d.Ctx(""), proxmox.VirtualMachineOption{
 			Name:  "usb0",
 			Value: usbVal,
 		}); err != nil {
@@ -62,7 +61,7 @@ func (d *ProxmoxDriver) MountUSB(vmUUID string, usbKey string, mount bool) (*mod
 		return &model.ZMessage{Success: true, Action: "USBMount", Message: "USB存储挂载成功"}, nil
 	}
 
-	if _, err := vm.Config(context.Background(), proxmox.VirtualMachineOption{
+	if _, err := vm.Config(d.Ctx(""), proxmox.VirtualMachineOption{
 		Name:  "delete",
 		Value: "usb0",
 	}); err != nil {

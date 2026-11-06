@@ -348,7 +348,7 @@ func NewWorkstationDriver(cfg *model.HSConfig) *WorkstationDriver {
 func (d *WorkstationDriver) GetPower(vmUUID string) string {
 	url := fmt.Sprintf("http://%s/api/vms/%s/power",
 		d.Config.ServerAddr, vmUUID)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(d.Ctx(vmUUID), 10*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	req.SetBasicAuth(d.Config.ServerUser, d.Config.ServerPass)
@@ -476,7 +476,7 @@ func NewQingzhouDriver(cfg *model.HSConfig) *QingzhouDriver {
 func (d *QingzhouDriver) GetPower(vmUUID string) string {
 	url := fmt.Sprintf("http://%s/api/vm/%s/status",
 		d.Config.ServerAddr, vmUUID)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(d.Ctx(vmUUID), 10*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	req.Header.Set("Authorization", "Bearer "+d.Config.ServerPass)
@@ -509,7 +509,7 @@ func (d *QingzhouDriver) GetPower(vmUUID string) string {
 func (d *QingzhouDriver) GetStatus() (*model.HWStatus, error) {
 	hw := &model.HWStatus{OnUpdate: time.Now().Unix()}
 	url := fmt.Sprintf("http://%s/api/host/status", d.Config.ServerAddr)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(d.Ctx(""), 10*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	req.Header.Set("Authorization", "Bearer "+d.Config.ServerPass)

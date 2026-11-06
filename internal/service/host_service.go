@@ -37,6 +37,8 @@ type HostService struct {
 	// statusMu/statusCache 主机状态短缓存
 	statusMu    sync.Mutex
 	statusCache map[string]*hostStatusCacheEntry
+	// refreshing 标记正在后台刷新状态的主机，避免并发重复采集
+	refreshing map[string]bool
 }
 
 // NewHostService 创建主机管理服务
@@ -115,8 +117,10 @@ func (s *HostService) DeleteHost(hsName string) error {
 		return fmt.Errorf("删除主机失败: %w", err)
 	}
 	s.mu.Lock()
+	old := s.drivers[hsName]
 	delete(s.drivers, hsName)
 	s.mu.Unlock()
+	shutdownDriver(old)
 	return nil
 }
 
@@ -129,10 +133,13 @@ func (s *HostService) SetHostEnable(hsName string, enable bool) error {
 	}
 
 	if !enable {
-		// 禁用：卸载驱动，后续请求将无法访问该主机
+		// 禁用：卸载驱动，后续请求将无法访问该主机。
+		// 同时取消驱动生命周期 context，中断仍在等待平台返回的操作。
 		s.mu.Lock()
+		old := s.drivers[hsName]
 		delete(s.drivers, hsName)
 		s.mu.Unlock()
+		shutdownDriver(old)
 		return nil
 	}
 
@@ -184,17 +191,30 @@ func (s *HostService) GetHostStatusPayload(hsName string, refresh bool) (map[str
 		}, nil
 	}
 
+	// stale-while-revalidate：有缓存就立刻返回，过期后在后台刷新。
+	// 采集需要访问平台 API（PVE/ESXi/云），一次可能要几百毫秒到数秒；
+	// 主机列表页打开时如果同步等待所有主机采集，页面会一直转圈。
+	// 这里的语义是「展示可能略旧的状态」，与前端诉求一致。
 	if !refresh {
 		s.statusMu.Lock()
 		entry := s.statusCache[hsName]
 		s.statusMu.Unlock()
-		if entry != nil && now.Sub(entry.cachedAt) < statusCacheTTL {
+		if entry != nil {
+			if now.Sub(entry.cachedAt) >= statusCacheTTL {
+				s.refreshHostStatusAsync(hsName)
+			}
 			return map[string]interface{}{
 				"status":      entry.status,
 				"source":      "cached",
 				"cached_at":   entry.cachedAt.Unix(),
 				"age_seconds": int(now.Sub(entry.cachedAt).Seconds()),
 			}, nil
+		}
+
+		// 没有内存缓存：先用数据库里最近一次采集结果顶上，同时后台刷新
+		if dbPayload, ok := s.statusFromDBIfAvailable(hsName, now); ok {
+			s.refreshHostStatusAsync(hsName)
+			return dbPayload, nil
 		}
 	}
 
@@ -228,6 +248,73 @@ func (s *HostService) GetHostStatusPayload(hsName string, refresh bool) (map[str
 		"cached_at":   now.Unix(),
 		"age_seconds": 0,
 	}, nil
+}
+
+// statusFromDBIfAvailable 数据库里有历史状态时返回它（second=false 表示没有可用数据）。
+// 与 statusFromDB 的区别：这里不伪造空的 error 响应，让调用方决定是否现场采集。
+func (s *HostService) statusFromDBIfAvailable(hsName string, now time.Time) (map[string]interface{}, bool) {
+	list, err := s.db.GetHSStatus(hsName, 1)
+	if err != nil || len(list) == 0 {
+		return nil, false
+	}
+	var status interface{}
+	if err := json.Unmarshal([]byte(list[0]), &status); err != nil || status == nil {
+		return nil, false
+	}
+	return map[string]interface{}{
+		"status":      status,
+		"source":      "db",
+		"cached_at":   now.Unix(),
+		"age_seconds": 0,
+	}, true
+}
+
+// refreshHostStatusAsync 后台采集一次主机状态并写入缓存/数据库。
+//
+// 同一主机同时只允许一次采集：主机列表页会并发请求多台主机状态，
+// 没有去重会放大下游平台压力。
+func (s *HostService) refreshHostStatusAsync(hsName string) {
+	s.statusMu.Lock()
+	if s.refreshing == nil {
+		s.refreshing = make(map[string]bool)
+	}
+	if s.refreshing[hsName] {
+		s.statusMu.Unlock()
+		return
+	}
+	s.refreshing[hsName] = true
+	s.statusMu.Unlock()
+
+	go func() {
+		defer func() {
+			s.statusMu.Lock()
+			delete(s.refreshing, hsName)
+			s.statusMu.Unlock()
+		}()
+
+		d := s.GetOrCreateDriver(hsName)
+		if d == nil {
+			return
+		}
+		hw, err := d.GetStatus()
+		if err != nil || hw == nil {
+			return
+		}
+		now := time.Now()
+		if hw.OnUpdate == 0 {
+			hw.OnUpdate = now.Unix()
+		}
+		if hw.CpuTotal <= 0 && hw.MemTotal <= 0 {
+			return
+		}
+		_ = s.db.AddHSStatus(hsName, hw)
+		s.statusMu.Lock()
+		if s.statusCache == nil {
+			s.statusCache = make(map[string]*hostStatusCacheEntry)
+		}
+		s.statusCache[hsName] = &hostStatusCacheEntry{status: hw, cachedAt: now}
+		s.statusMu.Unlock()
+	}()
 }
 
 // statusFromDB 采集不可用时回退到最近一次落库的状态
@@ -345,8 +432,40 @@ func (s *HostService) initDriver(cfg *model.HSConfig) {
 	}
 	s.restoreVMSaving(cfg.ServerName, d)
 	s.mu.Lock()
+	old := s.drivers[cfg.ServerName]
 	s.drivers[cfg.ServerName] = d
 	s.mu.Unlock()
+
+	// 配置重载/主机更新会用新驱动替换旧驱动：旧驱动上可能还有在等待
+	// 平台任务的 goroutine（PVE WaitFor 最长 24 小时），必须取消其
+	// 生命周期 context，否则连接与协程会一直残留。
+	shutdownDriver(old)
+}
+
+// shutdownDriver 取消驱动的生命周期 context（驱动实现了 Shutdown 时）
+func shutdownDriver(d driver.HostDriver) {
+	if d == nil {
+		return
+	}
+	if s, ok := d.(interface{ Shutdown() }); ok {
+		s.Shutdown()
+	}
+}
+
+// ShutdownAll 卸载全部驱动并取消其生命周期 context。
+// 供服务退出时调用：避免进程退出前仍有 goroutine 卡在平台调用上。
+func (s *HostService) ShutdownAll() {
+	s.mu.Lock()
+	drivers := make([]driver.HostDriver, 0, len(s.drivers))
+	for _, d := range s.drivers {
+		drivers = append(drivers, d)
+	}
+	s.drivers = make(map[string]driver.HostDriver)
+	s.mu.Unlock()
+
+	for _, d := range drivers {
+		shutdownDriver(d)
+	}
 }
 
 // restoreVMSaving 从数据库恢复驱动内存中的虚拟机配置
@@ -458,9 +577,12 @@ func rowToHSConfig(row *data.HSConfigRow) (*model.HSConfig, error) {
 	cfg.PortsClose = row.PortsClose
 	cfg.RemotePort = row.RemotePort
 	cfg.LimitsNums = row.LimitsNums
-	cfg.IKuaiAddr = row.IKuaiAddr
+	// 历史数据里可能存着浏览器地址栏整段 URL（带 /login#/login），
+	// 读取时一并规范化，避免界面回显与实际请求不一致。
+	cfg.IKuaiAddr = cleanIKuaiAddr(row.IKuaiAddr)
 	cfg.IKuaiUser = row.IKuaiUser
 	cfg.IKuaiPass = row.IKuaiPass
+	cfg.IKuaiToken = row.IKuaiToken
 	cfg.NCpuPrice = row.NCpuPrice
 	cfg.NMemPrice = row.NMemPrice
 	cfg.NHddPrice = row.NHddPrice
@@ -664,9 +786,10 @@ func hsConfigToRow(cfg *model.HSConfig) (*data.HSConfigRow, error) {
 		PortsClose: cfg.PortsClose,
 		RemotePort: cfg.RemotePort,
 		LimitsNums: cfg.LimitsNums,
-		IKuaiAddr:  cfg.IKuaiAddr,
+		IKuaiAddr:  cleanIKuaiAddr(cfg.IKuaiAddr),
 		IKuaiUser:  cfg.IKuaiUser,
 		IKuaiPass:  cfg.IKuaiPass,
+		IKuaiToken: cfg.IKuaiToken,
 		NCpuPrice:  cfg.NCpuPrice,
 		NMemPrice:  cfg.NMemPrice,
 		NHddPrice:  cfg.NHddPrice,

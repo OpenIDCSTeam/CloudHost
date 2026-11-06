@@ -163,6 +163,24 @@ type BaseDriver struct {
 	VmSaving map[string]*model.VMConfig
 	mu       sync.RWMutex
 	self     HostDriver // 最外层驱动实例（用于模拟 Python 虚方法派发）
+
+	// lifeOnce/lifeCtx/lifeCancel 驱动生命周期 context。
+	// 驱动被卸载或服务退出时取消，让所有在途的平台调用立刻返回，
+	// 而不是让 goroutine 挂死在 PVE/vSphere 的无响应连接上。
+	lifeOnce   sync.Once
+	lifeCtx    context.Context
+	lifeCancel context.CancelFunc
+
+	// opCtxs 请求级 context（key 为 vmUUID）。
+	// BindContext 在请求入口绑定，平台调用通过 Ctx(vmUUID) 取用，
+	// 客户端断开连接后由 net/http 取消请求 ctx，驱动的长操作随之中断。
+	opCtxs sync.Map // map[string]boundContext
+}
+
+// boundContext 已绑定的请求 context 及其取消函数
+type boundContext struct {
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewBaseDriver 创建基础驱动
@@ -171,6 +189,69 @@ func NewBaseDriver(cfg *model.HSConfig) *BaseDriver {
 		Config:   cfg,
 		VmSaving: make(map[string]*model.VMConfig),
 	}
+}
+
+// lifeContext 惰性初始化驱动生命周期 context。
+// 部分驱动历史上直接构造 BaseDriver{}，因此不能假设构造函数一定被调用。
+func (b *BaseDriver) lifeContext() context.Context {
+	b.lifeOnce.Do(func() {
+		b.lifeCtx, b.lifeCancel = context.WithCancel(context.Background())
+	})
+	return b.lifeCtx
+}
+
+// Ctx 返回平台调用应使用的 context。
+//
+// 优先取该虚拟机绑定的请求 context（可随客户端断开取消），
+// 没有绑定则退化为驱动生命周期 context（可随驱动卸载取消）。
+// 二者都不再是永不取消的 context.Background()。
+func (b *BaseDriver) Ctx(vmUUID string) context.Context {
+	if vmUUID != "" {
+		if v, ok := b.opCtxs.Load(vmUUID); ok {
+			if bc, ok := v.(boundContext); ok && bc.ctx != nil && bc.ctx.Err() == nil {
+				return bc.ctx
+			}
+		}
+	}
+	return b.lifeContext()
+}
+
+// BindContext 把 HTTP 请求的 context 绑定到某个虚拟机上，
+// 返回的释放函数必须在请求结束时调用（defer）。
+// vmUUID 为空或 parent 为 nil 时返回空操作。
+func (b *BaseDriver) BindContext(vmUUID string, parent context.Context) func() {
+	if vmUUID == "" || parent == nil {
+		return func() {}
+	}
+	ctx, cancel := context.WithCancel(parent)
+	bound := boundContext{ctx: ctx, cancel: cancel}
+	b.opCtxs.Store(vmUUID, bound)
+
+	return func() {
+		cancel()
+		// 只删除自己写入的那一份，避免误删后续请求绑定的 ctx
+		if v, ok := b.opCtxs.Load(vmUUID); ok {
+			if cur, ok := v.(boundContext); ok && cur.ctx == ctx {
+				b.opCtxs.Delete(vmUUID)
+			}
+		}
+	}
+}
+
+// Shutdown 取消驱动生命周期 context 与全部已绑定的请求 context。
+// 供主机卸载、配置重载与服务退出时调用。
+func (b *BaseDriver) Shutdown() {
+	b.lifeContext()
+	if b.lifeCancel != nil {
+		b.lifeCancel()
+	}
+	b.opCtxs.Range(func(key, value interface{}) bool {
+		if bc, ok := value.(boundContext); ok {
+			bc.cancel()
+		}
+		b.opCtxs.Delete(key)
+		return true
+	})
 }
 
 // SetSelf 记录最外层驱动实例（由 NewDriver 在构造后调用）
@@ -265,6 +346,12 @@ func CloneVMConfig(src *model.VMConfig) *model.VMConfig {
 		dst.VmCmdResult = make(map[string]interface{}, len(src.VmCmdResult))
 		for k, v := range src.VmCmdResult {
 			dst.VmCmdResult[k] = v
+		}
+	}
+	if src.RdpInfo != nil {
+		dst.RdpInfo = make(map[string]interface{}, len(src.RdpInfo))
+		for k, v := range src.RdpInfo {
+			dst.RdpInfo[k] = v
 		}
 	}
 	if src.ExtData != nil {

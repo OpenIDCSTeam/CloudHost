@@ -23,7 +23,7 @@ func (d *ESXiDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey string,
 			Message: fmt.Sprintf("查找虚拟机失败: %v", err)}, nil
 	}
 
-	if power, _ := vm.PowerState(d.ctx); power != types.VirtualMachinePowerStatePoweredOff {
+	if power, _ := vm.PowerState(d.Ctx("")); power != types.VirtualMachinePowerStatePoweredOff {
 		return &model.ZMessage{Success: false, Action: "PCISetup",
 			Message: "PCI直通需要先关闭虚拟机"}, nil
 	}
@@ -147,7 +147,7 @@ func (d *ESXiDriver) SetupUSB(vmUUID string, info *model.USBInfos, usbKey string
 // findPCIDevice 查找指定 PCI 直通设备
 func (d *ESXiDriver) findPCIDevice(vm *object.VirtualMachine, pciID string) (types.BaseVirtualDevice, error) {
 	var moVM mo.VirtualMachine
-	if err := vm.Properties(d.ctx, vm.Reference(), []string{"config.hardware.device"}, &moVM); err != nil {
+	if err := vm.Properties(d.Ctx(""), vm.Reference(), []string{"config.hardware.device"}, &moVM); err != nil {
 		return nil, fmt.Errorf("读取设备列表失败: %v", err)
 	}
 	for _, dev := range moVM.Config.Hardware.Device {
@@ -165,7 +165,7 @@ func (d *ESXiDriver) findPCIDevice(vm *object.VirtualMachine, pciID string) (typ
 // findUSBDevice 查找指定 USB 设备
 func (d *ESXiDriver) findUSBDevice(vm *object.VirtualMachine, vendor, product int32) (types.BaseVirtualDevice, error) {
 	var moVM mo.VirtualMachine
-	if err := vm.Properties(d.ctx, vm.Reference(), []string{"config.hardware.device"}, &moVM); err != nil {
+	if err := vm.Properties(d.Ctx(""), vm.Reference(), []string{"config.hardware.device"}, &moVM); err != nil {
 		return nil, fmt.Errorf("读取设备列表失败: %v", err)
 	}
 	for _, dev := range moVM.Config.Hardware.Device {
@@ -182,11 +182,11 @@ func (d *ESXiDriver) findUSBDevice(vm *object.VirtualMachine, vendor, product in
 
 // reconfigure 提交设备变更并等待完成
 func (d *ESXiDriver) reconfigure(vm *object.VirtualMachine, spec types.VirtualMachineConfigSpec) (string, error) {
-	task, err := vm.Reconfigure(d.ctx, spec)
+	task, err := vm.Reconfigure(d.Ctx(""), spec)
 	if err != nil {
 		return fmt.Sprintf("配置失败: %v", err), err
 	}
-	if err := task.Wait(d.ctx); err != nil {
+	if err := task.Wait(d.Ctx("")); err != nil {
 		return fmt.Sprintf("等待任务失败: %v", err), err
 	}
 	return "", nil

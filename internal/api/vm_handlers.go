@@ -2,6 +2,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -30,6 +31,33 @@ import (
 // ============================================================
 // 虚拟机管理 API
 // ============================================================
+
+// bindRequestContext 把当前 HTTP 请求的 context 绑定到指定虚拟机。
+//
+// 驱动内部的平台调用通过 BaseDriver.Ctx(vmUUID) 取用该 context，
+// 客户端断开或请求超时后会立刻中断正在等待的平台任务（PVE WaitFor、
+// govmomi task.Wait 等），不再出现「用户取消 10 个创建请求、后端仍跑完」
+// 的资源堆积。返回值必须在请求结束时调用（defer）。
+//
+// 注意：只适用于同步处理路径。异步任务（创建/删除等）应改用任务自身的
+// context，否则请求一返回就会把正在执行的任务取消。
+func (app *App) bindRequestContext(c *gin.Context, hsName, vmUUID string) func() {
+	if c == nil || c.Request == nil || vmUUID == "" {
+		return func() {}
+	}
+	d := app.HostSvc.GetDriver(hsName)
+	if d == nil {
+		return func() {}
+	}
+	type contextBinder interface {
+		BindContext(string, context.Context) func()
+	}
+	binder, ok := d.(contextBinder)
+	if !ok {
+		return func() {}
+	}
+	return binder.BindContext(vmUUID, c.Request.Context())
+}
 
 // loadVMConfig 读取虚拟机配置：数据库为权威，驱动内存覆盖运行时状态。
 //
@@ -310,8 +338,21 @@ func (app *App) handleVMCreate(c *gin.Context) {
 	virtualUser := hsName + "-" + vmUUID
 	cfg.OwnAll[virtualUser] = model.VirtualUserMask()
 
-	if app.HostSvc.GetDriver(hsName) == nil {
+	d := app.HostSvc.GetDriver(hsName)
+	if d == nil {
 		utils.NotFound(c, "主机不存在或未启用")
+		return
+	}
+
+	// 幂等保护：同一 vm_uuid 只允许存在一台虚拟机。
+	// 原实现既不查数据库也不查驱动内存，任务完成后重复提交会真的创建第二台
+	// （Proxmox 侧拿到新的 VMID，本地记录被覆盖，前一台成为失去纳管的孤儿）。
+	if app.HostSvc.VMExists(hsName, vmUUID) {
+		utils.Fail(c, 409, "虚拟机已存在: "+vmUUID)
+		return
+	}
+	if _, exists := d.GetVMSaving()[vmUUID]; exists {
+		utils.Fail(c, 409, "虚拟机已存在: "+vmUUID)
 		return
 	}
 
@@ -523,7 +564,7 @@ func (app *App) handleVMDelete(c *gin.Context) {
 			d.RemoveVMSaving(vmUUID)
 		}
 		if err := app.DB.DeleteVMConfig(hsName, vmUUID); err != nil {
-			utils.InternalError(c, "移除虚拟机记录失败: "+err.Error())
+			utils.InternalErrorf(c, "移除虚拟机记录失败", err)
 			return
 		}
 		_ = app.DB.DeleteVMStatus(hsName, vmUUID)
@@ -578,6 +619,9 @@ func (app *App) handleVMPowers(c *gin.Context) {
 		utils.NotFound(c, "主机不存在或未启用")
 		return
 	}
+	// 电源操作会等待平台任务（软关机最长 30 秒），请求中断时应同步取消
+	release := app.bindRequestContext(c, hsName, vmUUID)
+	defer release()
 
 	action, ok := normalizePowerAction(req.Action)
 	if !ok {
@@ -606,6 +650,9 @@ func (app *App) handleVMPowers(c *gin.Context) {
 	if vm != nil {
 		_ = app.DB.UpsertVMConfig(hsName, vmUUID, vm)
 	}
+
+	// 电源状态变化后旧截图必然失效，丢弃缓存避免前端继续看到关机画面
+	invalidateScreenshotCache(hsName, vmUUID)
 
 	// 软关机 / 软重启是异步操作：平台受理后状态不会立刻变化，
 	// 需要后台监控直到实际状态稳定（对应 Python 版 BasicServer.soft_pwr）。
@@ -674,6 +721,8 @@ func (app *App) handleVMRemote(c *gin.Context) {
 		utils.NotFound(c, "主机不存在或未启用")
 		return
 	}
+	release := app.bindRequestContext(c, hsName, vmUUID)
+	defer release()
 
 	ipAddr := c.ClientIP()
 	result, err := d.GetVNCInfo(vmUUID, ipAddr)
@@ -807,13 +856,17 @@ func (app *App) buildConsoleURL(c *gin.Context, d driver.HostDriver, hsName, vmU
 		apiHost := strings.TrimSpace(strOf(results["api_host"]))
 		node := strings.TrimSpace(strOf(results["node"]))
 		vmid := toPortInt(results["vmid"])
+		vncPort := toPortInt(results["port"])
+		ticket := strOf(results["ticket"])
+		password := strOf(results["password"])
 		cookie := strOf(results["cookie"])
 		csrf := strOf(results["csrf"])
-		if apiHost == "" || node == "" || vmid <= 0 || cookie == "" {
+		if apiHost == "" || node == "" || vmid <= 0 || vncPort <= 0 || ticket == "" || cookie == "" {
 			return ""
 		}
-		token := registerPVEVNCToken(hsName, vmUUID, apiHost, node, vmid, cookie, csrf)
-		return composeConsoleURL("http", consoleHostFromRequest(c, cfg), vncProxyPort, token, "")
+		token := registerPVEVNCToken(hsName, vmUUID, apiHost, node, vmid, vncPort, ticket, cookie, csrf)
+		// password 是 QEMU 的 VNC 密码（ticket 前 8 位），不带就过不了认证
+		return composeConsoleURL("http", consoleHostFromRequest(c, cfg), vncProxyPort, token, password)
 	}
 
 	host := ""
@@ -933,6 +986,15 @@ func (app *App) handleVMScreenshot(c *gin.Context) {
 		return
 	}
 
+	release := app.bindRequestContext(c, hsName, vmUUID)
+	defer release()
+
+	cacheKey := hsName + "/" + vmUUID
+	if cached, ok := getCachedScreenshot(cacheKey); ok {
+		utils.Success(c, gin.H{"screenshot": normalizeScreenshot(cached), "cached": true})
+		return
+	}
+
 	screenshot, err := d.GetScreenshot(vmUUID)
 	if err != nil {
 		// 截图失败原因必须透出：前端只显示「获取截图失败」时，
@@ -940,6 +1002,9 @@ func (app *App) handleVMScreenshot(c *gin.Context) {
 		app.Logger.Log(hsName, "WARNING", "虚拟机截图", "截图失败: "+err.Error(), false)
 		utils.Fail(c, 502, "获取截图失败: "+err.Error())
 		return
+	}
+	if strings.TrimSpace(screenshot) != "" {
+		setCachedScreenshot(cacheKey, screenshot)
 	}
 	utils.Success(c, gin.H{"screenshot": normalizeScreenshot(screenshot)})
 }
@@ -982,6 +1047,8 @@ func (app *App) handleVMPassword(c *gin.Context) {
 		utils.NotFound(c, "虚拟机不存在")
 		return
 	}
+	release := app.bindRequestContext(c, hsName, vmUUID)
+	defer release()
 
 	switch strings.ToLower(strings.TrimSpace(req.Type)) {
 	case "vnc_password":
@@ -1240,7 +1307,7 @@ func (app *App) handleVMScan(c *gin.Context) {
 
 	msg, scanErr := d.ScanVMs()
 	if scanErr != nil {
-		utils.InternalError(c, "扫描虚拟机失败: "+scanErr.Error())
+		utils.InternalErrorf(c, "扫描虚拟机失败", scanErr)
 		return
 	}
 	if msg != nil && !msg.Success {
@@ -1251,7 +1318,7 @@ func (app *App) handleVMScan(c *gin.Context) {
 	// 平台侧枚举结果（含内存态，用于恢复此前被标记删除的虚拟机）
 	platformVMs, listErr := d.GetVMList()
 	if listErr != nil {
-		utils.InternalError(c, "读取平台虚拟机列表失败: "+listErr.Error())
+		utils.InternalErrorf(c, "读取平台虚拟机列表失败", listErr)
 		return
 	}
 
@@ -1346,7 +1413,7 @@ func (app *App) handleVMCleanup(c *gin.Context) {
 	candidates := make(map[string]*model.VMConfig)
 	rawMap, err := app.DB.GetVMSaving(hsName)
 	if err != nil {
-		utils.InternalError(c, "读取虚拟机记录失败: "+err.Error())
+		utils.InternalErrorf(c, "读取虚拟机记录失败", err)
 		return
 	}
 	for uuid, raw := range rawMap {
@@ -1564,7 +1631,7 @@ func (app *App) handleVMDedupe(c *gin.Context) {
 	candidates := make(map[string]*model.VMConfig)
 	rawMap, err := app.DB.GetVMSaving(hsName)
 	if err != nil {
-		utils.InternalError(c, "读取虚拟机记录失败: "+err.Error())
+		utils.InternalErrorf(c, "读取虚拟机记录失败", err)
 		return
 	}
 	for uuid, raw := range rawMap {

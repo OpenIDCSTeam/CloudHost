@@ -140,8 +140,12 @@ func (app *App) handleLogin(c *gin.Context) {
 			return
 		}
 		userInfo = user
-		// 更新最后登录时间
-		_ = app.DB.UpdateUserLastLogin(req.Username)
+		// 更新最后登录时间。写库失败不影响本次登录，但必须留痕：
+		// 静默吞掉后「最后登录时间」长期不更新时无从排查。
+		if loginErr := app.DB.UpdateUserLastLogin(req.Username); loginErr != nil {
+			app.Logger.Event("auth", "用户登录").User(req.Username).IP(ip).
+				Err(loginErr).Warn("更新最后登录时间失败")
+		}
 	}
 
 	// 重置登录失败计数
@@ -614,8 +618,28 @@ func (app *App) handleUserCurrent(c *gin.Context) {
 }
 
 // handleUserList GET /api/users
+//
+// 兼容两种返回形态：
+//   - 不带 limit：返回用户数组（保持旧前端行为）；
+//   - 带 limit/offset：返回 {items,total,limit,offset}，避免用户量大时全量加载。
 func (app *App) handleUserList(c *gin.Context) {
-	users, err := app.DB.GetAllUsers()
+	limit := 0
+	if v := strings.TrimSpace(c.Query("limit")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	offset := 0
+	if v := strings.TrimSpace(c.Query("offset")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			offset = n
+		}
+	}
+
+	users, err := app.DB.GetAllUsersPage(limit, offset)
 	if err != nil {
 		utils.InternalError(c, "获取用户列表失败")
 		return
@@ -623,6 +647,17 @@ func (app *App) handleUserList(c *gin.Context) {
 	result := make([]map[string]interface{}, 0, len(users))
 	for _, u := range users {
 		result = append(result, sanitizeUser(u))
+	}
+
+	if limit > 0 {
+		total, countErr := app.DB.CountUsers()
+		if countErr != nil {
+			total = len(result)
+		}
+		utils.Success(c, gin.H{
+			"items": result, "total": total, "limit": limit, "offset": offset,
+		})
+		return
 	}
 	utils.Success(c, result)
 }
@@ -650,7 +685,7 @@ func (app *App) handleUserCreate(c *gin.Context) {
 		app.logEvent(c, "user", "创建用户").
 			Detail("target_user", username).Detail("email", email).Detail("is_admin", isAdmin).Err(err).
 			Errorf("创建用户失败：%v", err)
-		utils.InternalError(c, "创建用户失败: "+err.Error())
+		utils.InternalErrorf(c, "创建用户失败", err)
 		return
 	}
 

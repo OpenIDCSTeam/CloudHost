@@ -60,7 +60,7 @@ func (d *SmolVMDriver) execHost(cmd string, timeout time.Duration) (bool, string
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(d.Ctx(""), timeout)
 	defer cancel()
 
 	if d.isRemote() {

@@ -28,6 +28,12 @@ type HostConfigBackup struct {
 	Hosts      []*model.HSConfig `json:"hosts"`
 }
 
+// optionalBackupFields 允许在备份文件中缺失的字段。
+// 这些字段是后续版本新增的可选项，旧备份没有它们时必须仍能还原。
+var optionalBackupFields = map[string]bool{
+	"i_kuai_token": true,
+}
+
 type HostConfigRestoreItem struct {
 	Name       string `json:"name"`
 	Type       string `json:"type"`
@@ -73,6 +79,10 @@ func DecodeHostConfigBackup(raw json.RawMessage) (*HostConfigBackup, error) {
 		for key := range fields {
 			value, exists := envelope.Hosts[i][key]
 			if !exists || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+				// 后新增的可选字段：缺失时取零值，避免旧备份文件全部失效
+				if optionalBackupFields[key] {
+					continue
+				}
 				return nil, fmt.Errorf("第 %d 台主机缺少完整字段 %s，请使用导出的配置文件", i+1, key)
 			}
 		}
@@ -195,8 +205,10 @@ func (s *HostService) RestoreHostConfigs(backup *HostConfigBackup, overwrite boo
 	}
 	for _, cfg := range backup.Hosts {
 		s.mu.Lock()
+		old := s.drivers[cfg.ServerName]
 		delete(s.drivers, cfg.ServerName)
 		s.mu.Unlock()
+		shutdownDriver(old)
 		s.statusMu.Lock()
 		delete(s.statusCache, cfg.ServerName)
 		s.statusMu.Unlock()

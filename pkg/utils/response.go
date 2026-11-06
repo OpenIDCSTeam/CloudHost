@@ -2,6 +2,7 @@
 package utils
 
 import (
+	"log"
 	"net/http"
 	"time"
 
@@ -83,7 +84,43 @@ func TooManyRequests(c *gin.Context, msg string) {
 	Fail(c, 429, msg)
 }
 
-// InternalError 500 服务器错误
+// requestIDContextKey 与 middleware.ContextRequestID 保持一致。
+// 这里不 import middleware 包：auth/middleware 均依赖 utils，反向依赖会成环。
+const requestIDContextKey = "request_id"
+
+// RequestID 返回当前请求的追踪号（未启用中间件时为空串）
+func RequestID(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	if v, ok := c.Get(requestIDContextKey); ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// InternalError 500 服务器错误（msg 必须是面向用户的固定文案）
 func InternalError(c *gin.Context, msg string) {
+	Fail(c, 500, msg)
+}
+
+// InternalErrorf 记录内部错误详情，并向客户端返回脱敏文案。
+//
+// 原实现把 err.Error() 直接拼进响应，会把表结构、文件路径、驱动内部
+// 实现细节泄露给调用方；详细原因只写日志，响应里带请求号供排查关联。
+func InternalErrorf(c *gin.Context, msg string, err error) {
+	rid := RequestID(c)
+	method, path := "", ""
+	if c != nil && c.Request != nil {
+		method, path = c.Request.Method, c.Request.URL.Path
+	}
+	log.Printf("[error] rid=%s %s %s %s: %v", rid, method, path, msg, err)
+
+	if rid != "" {
+		Fail(c, 500, msg+"（请求号: "+rid+"）")
+		return
+	}
 	Fail(c, 500, msg)
 }

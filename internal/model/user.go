@@ -1,7 +1,10 @@
 // Package model User模型
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // User 用户模型（替代 map[string]interface{} 以避免类型断言panic）
 type User struct {
@@ -96,14 +99,42 @@ func SafeGetInt(m map[string]interface{}, key string) int {
 }
 
 // SafeGetBool 安全获取map中的bool值
+//
+// 数据库与 JSON 解码得到的数值类型并不统一：SQLite 驱动返回 int64，
+// JSON 默认解成 float64。旧实现只认 bool/int，遇到 int64/float64 会把
+// is_active=1 判成 false（账号被误判为禁用），这里统一覆盖。
 func SafeGetBool(m map[string]interface{}, key string) bool {
 	if v, ok := m[key]; ok {
-		if b, ok := v.(bool); ok {
-			return b
-		}
-		// 尝试int转bool (数据库可能存储为0/1)
-		if i, ok := v.(int); ok {
-			return i != 0
+		switch val := v.(type) {
+		case bool:
+			return val
+		case int:
+			return val != 0
+		case int8:
+			return val != 0
+		case int16:
+			return val != 0
+		case int32:
+			return val != 0
+		case int64:
+			return val != 0
+		case uint:
+			return val != 0
+		case uint8:
+			return val != 0
+		case uint16:
+			return val != 0
+		case uint32:
+			return val != 0
+		case uint64:
+			return val != 0
+		case float32:
+			return val != 0
+		case float64:
+			return val != 0
+		case string:
+			s := strings.ToLower(strings.TrimSpace(val))
+			return s == "1" || s == "true" || s == "yes" || s == "on"
 		}
 	}
 	return false

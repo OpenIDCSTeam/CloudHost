@@ -38,9 +38,11 @@ type Task struct {
 	CreatedBy   string                 `json:"created_by"`
 	HsName      string                 `json:"hs_name"`
 	VmUUID      string                 `json:"vm_uuid"`
-	CreatedAt   time.Time              `json:"created_at"`
-	StartedAt   *time.Time             `json:"started_at"`
-	CompletedAt *time.Time             `json:"completed_at"`
+	// Version 乐观锁版本号，每次成功写入自增
+	Version     int        `json:"version"`
+	CreatedAt   time.Time  `json:"created_at"`
+	StartedAt   *time.Time `json:"started_at"`
+	CompletedAt *time.Time `json:"completed_at"`
 }
 
 // TaskFilter 任务过滤器
@@ -63,13 +65,18 @@ func (d *DB) SaveTask(
 	createdAt time.Time,
 	startedAt, completedAt *time.Time,
 ) error {
+	// UPSERT 带乐观锁：
+	//  1. 已处于终态（completed/failed/cancelled/stopped）的任务，只允许被终态或
+	//     pending（重试重置）覆盖，避免迟到的 running 写入把成功改回执行中；
+	//  2. 非重试场景下进度只增不减，防止乱序写入让进度条回退；
+	//  3. 命中更新时 version 自增，调用方可在 GetTask 后做版本比对。
 	query := `
 		INSERT INTO async_tasks (
 			id, name, type, status, progress, message, 
 			result, error, metadata, created_by,
 			hs_name, vm_uuid,
-			created_at, started_at, completed_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			created_at, started_at, completed_at, version
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
 		ON CONFLICT(id) DO UPDATE SET
 			status = excluded.status,
 			progress = excluded.progress,
@@ -80,7 +87,18 @@ func (d *DB) SaveTask(
 			hs_name = excluded.hs_name,
 			vm_uuid = excluded.vm_uuid,
 			started_at = excluded.started_at,
-			completed_at = excluded.completed_at
+			completed_at = excluded.completed_at,
+			version = async_tasks.version + 1
+		WHERE
+			(
+				async_tasks.status NOT IN ('completed', 'failed', 'cancelled', 'stopped')
+				OR excluded.status IN ('completed', 'failed', 'cancelled', 'stopped', 'pending')
+			)
+			AND (
+				excluded.status = 'pending'
+				OR excluded.progress >= async_tasks.progress
+				OR async_tasks.progress <= 0
+			)
 	`
 
 	_, err := d.db.Exec(
@@ -99,7 +117,7 @@ func (d *DB) GetTask(taskID string) (*Task, error) {
 		SELECT id, name, type, status, progress, message,
 		       result, error, metadata, created_by,
 		       COALESCE(hs_name,''), COALESCE(vm_uuid,''),
-		       created_at, started_at, completed_at
+		       created_at, started_at, completed_at, COALESCE(version, 0)
 		FROM async_tasks
 		WHERE id = ?
 	`
@@ -114,6 +132,7 @@ func (d *DB) GetTask(taskID string) (*Task, error) {
 		&resultJSON, &task.Error, &metadataJSON, &task.CreatedBy,
 		&task.HsName, &task.VmUUID,
 		&task.CreatedAt, &startedAt, &completedAt,
+		&task.Version,
 	)
 
 	if err != nil {
@@ -144,7 +163,7 @@ func (d *DB) ListTasks(filter TaskFilter) ([]*Task, int, error) {
 		SELECT id, name, type, status, progress, message,
 		       result, error, metadata, created_by,
 		       COALESCE(hs_name,''), COALESCE(vm_uuid,''),
-		       created_at, started_at, completed_at
+		       created_at, started_at, completed_at, COALESCE(version, 0)
 		FROM async_tasks
 		WHERE 1=1
 	`
@@ -240,6 +259,7 @@ func (d *DB) ListTasks(filter TaskFilter) ([]*Task, int, error) {
 			&resultJSON, &task.Error, &metadataJSON, &task.CreatedBy,
 			&task.HsName, &task.VmUUID,
 			&task.CreatedAt, &startedAt, &completedAt,
+			&task.Version,
 		)
 		if err != nil {
 			return nil, 0, err

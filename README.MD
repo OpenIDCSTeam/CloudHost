@@ -139,7 +139,7 @@ sudo bash install.sh --uninstall   # 卸载（保留数据）
 
 ```bash
 # 构建 pkg（需 macOS + Xcode Command Line Tools）
-GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 \
+GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 \
   go build -trimpath -ldflags "-s -w" -o dist/hostagent-darwin-arm64 ./cmd/server
 chmod +x packaging/macos/build-pkg.sh
 ./packaging/macos/build-pkg.sh 1.0.0 arm64
@@ -173,7 +173,8 @@ sudo installer -pkg BuildCache/OpenIDCS-HostAgent-1.0.0-macos-arm64.pkg -target 
 
 - **操作系统**: Windows 10/11、Linux（Ubuntu 20.04+ / Debian 11+ / RHEL 8+）、macOS 12+
 - **Go**: 1.26 或更高版本
-- **C 工具链**: SQLite 驱动依赖 CGO（Linux `gcc`、Windows MinGW、macOS `clang`）
+- **C 工具链**: 不需要。SQLite 驱动使用纯 Go 实现（`modernc.org/sqlite`），
+  `CGO_ENABLED=0` 即可编译，也支持直接交叉编译到其他平台
 - **内存**: 最少 4GB RAM（推荐 8GB+）
 - **网络**: 能够访问虚拟化平台的管理接口
 
@@ -191,8 +192,8 @@ go mod download
 go build -o hostagent ./cmd/server      # Windows: -o hostagent.exe
 ```
 
-> 交叉编译时需同时指定 `GOOS` / `GOARCH` / `CC`，例如
-> `GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 go build -o hostagent ./cmd/server`。
+> 无需 CGO，交叉编译只需指定 `GOOS` / `GOARCH`，例如
+> `GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o hostagent ./cmd/server`。
 
 #### 启动后端
 ```bash
@@ -372,6 +373,13 @@ OpenIDC-Client/
 | 数据/日志 | 保存在 `DataSaving/` 目录，按主机名分文件 |
 | 多语言 | 前端 `FrontPages/src/utils/i18n.ts`，后端 `HostConfig/translates/` |
 | API认证 | 支持 Token 与 Session 双重认证 |
+
+可选环境变量：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `OPENIDCS_COOKIE_SECURE` | 关闭 | 设为 `1` 时会话 Cookie 只通过 HTTPS 回传。HTTPS 部署应开启，纯 HTTP 部署必须关闭，否则浏览器不回传 Cookie、登录失效 |
+| `OPENIDCS_TASK_TIMEOUT_MINUTES` | `30` | 异步任务（创建/删除/更新/重装虚拟机）的执行超时，单位分钟；备份/还原类固定 24 小时 |
 
 所有为开源社区做出贡献的开发者们
 

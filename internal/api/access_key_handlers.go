@@ -198,7 +198,7 @@ func (app *App) handleVMGetAccessKey(c *gin.Context) {
 
 	key, enabled, err := app.AccessKeySvc.Get(hsName, vmUUID)
 	if err != nil {
-		utils.InternalError(c, "读取访问密钥失败: "+err.Error())
+		utils.InternalErrorf(c, "读取访问密钥失败", err)
 		return
 	}
 	utils.Success(c, app.vmAccessKeyPayload(hsName, vmUUID, key, enabled))
@@ -234,7 +234,7 @@ func (app *App) handleVMGenerateAccessKey(c *gin.Context) {
 	}
 	key, err := app.AccessKeySvc.Reset(hsName, vmUUID, createdBy)
 	if err != nil {
-		utils.InternalError(c, "生成访问密钥失败: "+err.Error())
+		utils.InternalErrorf(c, "生成访问密钥失败", err)
 		return
 	}
 
@@ -269,7 +269,7 @@ func (app *App) handleVMDeleteAccessKey(c *gin.Context) {
 
 	removed, err := app.AccessKeySvc.Revoke(hsName, vmUUID)
 	if err != nil {
-		utils.InternalError(c, "撤销访问密钥失败: "+err.Error())
+		utils.InternalErrorf(c, "撤销访问密钥失败", err)
 		return
 	}
 	app.Logger.Log("accesskey", "INFO", "访问密钥",

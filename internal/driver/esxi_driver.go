@@ -17,10 +17,13 @@ import (
 )
 
 // ESXiDriver VMware ESXi/vSphere 驱动
+//
+// ctx 字段已移除：原实现把 context.Background() 存在结构体里，
+// 所有 govmomi 调用都共用这个永不取消的 context，客户端断开或
+// 驱动卸载时任务仍会跑到底。现统一通过 BaseDriver.Ctx(vmUUID) 获取。
 type ESXiDriver struct {
 	*BaseDriver
 	client     *govmomi.Client
-	ctx        context.Context
 	datacenter *object.Datacenter
 	finder     *find.Finder
 }
@@ -29,7 +32,6 @@ type ESXiDriver struct {
 func NewESXiDriver(cfg *model.HSConfig) *ESXiDriver {
 	return &ESXiDriver{
 		BaseDriver: NewBaseDriver(cfg),
-		ctx:        context.Background(),
 	}
 }
 
@@ -45,7 +47,7 @@ func (d *ESXiDriver) apiConn() error {
 	}
 	u.User = url.UserPassword(d.Config.ServerUser, d.Config.ServerPass)
 
-	ctx, cancel := context.WithTimeout(d.ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(d.Ctx(""), 30*time.Second)
 	defer cancel()
 
 	client, err := govmomi.NewClient(ctx, u, true)
@@ -57,7 +59,7 @@ func (d *ESXiDriver) apiConn() error {
 	d.finder = find.NewFinder(client.Client, true)
 
 	// 获取默认数据中心
-	dc, err := d.finder.DefaultDatacenter(d.ctx)
+	dc, err := d.finder.DefaultDatacenter(d.Ctx(""))
 	if err != nil {
 		return fmt.Errorf("获取数据中心失败: %w", err)
 	}
@@ -73,7 +75,7 @@ func (d *ESXiDriver) findVM(vmUUID string) (*object.VirtualMachine, error) {
 		return nil, err
 	}
 
-	vm, err := d.finder.VirtualMachine(d.ctx, vmUUID)
+	vm, err := d.finder.VirtualMachine(d.Ctx(""), vmUUID)
 	if err != nil {
 		return nil, fmt.Errorf("未找到虚拟机: %w", err)
 	}
@@ -88,7 +90,7 @@ func (d *ESXiDriver) GetPower(vmUUID string) string {
 		return "未知"
 	}
 
-	powerState, err := vm.PowerState(d.ctx)
+	powerState, err := vm.PowerState(d.Ctx(""))
 	if err != nil {
 		return "未知"
 	}
@@ -116,7 +118,7 @@ func (d *ESXiDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	}
 
 	// 获取资源池和数据存储
-	pool, err := d.finder.DefaultResourcePool(d.ctx)
+	pool, err := d.finder.DefaultResourcePool(d.Ctx(""))
 	if err != nil {
 		return &model.ZMessage{
 			Success: false,
@@ -125,7 +127,7 @@ func (d *ESXiDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 		}, nil
 	}
 
-	ds, err := d.finder.DefaultDatastore(d.ctx)
+	ds, err := d.finder.DefaultDatastore(d.Ctx(""))
 	if err != nil {
 		return &model.ZMessage{
 			Success: false,
@@ -146,7 +148,7 @@ func (d *ESXiDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	}
 
 	// 创建虚拟机目录
-	folder, err := d.finder.DefaultFolder(d.ctx)
+	folder, err := d.finder.DefaultFolder(d.Ctx(""))
 	if err != nil {
 		return &model.ZMessage{
 			Success: false,
@@ -156,7 +158,7 @@ func (d *ESXiDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	}
 
 	// 创建虚拟机任务
-	task, err := folder.CreateVM(d.ctx, spec, pool, nil)
+	task, err := folder.CreateVM(d.Ctx(""), spec, pool, nil)
 	if err != nil {
 		return &model.ZMessage{
 			Success: false,
@@ -166,7 +168,7 @@ func (d *ESXiDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	}
 
 	// 等待任务完成
-	info, err := task.WaitForResult(d.ctx, nil)
+	info, err := task.WaitForResult(d.Ctx(""), nil)
 	if err != nil {
 		return &model.ZMessage{
 			Success: false,
@@ -175,7 +177,15 @@ func (d *ESXiDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 		}, nil
 	}
 
-	vmRef := info.Result.(types.ManagedObjectReference)
+	// vSphere 在异常场景下可能返回非预期类型，裸断言会直接 panic 掉整个请求
+	vmRef, ok := info.Result.(types.ManagedObjectReference)
+	if !ok {
+		return &model.ZMessage{
+			Success: false,
+			Action:  "VMCreate",
+			Message: fmt.Sprintf("创建VM失败: 无效的返回类型 %T", info.Result),
+		}, nil
+	}
 
 	// 保存虚拟机配置到内存
 	d.mu.Lock()
@@ -210,7 +220,7 @@ func (d *ESXiDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMessage
 	}
 
 	// 如果虚拟机正在运行，先关机
-	powerState, err := vm.PowerState(d.ctx)
+	powerState, err := vm.PowerState(d.Ctx(""))
 	if err != nil {
 		return &model.ZMessage{
 			Success: false,
@@ -220,7 +230,7 @@ func (d *ESXiDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMessage
 	}
 
 	if powerState == types.VirtualMachinePowerStatePoweredOn {
-		task, err := vm.PowerOff(d.ctx)
+		task, err := vm.PowerOff(d.Ctx(""))
 		if err != nil {
 			return &model.ZMessage{
 				Success: false,
@@ -228,7 +238,7 @@ func (d *ESXiDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMessage
 				Message: fmt.Sprintf("关机失败: %v", err),
 			}, nil
 		}
-		if err := task.Wait(d.ctx); err != nil {
+		if err := task.Wait(d.Ctx("")); err != nil {
 			return &model.ZMessage{
 				Success: false,
 				Action:  "VMDelete",
@@ -238,7 +248,7 @@ func (d *ESXiDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMessage
 	}
 
 	// 删除虚拟机
-	task, err := vm.Destroy(d.ctx)
+	task, err := vm.Destroy(d.Ctx(""))
 	if err != nil {
 		return &model.ZMessage{
 			Success: false,
@@ -247,7 +257,7 @@ func (d *ESXiDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMessage
 		}, nil
 	}
 
-	if err := task.Wait(d.ctx); err != nil {
+	if err := task.Wait(d.Ctx("")); err != nil {
 		return &model.ZMessage{
 			Success: false,
 			Action:  "VMDelete",
@@ -282,22 +292,22 @@ func (d *ESXiDriver) PowerControl(vmUUID string, action model.VMPowers) (*model.
 	var actionName string
 	switch action {
 	case model.VMPowerSStart:
-		task, err = vm.PowerOn(d.ctx)
+		task, err = vm.PowerOn(d.Ctx(""))
 		actionName = "启动"
 	case model.VMPowerSClose:
-		err = vm.ShutdownGuest(d.ctx)
+		err = vm.ShutdownGuest(d.Ctx(""))
 		actionName = "软关机"
 	case model.VMPowerHClose:
-		task, err = vm.PowerOff(d.ctx)
+		task, err = vm.PowerOff(d.Ctx(""))
 		actionName = "强制关机"
 	case model.VMPowerSReset:
-		err = vm.RebootGuest(d.ctx)
+		err = vm.RebootGuest(d.Ctx(""))
 		actionName = "软重启"
 	case model.VMPowerHReset:
-		task, err = vm.Reset(d.ctx)
+		task, err = vm.Reset(d.Ctx(""))
 		actionName = "强制重启"
 	case model.VMPowerAPause:
-		task, err = vm.Suspend(d.ctx)
+		task, err = vm.Suspend(d.Ctx(""))
 		actionName = "暂停"
 	default:
 		return &model.ZMessage{
@@ -316,7 +326,7 @@ func (d *ESXiDriver) PowerControl(vmUUID string, action model.VMPowers) (*model.
 	}
 
 	if task != nil {
-		if err := task.Wait(d.ctx); err != nil {
+		if err := task.Wait(d.Ctx("")); err != nil {
 			return &model.ZMessage{
 				Success: false,
 				Action:  "VMPowers",
@@ -348,13 +358,13 @@ func (d *ESXiDriver) GetStatus() (*model.HWStatus, error) {
 	}
 
 	// 获取主机系统信息
-	host, err := d.finder.DefaultHostSystem(d.ctx)
+	host, err := d.finder.DefaultHostSystem(d.Ctx(""))
 	if err != nil {
 		return &model.HWStatus{OnUpdate: time.Now().Unix()}, nil
 	}
 
 	var hs mo.HostSystem
-	err = host.Properties(d.ctx, host.Reference(), []string{
+	err = host.Properties(d.Ctx(""), host.Reference(), []string{
 		"summary.hardware",
 		"summary.quickStats",
 		"summary.config",
@@ -391,7 +401,7 @@ func (d *ESXiDriver) GetVMList() (map[string]*model.VMConfig, error) {
 		return d.BaseDriver.GetVMList()
 	}
 
-	vms, err := d.finder.VirtualMachineList(d.ctx, "*")
+	vms, err := d.finder.VirtualMachineList(d.Ctx(""), "*")
 	if err != nil {
 		return d.BaseDriver.GetVMList()
 	}
@@ -399,7 +409,7 @@ func (d *ESXiDriver) GetVMList() (map[string]*model.VMConfig, error) {
 	result := d.GetVMSaving()
 	for _, vm := range vms {
 		var vmObj mo.VirtualMachine
-		err := vm.Properties(d.ctx, vm.Reference(), []string{
+		err := vm.Properties(d.Ctx(""), vm.Reference(), []string{
 			"name",
 			"config.uuid",
 			"runtime.powerState",
@@ -469,7 +479,7 @@ func (d *ESXiDriver) UpdateVM(cfg *model.VMConfig, oldCfg *model.VMConfig) (*mod
 	}
 
 	// 检查虚拟机是否关机
-	powerState, _ := vm.PowerState(d.ctx)
+	powerState, _ := vm.PowerState(d.Ctx(""))
 	if powerState != types.VirtualMachinePowerStatePoweredOff {
 		return &model.ZMessage{
 			Success: false,
@@ -487,7 +497,7 @@ func (d *ESXiDriver) UpdateVM(cfg *model.VMConfig, oldCfg *model.VMConfig) (*mod
 		spec.MemoryMB = int64(cfg.MemNum)
 	}
 
-	task, err := vm.Reconfigure(d.ctx, spec)
+	task, err := vm.Reconfigure(d.Ctx(""), spec)
 	if err != nil {
 		return &model.ZMessage{
 			Success: false,
@@ -496,7 +506,7 @@ func (d *ESXiDriver) UpdateVM(cfg *model.VMConfig, oldCfg *model.VMConfig) (*mod
 		}, nil
 	}
 
-	if err := task.Wait(d.ctx); err != nil {
+	if err := task.Wait(d.Ctx("")); err != nil {
 		return &model.ZMessage{
 			Success: false,
 			Action:  "VMUpdate",
@@ -578,7 +588,7 @@ func (d *ESXiDriver) CreateBackup(vmUUID string, tips string) (*model.ZMessage, 
 	}
 
 	snapshotName := fmt.Sprintf("backup_%d", time.Now().Unix())
-	task, err := vm.CreateSnapshot(d.ctx, snapshotName, tips, false, false)
+	task, err := vm.CreateSnapshot(d.Ctx(""), snapshotName, tips, false, false)
 	if err != nil {
 		return &model.ZMessage{
 			Success: false,
@@ -587,7 +597,7 @@ func (d *ESXiDriver) CreateBackup(vmUUID string, tips string) (*model.ZMessage, 
 		}, nil
 	}
 
-	if err := task.Wait(d.ctx); err != nil {
+	if err := task.Wait(d.Ctx("")); err != nil {
 		return &model.ZMessage{
 			Success: false,
 			Action:  "VMBackup",
@@ -631,7 +641,7 @@ func (d *ESXiDriver) GetVNCInfo(vmUUID string, ipAddr string) (*model.ZMessage, 
 	}
 
 	// 获取VMRC票据
-	ticket, err := vm.AcquireTicket(d.ctx, "webmks")
+	ticket, err := vm.AcquireTicket(d.Ctx(""), "webmks")
 	if err != nil {
 		return &model.ZMessage{
 			Success: false,
@@ -645,9 +655,11 @@ func (d *ESXiDriver) GetVNCInfo(vmUUID string, ipAddr string) (*model.ZMessage, 
 		Action:  "VCRemote",
 		Message: "VNC信息获取成功",
 		Results: map[string]interface{}{
-			"type":     "vmrc",
-			"host":     ticket.Host,
-			"port":     ticket.Port,
+			"type": "vmrc",
+			"host": ticket.Host,
+			// govmomi 的 ticket.Port 是 int32，直接放入 interface{}
+			// 会让下游数值断言失败并拼不出控制台地址，这里统一为 int。
+			"port":     int(ticket.Port),
 			"ticket":   ticket.Ticket,
 			"password": ticket.Ticket,
 		},

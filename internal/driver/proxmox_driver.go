@@ -5,10 +5,16 @@ package driver
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -51,6 +57,141 @@ type ProxmoxDriver struct {
 	*BaseDriver
 	client   *proxmox.Client
 	clientMu sync.Mutex
+
+	// VNC 走 vncwebsocket 时除了 vncticket 还要求请求本身已登录，
+	// 这里缓存 access/ticket 拿到的 PVEAuthCookie 与 CSRF token
+	// （有效期约 2 小时），代理每次连接都据此现场创建 vnc 会话。
+	ticketMu     sync.Mutex
+	apiTicket    string
+	apiCSRF      string
+	apiTicketExp time.Time
+}
+
+// pveAPITicket 返回 PVE 登录票据与 CSRF token（用于 PVEAuthCookie / 写操作）。
+func (d *ProxmoxDriver) pveAPITicket(ctx context.Context) (string, string, error) {
+	d.ticketMu.Lock()
+	if d.apiTicket != "" && time.Now().Before(d.apiTicketExp) {
+		ticket, csrf := d.apiTicket, d.apiCSRF
+		d.ticketMu.Unlock()
+		return ticket, csrf, nil
+	}
+	d.ticketMu.Unlock()
+
+	user := d.Config.ServerUser
+	if user == "" {
+		user = "root"
+	}
+	if !strings.Contains(user, "@") {
+		user += "@pam"
+	}
+
+	form := url.Values{}
+	form.Set("username", user)
+	form.Set("password", d.Config.ServerPass)
+
+	base := strings.TrimSuffix(d.proxmoxBaseURL(), proxmoxAPIPath)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		base+proxmoxAPIPath+"/access/ticket", strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := platformHTTPClient().Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("PVE 登录失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("PVE 登录失败（HTTP %d）", resp.StatusCode)
+	}
+
+	var out struct {
+		Data struct {
+			Ticket string `json:"ticket"`
+			CSRF   string `json:"CSRFPreventionToken"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || out.Data.Ticket == "" {
+		return "", "", fmt.Errorf("PVE 登录响应异常")
+	}
+
+	d.ticketMu.Lock()
+	d.apiTicket = out.Data.Ticket
+	d.apiCSRF = out.Data.CSRF
+	d.apiTicketExp = time.Now().Add(100 * time.Minute)
+	d.ticketMu.Unlock()
+	return out.Data.Ticket, out.Data.CSRF, nil
+}
+
+// pveVNCSession 创建一个 web 端使用的 VNC 会话，返回端口、ticket 与 VNC 密码。
+//
+// 关键：必须带 websocket=1。PVE 只在该参数下生成 VNC 协议密码，
+// 并把它拼在 ticket 最前面（PVE::API2::Qemu：$ticket = "${password}:${ticket}"）。
+// 不带该参数拿到的是纯 ticket，QEMU 会以 Authentication failed 拒绝连接。
+func (d *ProxmoxDriver) pveVNCSession(vmid int64) (int, string, string, error) {
+	ctx, cancel := context.WithTimeout(d.Ctx(""), 20*time.Second)
+	defer cancel()
+
+	cookie, csrf, err := d.pveAPITicket(ctx)
+	if err != nil {
+		return 0, "", "", err
+	}
+
+	base := strings.TrimSuffix(d.proxmoxBaseURL(), proxmoxAPIPath)
+	u := fmt.Sprintf("%s%s/nodes/%s/qemu/%d/vncproxy",
+		base, proxmoxAPIPath, d.nodeName(), vmid)
+
+	form := url.Values{}
+	form.Set("websocket", "1")
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(form.Encode()))
+	if err != nil {
+		return 0, "", "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Cookie", "PVEAuthCookie="+cookie)
+	req.Header.Set("CSRFPreventionToken", csrf)
+
+	resp, err := platformHTTPClient().Do(req)
+	if err != nil {
+		return 0, "", "", fmt.Errorf("创建VNC会话失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if resp.StatusCode != http.StatusOK {
+		return 0, "", "", fmt.Errorf("创建VNC会话失败（HTTP %d）: %s",
+			resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var out struct {
+		Data struct {
+			Port   interface{} `json:"port"`
+			Ticket string      `json:"ticket"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return 0, "", "", fmt.Errorf("解析VNC会话响应失败: %w", err)
+	}
+
+	port := 0
+	switch v := out.Data.Port.(type) {
+	case float64:
+		port = int(v)
+	case string:
+		port, _ = strconv.Atoi(v)
+	}
+	if port <= 0 || out.Data.Ticket == "" {
+		return 0, "", "", fmt.Errorf("VNC会话响应缺少 port/ticket")
+	}
+
+	// PVE 生成的密码是 8 个可打印 ASCII，拼在 ticket 最前面
+	password := out.Data.Ticket
+	if len(password) > 8 {
+		password = password[:8]
+	}
+	return port, out.Data.Ticket, password, nil
 }
 
 // proxmoxAPIPath go-proxmox 客户端要求的 API 路径前缀。
@@ -61,6 +202,12 @@ type ProxmoxDriver struct {
 // 被 Proxmox 的 pveproxy 以 `500 no such file '/version'` 拒绝
 // （表现为「连接Proxmox失败: 500 no such file '/version'」）。
 const proxmoxAPIPath = "/api2/json"
+
+// pveAudioDevice PVE 声卡配置。
+// 会议、媒体播放等桌面应用在没有任何音频设备时会直接不工作，
+// 因此新建虚拟机默认分配一块 HDA 声卡。
+// 个别老版本 PVE 不认识该型号，创建时会自动去掉该项重试。
+const pveAudioDevice = "device=ich9-intel-hda,driver=spice"
 
 // proxmoxBaseURL 归一化出 go-proxmox 的 API 基地址 https://host:port/api2/json。
 //
@@ -105,6 +252,31 @@ func (d *ProxmoxDriver) proxmoxHostPort() string {
 	return host
 }
 
+// filterVMOptions 过滤掉指定名称的配置项（用于按能力降级重试）。
+func filterVMOptions(opts []proxmox.VirtualMachineOption, names ...string) []proxmox.VirtualMachineOption {
+	skip := make(map[string]bool, len(names))
+	for _, n := range names {
+		skip[n] = true
+	}
+	out := make([]proxmox.VirtualMachineOption, 0, len(opts))
+	for _, o := range opts {
+		if skip[o.Name] {
+			continue
+		}
+		out = append(out, o)
+	}
+	return out
+}
+
+// proxmoxHost 返回不含端口的节点地址（仅用于展示与兼容字段）。
+func (d *ProxmoxDriver) proxmoxHost() string {
+	host := d.proxmoxHostPort()
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
+}
+
 // hostHasPort 判断 host[:port] 是否已带端口（兼容 IPv6 字面量 [::1]:8006）
 func hostHasPort(host string) bool {
 	if strings.HasPrefix(host, "[") {
@@ -125,7 +297,7 @@ func NewProxmoxDriver(cfg *model.HSConfig) *ProxmoxDriver {
 
 // apiConn 获取Proxmox API连接（懒加载+复用）
 //
-// 原实现每次调用都在持锁状态下做一次网络探测，且使用
+// 原实现每次调用都在持锁状态下做一次网络探测，且使用永不取消的
 // context.Background()：PVE 不响应时会占住连接锁并无限阻塞，
 // 进而拖住该主机后续所有操作、整轮状态采集以及进程退出。
 // 现在改为：锁内只读取指针，慢路径在锁外建立连接并带超时。
@@ -155,7 +327,7 @@ func (d *ProxmoxDriver) apiConn() (*proxmox.Client, error) {
 	)
 
 	// 建立连接带超时，避免依赖不可用时阻塞调用方
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(d.Ctx(""), 30*time.Second)
 	defer cancel()
 	if _, err := client.Version(ctx); err != nil {
 		return nil, fmt.Errorf("连接Proxmox失败: %w", err)
@@ -192,7 +364,7 @@ func (d *ProxmoxDriver) getNode() (*proxmox.Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	node, err := client.Node(context.Background(), d.nodeName())
+	node, err := client.Node(d.Ctx(""), d.nodeName())
 	if err != nil {
 		return nil, fmt.Errorf("获取节点失败: %w", err)
 	}
@@ -256,7 +428,7 @@ func (d *ProxmoxDriver) getVMID(vmUUID string) (int64, error) {
 		return 0, err
 	}
 
-	vms, err := node.VirtualMachines(context.Background())
+	vms, err := node.VirtualMachines(d.Ctx(""))
 	if err != nil {
 		return 0, fmt.Errorf("获取VM列表失败: %w", err)
 	}
@@ -306,7 +478,7 @@ func (d *ProxmoxDriver) getVM(vmUUID string) (*proxmox.VirtualMachine, error) {
 	if err != nil {
 		return nil, err
 	}
-	vm, err := node.VirtualMachine(context.Background(), int(vmid))
+	vm, err := node.VirtualMachine(d.Ctx(""), int(vmid))
 	if err != nil {
 		return nil, fmt.Errorf("获取VM对象失败: %w", err)
 	}
@@ -319,7 +491,7 @@ func (d *ProxmoxDriver) newVMID() (int, error) {
 	if err != nil {
 		return 100, nil
 	}
-	vms, err := node.VirtualMachines(context.Background())
+	vms, err := node.VirtualMachines(d.Ctx(""))
 	if err != nil {
 		return 100, nil
 	}
@@ -365,7 +537,7 @@ func (d *ProxmoxDriver) GetStatus() (*model.HWStatus, error) {
 		return emptyHWStatus(), nil
 	}
 
-	if err := node.Status(context.Background()); err != nil {
+	if err := node.Status(d.Ctx("")); err != nil {
 		return emptyHWStatus(), nil
 	}
 
@@ -405,7 +577,7 @@ func (d *ProxmoxDriver) ScanVMs() (*model.ZMessage, error) {
 		return &model.ZMessage{Success: false, Action: "VMDetect", Message: err.Error()}, nil
 	}
 
-	vms, err := node.VirtualMachines(context.Background())
+	vms, err := node.VirtualMachines(d.Ctx(""))
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "VMDetect", Message: err.Error()}, nil
 	}
@@ -468,7 +640,7 @@ func (d *ProxmoxDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 		return &model.ZMessage{Success: false, Action: "VMCreate", Message: err.Error()}, nil
 	}
 
-	ctx := context.Background()
+	ctx := d.Ctx(cfg.VmUUID)
 
 	// 平台上的虚拟机名与内部 vm_uuid 保持一致（不再做 "_"→"-" 转换），
 	// 否则创建后扫描会因键形式不同而多出一条重复记录。
@@ -517,6 +689,11 @@ func (d *ProxmoxDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 		{Name: "bios", Value: "ovmf"},
 		{Name: "scsihw", Value: "virtio-scsi-single"},
 		{Name: "efidisk0", Value: fmt.Sprintf("%s:1,efitype=4m", storage)},
+		// 预置一个空光驱：后续挂载 ISO 只是“换盘”，运行中的虚拟机可热生效；
+		// 若创建时没有光驱，热添加 IDE 设备必须先关机。
+		{Name: "ide2", Value: "none,media=cdrom"},
+		// 声卡：没有音频设备时部分桌面应用会直接报错或用不了
+		{Name: "audio0", Value: pveAudioDevice},
 	}
 
 	// 网卡配置（含 MAC）
@@ -525,7 +702,22 @@ func (d *ProxmoxDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 		opts = append(opts, proxmox.VirtualMachineOption{Name: key, Value: nets[key]})
 	}
 
+	// 启动顺序：系统盘 → 光驱 → 网卡（PXE）。
+	// PVE 的配置键是 boot，值为 order=...（写成 order 会被 400 拒绝）。
+	bootParts := []string{"ide0", "ide2"}
+	bootParts = append(bootParts, sortedMapKeys(nets)...)
+	opts = append(opts, proxmox.VirtualMachineOption{
+		Name:  "boot",
+		Value: "order=" + strings.Join(bootParts, ";"),
+	})
+
 	task, err := node.NewVirtualMachine(ctx, vmid, opts...)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "audio") {
+		// 老版本 PVE 不支持该声卡型号：去掉 audio0 再试一次，
+		// 不能因为一块声卡让整台虚拟机创建失败。
+		log.Printf("[proxmox] 当前节点不接受 audio0（%v），去掉声卡后重试", err)
+		task, err = node.NewVirtualMachine(ctx, vmid, filterVMOptions(opts, "audio0")...)
+	}
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "VMCreate", Message: "创建虚拟机失败: " + err.Error()}, nil
 	}
@@ -610,7 +802,7 @@ func (d *ProxmoxDriver) applyVNCPort(cfg *model.VMConfig, vm *proxmox.VirtualMac
 	if cfg == nil || vm == nil {
 		return
 	}
-	ctx := context.Background()
+	ctx := d.Ctx(cfg.VmUUID)
 
 	vncPort := 5900 + vmid
 	if p, err := strconv.Atoi(strings.TrimSpace(cfg.VcPort)); err == nil && p > 0 {
@@ -678,7 +870,7 @@ func (d *ProxmoxDriver) ReinstallVM(cfg *model.VMConfig) (*model.ZMessage, error
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "VMReinstall", Message: err.Error()}, nil
 	}
-	ctx := context.Background()
+	ctx := d.Ctx(cfg.VmUUID)
 
 	// 1. 停止虚拟机
 	if vm.IsRunning() {
@@ -729,6 +921,8 @@ func (d *ProxmoxDriver) ReinstallVM(cfg *model.VMConfig) (*model.ZMessage, error
 
 // UpdateVM 更新虚拟机配置
 func (d *ProxmoxDriver) UpdateVM(cfg *model.VMConfig, oldCfg *model.VMConfig) (*model.ZMessage, error) {
+	ctx := d.Ctx(cfg.VmUUID)
+
 	vm, err := d.getVM(cfg.VmUUID)
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "VMUpdate", Message: err.Error()}, nil
@@ -763,7 +957,7 @@ func (d *ProxmoxDriver) UpdateVM(cfg *model.VMConfig, oldCfg *model.VMConfig) (*
 	}
 
 	if len(opts) > 0 {
-		if _, err := vm.Config(context.Background(), opts...); err != nil {
+		if _, err := vm.Config(ctx, opts...); err != nil {
 			return &model.ZMessage{Success: false, Action: "VMUpdate", Message: err.Error()}, nil
 		}
 	}
@@ -777,11 +971,38 @@ func (d *ProxmoxDriver) UpdateVM(cfg *model.VMConfig, oldCfg *model.VMConfig) (*
 		if sizeGB < 1 {
 			sizeGB = 1
 		}
-		if _, err := vm.ResizeDisk(context.Background(), "ide0", fmt.Sprintf("%dG", sizeGB)); err != nil {
+		if _, err := vm.ResizeDisk(ctx, "ide0", fmt.Sprintf("%dG", sizeGB)); err != nil {
 			return &model.ZMessage{
 				Success: false, Action: "VMUpdate",
 				Message: "系统盘扩容失败: " + err.Error(),
 			}, nil
+		}
+	}
+
+	// 旧虚拟机没有声卡：补一块，否则部分桌面应用（会议/媒体）无法工作。
+	// 已在配置里存在时不重复下发，避免每次更新配置都多一次 API 调用。
+	if vmid, vmidErr := d.getVMID(cfg.VmUUID); vmidErr == nil {
+		if cfgMap, cfgErr := d.pveVMConfigMap(vmid); cfgErr == nil {
+			if _, exists := cfgMap["audio0"]; !exists {
+				if _, err := vm.Config(ctx, proxmox.VirtualMachineOption{
+					Name:  "audio0",
+					Value: pveAudioDevice,
+				}); err != nil {
+					log.Printf("[proxmox] 补充声卡失败: %v", err)
+				}
+			}
+		}
+	}
+
+	// 启动顺序与磁盘/光盘/网卡保持一致。
+	// 「启动顺序管理」保存只改了本地 efi_all，此前不会落到 PVE 的 boot 参数，
+	// 表现为「界面上有光盘，平台启动顺序里没有」。
+	if boot := d.proxmoxBootOrder(cfg); boot != "" {
+		if _, err := vm.Config(ctx, proxmox.VirtualMachineOption{
+			Name:  "boot",
+			Value: boot,
+		}); err != nil {
+			log.Printf("[proxmox] 更新启动顺序失败（%s）: %v", boot, err)
 		}
 	}
 
@@ -794,6 +1015,8 @@ func (d *ProxmoxDriver) UpdateVM(cfg *model.VMConfig, oldCfg *model.VMConfig) (*
 
 // DeleteVM 删除虚拟机
 func (d *ProxmoxDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMessage, error) {
+	ctx := d.Ctx(vmUUID)
+
 	vm, err := d.getVM(vmUUID)
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "VMDelete", Message: err.Error()}, nil
@@ -801,18 +1024,18 @@ func (d *ProxmoxDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMess
 
 	// 先关机
 	if vm.Status == "running" {
-		task, err := vm.Stop(context.Background())
+		task, err := vm.Stop(ctx)
 		if err == nil {
-			_ = task.WaitFor(context.Background(), 30)
+			_ = task.WaitFor(ctx, 30)
 		}
 	}
 
-	task, err := vm.Delete(context.Background())
+	task, err := vm.Delete(ctx)
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "VMDelete", Message: err.Error()}, nil
 	}
 
-	if err := task.WaitFor(context.Background(), 60); err != nil {
+	if err := task.WaitFor(ctx, 60); err != nil {
 		return &model.ZMessage{Success: false, Action: "VMDelete", Message: "等待删除任务超时: " + err.Error()}, nil
 	}
 
@@ -825,6 +1048,8 @@ func (d *ProxmoxDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMess
 
 // PowerControl 电源控制
 func (d *ProxmoxDriver) PowerControl(vmUUID string, action model.VMPowers) (*model.ZMessage, error) {
+	ctx := d.Ctx(vmUUID)
+
 	vm, err := d.getVM(vmUUID)
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "VMPowers", Message: err.Error()}, nil
@@ -835,17 +1060,17 @@ func (d *ProxmoxDriver) PowerControl(vmUUID string, action model.VMPowers) (*mod
 
 	switch action {
 	case model.VMPowerSStart:
-		task, taskErr = vm.Start(context.Background())
+		task, taskErr = vm.Start(ctx)
 	case model.VMPowerSClose:
-		task, taskErr = vm.Shutdown(context.Background())
+		task, taskErr = vm.Shutdown(ctx)
 	case model.VMPowerHClose:
-		task, taskErr = vm.Stop(context.Background())
+		task, taskErr = vm.Stop(ctx)
 	case model.VMPowerSReset, model.VMPowerHReset:
-		task, taskErr = vm.Reset(context.Background())
+		task, taskErr = vm.Reset(ctx)
 	case model.VMPowerAPause:
-		task, taskErr = vm.Pause(context.Background())
+		task, taskErr = vm.Pause(ctx)
 	case model.VMPowerAWaked:
-		task, taskErr = vm.Resume(context.Background())
+		task, taskErr = vm.Resume(ctx)
 	default:
 		return &model.ZMessage{Success: false, Action: "VMPowers", Message: "不支持的电源操作"}, nil
 	}
@@ -855,7 +1080,7 @@ func (d *ProxmoxDriver) PowerControl(vmUUID string, action model.VMPowers) (*mod
 	}
 
 	if task != nil {
-		if err := task.WaitFor(context.Background(), 30); err != nil {
+		if err := task.WaitFor(ctx, 30); err != nil {
 			return &model.ZMessage{Success: false, Action: "VMPowers", Message: "等待电源操作超时"}, nil
 		}
 	}
@@ -878,125 +1103,235 @@ func (d *ProxmoxDriver) PowerControl(vmUUID string, action model.VMPowers) (*mod
 
 // GetVNCInfo 获取VNC连接信息
 func (d *ProxmoxDriver) GetVNCInfo(vmUUID string, ipAddr string) (*model.ZMessage, error) {
+	ctx := d.Ctx(vmUUID)
+
 	vm, err := d.getVM(vmUUID)
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "VCRemote", Message: err.Error()}, nil
 	}
 
-	vnc, err := vm.TermProxy(context.Background())
+	if vm.Status != "running" {
+		return &model.ZMessage{Success: false, Action: "VCRemote", Message: "虚拟机未运行，无法打开控制台"}, nil
+	}
+
+	vmid, err := d.getVMID(vmUUID)
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "VCRemote", Message: err.Error()}, nil
 	}
 
-	hostAddr := d.proxmoxHostPort()
+	// vncwebsocket 除了 vncticket 还要求请求本身已登录，
+	// 否则会返回 401 No ticket。
+	apiTicket, apiCSRF, ticketErr := d.pveAPITicket(ctx)
+	if ticketErr != nil {
+		return &model.ZMessage{Success: false, Action: "VCRemote", Message: ticketErr.Error()}, nil
+	}
 
+	// 预先创建 web 用 vnc 会话（等价于 qm vncproxy --websocket）。
+	// 只有带 websocket=1 时 PVE 才会生成 VNC 密码并拼在 ticket 最前面
+	// （PVE::API2::Qemu：$ticket = "${password}:${ticket}"），
+	// 否则拿到的是纯 ticket，noVNC 在 VNC 认证阶段会被拒。
+	port, vncTicket, password, sessErr := d.pveVNCSession(vmid)
+	if sessErr != nil {
+		return &model.ZMessage{Success: false, Action: "VCRemote", Message: sessErr.Error()}, nil
+	}
+
+	// PVE 的 vncproxy 只在节点本地开一条 VNC 通道，必须经
+	//   wss://<node>:8006/api2/json/nodes/<node>/qemu/<vmid>/vncwebsocket?port=&vncticket=
+	// 访问，直接 TCP 连过去既连不上也不需要密码。
 	return &model.ZMessage{
 		Success: true,
 		Action:  "VCRemote",
 		Message: "VNC信息获取成功",
 		Results: map[string]interface{}{
 			"type":     "proxmox",
-			"host":     hostAddr,
-			"ticket":   vnc.Ticket,
-			"port":     vnc.Port,
-			"password": vnc.Ticket,
+			"host":     d.proxmoxHost(),
+			"api_host": d.proxmoxHostPort(),
+			"node":     d.nodeName(),
+			"vmid":     int(vmid),
+			"port":     port,
+			"ticket":   vncTicket,
+			"password": password,
+			"cookie":   apiTicket,
+			"csrf":     apiCSRF,
 		},
 	}, nil
 }
 
-// GetScreenshot 获取虚拟机截图
+// GetScreenshot 获取虚拟机截图（纯 base64，不含 data: 前缀）。
+//
+// PVE 没有截图 REST API，官方手段是让 QEMU 把当前画面 dump 成 PPM：
+//
+//	echo 'screendump /tmp/x.ppm' | qm monitor <vmid>
+//
+// 因此需要 SSH 到 PVE 节点（主机配置的 server_addr / server_user / server_pass）。
+// 原实现走 qemu-guest-agent 在虚拟机内执行 ImageMagick，要求来宾系统装有
+// X11 与 imagemagick，实际几乎不可用，表现为「截图功能不可用」。
 func (d *ProxmoxDriver) GetScreenshot(vmUUID string) (string, error) {
 	vm, err := d.getVM(vmUUID)
 	if err != nil {
 		return "", fmt.Errorf("获取虚拟机失败: %w", err)
 	}
-
-	// 检查虚拟机是否运行
 	if vm.Status != "running" {
 		return "", fmt.Errorf("虚拟机未运行，无法截图")
 	}
 
-	// 使用 Proxmox 的 vncproxy 和截图 API
-	// Proxmox 7.0+ 支持通过 spiceproxy 获取截图
-	// 我们使用 HTTP API 直接获取截图
-	client, err := d.apiConn()
-	if err != nil {
-		return "", fmt.Errorf("连接 Proxmox API 失败: %w", err)
-	}
-
-	// 构建截图 API 路径
-	// GET /api2/json/nodes/{node}/qemu/{vmid}/agent/exec-status
-	// 或使用 vncproxy 方式获取截图
-	nodeName := d.nodeName()
 	vmid, err := d.getVMID(vmUUID)
 	if err != nil {
 		return "", fmt.Errorf("获取 VM ID 失败: %w", err)
 	}
 
-	// 方案1: 尝试使用 QEMU Guest Agent 截图（需要虚拟机安装 qemu-guest-agent）
-	screenshotPath := fmt.Sprintf("/nodes/%s/qemu/%d/agent/exec", nodeName, vmid)
-	screenshotCmd := map[string]interface{}{
-		"command": []string{
-			"sh", "-c",
-			"DISPLAY=:0 import -window root png:- | base64",
-		},
+	sshCfg := sshConfigFromHS(d.Config)
+	if strings.TrimSpace(sshCfg.Host) == "" {
+		return "", fmt.Errorf("主机未配置 SSH 地址，无法截取 Proxmox 画面")
 	}
+	sshCfg.Timeout = 30 * time.Second
 
-	ctx := context.Background()
-	var result map[string]interface{}
+	// screendump 由 QEMU 异步写文件，一次抓取可能只读到头部和少量像素
+	// （实测拿到 4080 字节而不是完整的 3MB），因此失败时重试一次。
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		data, err := d.captureProxmoxScreen(sshCfg, vmid)
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+		time.Sleep(300 * time.Millisecond)
+	}
+	return "", lastErr
+}
 
-	// 如果 Guest Agent 不可用，使用备用方案
-	err = client.Post(ctx, screenshotPath, screenshotCmd, &result)
+// captureProxmoxScreen 通过 SSH 让 QEMU dump 一帧 PPM，读回后转成 PNG base64。
+func (d *ProxmoxDriver) captureProxmoxScreen(sshCfg SSHExecConfig, vmid int64) (string, error) {
+	// 优先写 tmpfs（/dev/shm）：screendump 在普通磁盘上可能留下未完成的
+	// 部分文件，而 tmpfs 写入更快、无回写延迟。
+	remote := fmt.Sprintf("/dev/shm/openidcs-screen-%d-%d.ppm", vmid, time.Now().UnixNano())
+
+	// 必须等文件大小稳定，而不是「非空」：screendump 一开始就会创建文件，
+	// 此时内容只有头部，读到的是残缺 PPM。
+	// dump 与读回合并成一次 SSH 会话，省掉一次握手。
+	// monitor 会话要保持到 QEMU 写完文件：命令发完立即关闭管道会让
+	// screendump 只留下头部和少量像素；之后再等文件大小稳定。
+	dumpCmd := fmt.Sprintf(`rm -f %[1]s
+{ echo 'screendump %[1]s'; sleep 1; } | qm monitor %[2]d >/dev/null 2>&1
+prev=-1; same=0
+for i in $(seq 1 40); do
+  cur=$(stat -c %%s %[1]s 2>/dev/null || echo 0)
+  if [ "$cur" -gt 0 ] && [ "$cur" = "$prev" ]; then same=$((same+1)); else same=0; fi
+  if [ "$same" -ge 2 ]; then break; fi
+  prev=$cur
+  sleep 0.2
+done
+if [ -s %[1]s ]; then
+  echo __OK__ >&2
+  base64 -w0 %[1]s 2>/dev/null || base64 %[1]s
+  rm -f %[1]s
+else
+  echo __FAIL__ >&2
+fi`, remote, vmid)
+
+	res, err := RunSSHCommand(sshCfg, dumpCmd)
 	if err != nil {
-		// 方案2: 使用 Proxmox VNC Screenshot API (需要 Proxmox 7.2+)
-		// 这个功能可能需要额外配置或不是所有版本都支持
-		return "", fmt.Errorf("截图功能暂不可用: Proxmox 虚拟机需要安装 qemu-guest-agent 并配置 X11 显示，或升级到 Proxmox VE 7.2+ 使用内置截图 API")
+		return "", fmt.Errorf("SSH 执行截图命令失败: %w", err)
+	}
+	if !strings.Contains(res.Stderr, "__OK__") {
+		msg := strings.TrimSpace(res.Stderr)
+		return "", fmt.Errorf("Proxmox 未生成截图文件（请确认节点可 SSH 且虚拟机有画面）: %s", msg)
 	}
 
-	// 等待命令执行完成并获取输出
-	pid, ok := result["pid"].(float64)
-	if !ok {
-		return "", fmt.Errorf("执行截图命令失败")
+	b64 := strings.Join(strings.Fields(res.Stdout), "")
+	if b64 == "" {
+		return "", fmt.Errorf("截图文件为空")
 	}
-
-	// 轮询获取执行结果（最多等待10秒）
-	for i := 0; i < 20; i++ {
-		time.Sleep(500 * time.Millisecond)
-
-		statusPath := fmt.Sprintf("/nodes/%s/qemu/%d/agent/exec-status?pid=%.0f", nodeName, vmid, pid)
-		var statusResult map[string]interface{}
-		err = client.Get(ctx, statusPath, &statusResult)
-		if err != nil {
-			continue
-		}
-
-		data, ok := statusResult["data"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		exited, ok := data["exited"].(bool)
-		if !ok || !exited {
-			continue
-		}
-
-		// 获取输出
-		outData, ok := data["out-data"].(string)
-		if ok && outData != "" {
-			// out-data 已经是 base64 编码的 PNG
-			return "data:image/png;base64," + outData, nil
-		}
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return "", fmt.Errorf("截图数据解码失败: %w", err)
 	}
-
-	return "", fmt.Errorf("截图超时")
+	out, err := ppmBytesToBase64PNG(raw)
+	if err != nil {
+		// 附带实际字节数，便于区分「QEMU 没写完」与「读取被截断」
+		return "", fmt.Errorf("%w（b64=%d, raw=%d）", err, len(b64), len(raw))
+	}
+	return out, nil
 }
 
 // ============================================================
 // 备份管理
 // ============================================================
 
+// pveBackupContent PVE 存储内容接口返回的备份条目
+type pveBackupContent struct {
+	VolID string `json:"volid"`
+	CTime int64  `json:"ctime"`
+	Size  int64  `json:"size"`
+	Notes string `json:"notes"`
+}
+
+// SyncBackups 从 PVE 拉取该虚拟机的备份文件列表并覆盖内存记录。
+//
+// 不能靠时间戳拼文件名：vzdump 的实际命名、压缩后缀、以及管理员手工
+// 创建的备份都无法预测。以存储内容为准，列表才与 PVE 一致。
+func (d *ProxmoxDriver) SyncBackups(vmUUID string) {
+	ctx := d.Ctx(vmUUID)
+
+	vmid, err := d.getVMID(vmUUID)
+	if err != nil {
+		// 拿不到 vmid 就无法判断哪些备份属于这台虚拟机：
+		// 清空本地列表，避免残留其它虚拟机的备份记录被当成自己的。
+		d.mu.Lock()
+		if cfg, ok := d.VmSaving[vmUUID]; ok {
+			cfg.Backups = nil
+		}
+		d.mu.Unlock()
+		return
+	}
+	client, err := d.apiConn()
+	if err != nil {
+		return
+	}
+	storage := strings.TrimSpace(d.Config.BackupPath)
+	if storage == "" {
+		storage = "local"
+	}
+
+	var items []pveBackupContent
+	path := fmt.Sprintf("/nodes/%s/storage/%s/content?content=backup",
+		d.nodeName(), url.PathEscape(storage))
+	if err := client.Get(ctx, path, &items); err != nil {
+		log.Printf("[proxmox] 拉取备份列表失败（storage=%s）: %v", storage, err)
+		return
+	}
+
+	prefix := fmt.Sprintf("vzdump-qemu-%d-", vmid)
+	list := make([]model.VMBackup, 0, len(items))
+	for _, it := range items {
+		name := it.VolID
+		if idx := strings.LastIndex(name, "/"); idx >= 0 {
+			name = name[idx+1:]
+		}
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		backup := model.VMBackup{
+			BackupName: name,
+			BackupTime: time.Unix(it.CTime, 0),
+			BackupTips: it.Notes,
+		}
+		list = append(list, backup)
+	}
+	// 新的在前
+	sort.Slice(list, func(i, j int) bool { return list[i].BackupTime.After(list[j].BackupTime) })
+
+	d.mu.Lock()
+	if cfg, ok := d.VmSaving[vmUUID]; ok {
+		cfg.Backups = list
+	}
+	d.mu.Unlock()
+}
+
 // CreateBackup 创建备份
 func (d *ProxmoxDriver) CreateBackup(vmUUID string, tips string) (*model.ZMessage, error) {
+	ctx := d.Ctx(vmUUID)
+
 	node, err := d.getNode()
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "VMBackup", Message: err.Error()}, nil
@@ -1012,7 +1347,7 @@ func (d *ProxmoxDriver) CreateBackup(vmUUID string, tips string) (*model.ZMessag
 		storage = d.Config.BackupPath
 	}
 
-	task, err := node.Vzdump(context.Background(), &proxmox.VirtualMachineBackupOptions{
+	task, err := node.Vzdump(ctx, &proxmox.VirtualMachineBackupOptions{
 		VMID:     uint64(vmid),
 		Storage:  storage,
 		Compress: proxmox.VirtualMachineBackupCompressZstd,
@@ -1021,21 +1356,14 @@ func (d *ProxmoxDriver) CreateBackup(vmUUID string, tips string) (*model.ZMessag
 		return &model.ZMessage{Success: false, Action: "VMBackup", Message: err.Error()}, nil
 	}
 
-	if err := task.WaitFor(context.Background(), 600); err != nil {
-		return &model.ZMessage{Success: false, Action: "VMBackup", Message: "备份超时: " + err.Error()}, nil
+	// 备份是分钟级任务，大磁盘可能超过 10 分钟：
+	// 这里由后台协程等待，放宽到 24 小时，避免把「还在跑」误判成「超时失败」。
+	if err := task.WaitFor(ctx, 86400); err != nil {
+		return &model.ZMessage{Success: false, Action: "VMBackup", Message: "备份失败: " + err.Error()}, nil
 	}
 
-	// 更新备份列表
-	d.mu.Lock()
-	if cfg, ok := d.VmSaving[vmUUID]; ok {
-		backupName := fmt.Sprintf("vzdump-qemu-%d-%s.vma.zst", vmid, time.Now().Format("2006_01_02-15_04_05"))
-		cfg.Backups = append(cfg.Backups, model.VMBackup{
-			BackupName: backupName,
-			BackupTime: time.Now(),
-			BackupTips: tips,
-		})
-	}
-	d.mu.Unlock()
+	// 以 PVE 上的实际备份文件为准刷新列表（不再靠时间戳拼文件名）
+	d.SyncBackups(vmUUID)
 
 	return &model.ZMessage{Success: true, Action: "VMBackup", Message: "备份创建成功"}, nil
 }
@@ -1044,6 +1372,8 @@ func (d *ProxmoxDriver) CreateBackup(vmUUID string, tips string) (*model.ZMessag
 
 // DeleteBackup 删除备份
 func (d *ProxmoxDriver) DeleteBackup(vmUUID string, backupName string) (*model.ZMessage, error) {
+	ctx := d.Ctx(vmUUID)
+
 	storage := "local"
 	if d.Config.BackupPath != "" {
 		storage = d.Config.BackupPath
@@ -1053,17 +1383,17 @@ func (d *ProxmoxDriver) DeleteBackup(vmUUID string, backupName string) (*model.Z
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "RMBackup", Message: err.Error()}, nil
 	}
-	bkpStorage, err := node.Storage(context.Background(), storage)
+	bkpStorage, err := node.Storage(ctx, storage)
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "RMBackup", Message: err.Error()}, nil
 	}
 	volID := fmt.Sprintf("%s:backup/%s", storage, backupName)
-	delTask, err := bkpStorage.DeleteContent(context.Background(), volID)
+	delTask, err := bkpStorage.DeleteContent(ctx, volID)
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "RMBackup", Message: err.Error()}, nil
 	}
 	if delTask != nil {
-		_ = delTask.WaitFor(context.Background(), 60)
+		_ = delTask.WaitFor(ctx, 60)
 	}
 
 	// 从备份列表中移除
@@ -1093,11 +1423,11 @@ func (d *ProxmoxDriver) ScanBackups() (*model.ZMessage, error) {
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "LDBackup", Message: err.Error()}, nil
 	}
-	bkpStorage, err := node.Storage(context.Background(), storage)
+	bkpStorage, err := node.Storage(d.Ctx(""), storage)
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "LDBackup", Message: err.Error()}, nil
 	}
-	contents, err := bkpStorage.GetContent(context.Background())
+	contents, err := bkpStorage.GetContent(d.Ctx(""))
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "LDBackup", Message: err.Error()}, nil
 	}
@@ -1153,6 +1483,8 @@ func (d *ProxmoxDriver) getVMIDNoLock(vmUUID string) (int64, error) {
 
 // SetupPCI PCI设备直通操作
 func (d *ProxmoxDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey string, add bool) (*model.ZMessage, error) {
+	ctx := d.Ctx(vmUUID)
+
 	vm, err := d.getVM(vmUUID)
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "PCISetup", Message: err.Error()}, nil
@@ -1160,7 +1492,7 @@ func (d *ProxmoxDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey stri
 
 	if add {
 		// 添加PCI设备
-		if _, err := vm.Config(context.Background(), proxmox.VirtualMachineOption{
+		if _, err := vm.Config(ctx, proxmox.VirtualMachineOption{
 			Name:  "hostpci0",
 			Value: pciKey + ",pcie=1",
 		}); err != nil {
@@ -1174,7 +1506,7 @@ func (d *ProxmoxDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey stri
 		d.mu.Unlock()
 	} else {
 		// 移除PCI设备
-		if _, err := vm.Config(context.Background(), proxmox.VirtualMachineOption{
+		if _, err := vm.Config(ctx, proxmox.VirtualMachineOption{
 			Name:  "delete",
 			Value: "hostpci0",
 		}); err != nil {
@@ -1202,6 +1534,8 @@ func (d *ProxmoxDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey stri
 
 // SetupUSB USB设备直通操作
 func (d *ProxmoxDriver) SetupUSB(vmUUID string, info *model.USBInfos, usbKey string, add bool) (*model.ZMessage, error) {
+	ctx := d.Ctx(vmUUID)
+
 	vm, err := d.getVM(vmUUID)
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "USBSetup", Message: err.Error()}, nil
@@ -1209,7 +1543,7 @@ func (d *ProxmoxDriver) SetupUSB(vmUUID string, info *model.USBInfos, usbKey str
 
 	if add {
 		usbVal := fmt.Sprintf("host=%s:%s", info.VidUUID, info.PidUUID)
-		if _, err := vm.Config(context.Background(), proxmox.VirtualMachineOption{
+		if _, err := vm.Config(ctx, proxmox.VirtualMachineOption{
 			Name:  "usb0",
 			Value: usbVal,
 		}); err != nil {
@@ -1221,7 +1555,7 @@ func (d *ProxmoxDriver) SetupUSB(vmUUID string, info *model.USBInfos, usbKey str
 		}
 		d.mu.Unlock()
 	} else {
-		if _, err := vm.Config(context.Background(), proxmox.VirtualMachineOption{
+		if _, err := vm.Config(ctx, proxmox.VirtualMachineOption{
 			Name:  "delete",
 			Value: "usb0",
 		}); err != nil {
@@ -1247,6 +1581,8 @@ func (d *ProxmoxDriver) SetupUSB(vmUUID string, info *model.USBInfos, usbKey str
 
 // MountHDD 挂载/卸载数据盘
 func (d *ProxmoxDriver) MountHDD(vmUUID string, hdd *model.SDConfig, mount bool) (*model.ZMessage, error) {
+	ctx := d.Ctx(vmUUID)
+
 	vm, err := d.getVM(vmUUID)
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "HDDMount", Message: err.Error()}, nil
@@ -1284,7 +1620,7 @@ func (d *ProxmoxDriver) MountHDD(vmUUID string, hdd *model.SDConfig, mount bool)
 		}
 
 		diskVal := fmt.Sprintf("%s:%d,format=qcow2", storage, sizeGB)
-		if _, err := vm.Config(context.Background(), proxmox.VirtualMachineOption{
+		if _, err := vm.Config(ctx, proxmox.VirtualMachineOption{
 			Name:  slot,
 			Value: diskVal,
 		}); err != nil {
@@ -1314,7 +1650,7 @@ func (d *ProxmoxDriver) MountHDD(vmUUID string, hdd *model.SDConfig, mount bool)
 			}
 		}
 		if slot != "" {
-			if _, err := vm.Config(context.Background(), proxmox.VirtualMachineOption{
+			if _, err := vm.Config(ctx, proxmox.VirtualMachineOption{
 				Name:  "delete",
 				Value: slot,
 			}); err != nil {
@@ -1341,40 +1677,96 @@ func (d *ProxmoxDriver) MountHDD(vmUUID string, hdd *model.SDConfig, mount bool)
 
 // MountISO 挂载/卸载ISO
 func (d *ProxmoxDriver) MountISO(vmUUID string, iso *model.IMConfig, mount bool) (*model.ZMessage, error) {
+	ctx := d.Ctx(vmUUID)
+
 	vm, err := d.getVM(vmUUID)
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "ISOMount", Message: err.Error()}, nil
 	}
 
 	if mount {
-		dvdStorage := "local"
-		if d.Config.DvdromPath != "" {
-			dvdStorage = d.Config.DvdromPath
-		}
-		isoVal := fmt.Sprintf("%s:iso/%s,media=cdrom", dvdStorage, iso.IsoFile)
-		if _, err := vm.Config(context.Background(), proxmox.VirtualMachineOption{
+		volume := proxmoxISOVolume(d.Config.DvdromPath, iso)
+		isoVal := volume + ",media=cdrom"
+		if _, err := vm.Config(ctx, proxmox.VirtualMachineOption{
 			Name:  "ide2",
 			Value: isoVal,
 		}); err != nil {
-			return &model.ZMessage{Success: false, Action: "ISOMount", Message: err.Error()}, nil
+			return &model.ZMessage{Success: false, Action: "ISOMount",
+				Message: fmt.Sprintf("挂载ISO失败: %v（卷: %s）", err, isoVal)}, nil
 		}
+
+		// 回读校验：PVE 接受请求不等于配置真的落盘（曾出现返回成功、
+		// 但 ide2 仍是 none 的情况），把实际值暴露出来，避免「假成功」。
+		if vmid, vmidErr := d.getVMID(vmUUID); vmidErr == nil {
+			want := filepath.Base(volume)
+			var got string
+			for attempt := 0; attempt < 3; attempt++ {
+				cfgMap, cfgErr := d.pveVMConfigMap(vmid)
+				if cfgErr != nil {
+					break
+				}
+				got = cfgMap["ide2"]
+				if strings.Contains(got, want) {
+					break
+				}
+				time.Sleep(300 * time.Millisecond)
+			}
+			if got != "" && !strings.Contains(got, want) {
+				return &model.ZMessage{Success: false, Action: "ISOMount",
+					Message: fmt.Sprintf("挂载ISO未生效：期望 %s，实际 ide2=%q（请确认该 ISO 存在于 %s 存储）",
+						volume, got, strings.TrimSuffix(d.Config.DvdromPath, ":iso"))}, nil
+			}
+		}
+
 		d.mu.Lock()
+		var bootOrder string
 		if vmCfg, ok := d.VmSaving[vmUUID]; ok {
+			// IsoAll 从未挂载过时为 nil，直接赋值会 panic
+			if vmCfg.IsoAll == nil {
+				vmCfg.IsoAll = make(map[string]model.IMConfig)
+			}
 			vmCfg.IsoAll[iso.IsoName] = *iso
+			bootOrder = d.proxmoxBootOrder(vmCfg)
 		}
 		d.mu.Unlock()
+
+		// 启动顺序要和“有光盘”这件事保持一致，否则挂上 ISO 也引导不到。
+		// PVE 的配置键是 boot，值为 order=...（写成 name=order 会被 400 拒绝）。
+		if bootOrder != "" {
+			if _, err := vm.Config(ctx, proxmox.VirtualMachineOption{
+				Name:  "boot",
+				Value: bootOrder,
+			}); err != nil {
+				log.Printf("[proxmox] 更新启动顺序失败（%s）: %v", bootOrder, err)
+			} else if vmid, vmidErr := d.getVMID(vmUUID); vmidErr == nil {
+				if cfgMap, cfgErr := d.pveVMConfigMap(vmid); cfgErr == nil {
+					log.Printf("[proxmox] 光盘已挂载：ide2=%s boot=%s", cfgMap["ide2"], cfgMap["boot"])
+				}
+			}
+		}
 	} else {
-		if _, err := vm.Config(context.Background(), proxmox.VirtualMachineOption{
+		if _, err := vm.Config(ctx, proxmox.VirtualMachineOption{
 			Name:  "ide2",
 			Value: "none,media=cdrom",
 		}); err != nil {
 			return &model.ZMessage{Success: false, Action: "ISOMount", Message: err.Error()}, nil
 		}
 		d.mu.Lock()
+		var bootOrder string
 		if vmCfg, ok := d.VmSaving[vmUUID]; ok {
 			delete(vmCfg.IsoAll, iso.IsoName)
+			bootOrder = d.proxmoxBootOrder(vmCfg)
 		}
 		d.mu.Unlock()
+
+		if bootOrder != "" {
+			if _, err := vm.Config(ctx, proxmox.VirtualMachineOption{
+				Name:  "boot",
+				Value: bootOrder,
+			}); err != nil {
+				log.Printf("[proxmox] 更新启动顺序失败（%s）: %v", bootOrder, err)
+			}
+		}
 	}
 
 	action := "挂载"
@@ -1384,19 +1776,60 @@ func (d *ProxmoxDriver) MountISO(vmUUID string, iso *model.IMConfig, mount bool)
 	return &model.ZMessage{Success: true, Action: "ISOMount", Message: "ISO" + action + "成功"}, nil
 }
 
+// proxmoxISOVolume 构造 PVE 的 ISO 卷 ID（形如 local:iso/foo.iso）。
+//
+// 主机配置里的 dvdrom_path 常见两种写法：
+//   - "local"       → 需要补成 local:iso
+//   - "local:iso"   → 已经是 storage:content 形式
+//
+// 原实现无条件拼 "%s:iso/%s"，当配置为 "local:iso" 时会得到
+// "local:iso:iso/foo.iso" 这种非法卷 ID，PVE 直接拒绝，
+// 表现为「点了挂载但什么也没发生」。
+func proxmoxISOVolume(storageCfg string, iso *model.IMConfig) string {
+	// 驱动/前端可能直接给出完整卷 ID，此时原样使用
+	for _, candidate := range []string{iso.IsoPath, iso.IsoFile} {
+		c := strings.TrimSpace(candidate)
+		if c == "" {
+			continue
+		}
+		if strings.Contains(c, ":") && strings.Contains(c, "/") {
+			return strings.TrimSuffix(c, ",media=cdrom")
+		}
+	}
+
+	file := strings.TrimSpace(iso.IsoFile)
+	if file == "" {
+		file = strings.TrimSpace(iso.IsoPath)
+	}
+	file = strings.TrimLeft(file, "/")
+	// 前端可能只给 "iso/foo.iso"，避免拼成 iso/iso
+	file = strings.TrimPrefix(file, "iso/")
+
+	storage := strings.TrimSpace(storageCfg)
+	if storage == "" {
+		storage = "local"
+	}
+	if !strings.Contains(storage, ":") {
+		storage += ":iso"
+	}
+	return storage + "/" + file
+}
+
 // ============================================================
 // 密码设置
 // ============================================================
 
 // SetPassword 设置虚拟机密码（通过QEMU guest agent）
 func (d *ProxmoxDriver) SetPassword(vmUUID string, password string) (*model.ZMessage, error) {
+	ctx := d.Ctx(vmUUID)
+
 	vm, err := d.getVM(vmUUID)
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "Password", Message: err.Error()}, nil
 	}
 
 	// 通过QEMU guest agent设置密码
-	if err := vm.AgentSetUserPassword(context.Background(), "root", password); err != nil {
+	if err := vm.AgentSetUserPassword(ctx, "root", password); err != nil {
 		// 如果guest agent不可用，只更新内存中的密码
 		d.mu.Lock()
 		if cfg, ok := d.VmSaving[vmUUID]; ok {
@@ -1426,7 +1859,7 @@ func (d *ProxmoxDriver) Crontab() bool {
 		return false
 	}
 
-	vms, err := node.VirtualMachines(context.Background())
+	vms, err := node.VirtualMachines(d.Ctx(""))
 	if err != nil {
 		return false
 	}

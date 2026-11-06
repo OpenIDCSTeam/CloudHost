@@ -8,7 +8,6 @@
 package driver
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -56,7 +55,7 @@ func (d *ProxmoxDriver) pveVMConfigMap(vmid int64) (map[string]string, error) {
 	}
 	var raw map[string]interface{}
 	path := fmt.Sprintf("/nodes/%s/qemu/%d/config", d.nodeName(), vmid)
-	if err := client.Get(context.Background(), path, &raw); err != nil {
+	if err := client.Get(d.Ctx(""), path, &raw); err != nil {
 		return nil, fmt.Errorf("读取虚拟机配置失败: %w", err)
 	}
 	out := make(map[string]string, len(raw))
@@ -157,7 +156,7 @@ func (d *ProxmoxDriver) DeleteHDD(vmUUID string, hddName string) (*model.ZMessag
 	}
 	volid := pveVolumeOf(value)
 
-	ctx := context.Background()
+	ctx := d.Ctx(vmUUID)
 	wasRunning := vm.IsRunning()
 	if wasRunning {
 		if task, err := vm.Stop(ctx); err == nil && task != nil {
@@ -273,7 +272,7 @@ func (d *ProxmoxDriver) TransferHDD(vmUUID string, hdd *model.SDConfig, targetVM
 		return &model.ZMessage{Success: false, Action: "HDDTrans", Message: err.Error()}, nil
 	}
 
-	ctx := context.Background()
+	ctx := d.Ctx(vmUUID)
 
 	// 移交前两侧都必须关机
 	srcWasRunning := srcVM.IsRunning()
@@ -514,7 +513,7 @@ func (d *ProxmoxDriver) RestoreBackup(vmUUID string, backupName string) (*model.
 		return &model.ZMessage{Success: false, Action: "Restores", Message: err.Error()}, nil
 	}
 
-	ctx := context.Background()
+	ctx := d.Ctx(vmUUID)
 
 	// 解析备份卷标识（优先精确匹配，其次模糊匹配，与 Python 一致）
 	storageName := strings.TrimSpace(d.Config.BackupPath)
@@ -609,7 +608,7 @@ func (d *ProxmoxDriver) waitPVETask(taskID string, timeout time.Duration) error 
 			ExitStatus string `json:"exitstatus"`
 		}
 		path := fmt.Sprintf("/nodes/%s/tasks/%s/status", d.nodeName(), taskID)
-		if err := client.Get(context.Background(), path, &status); err == nil {
+		if err := client.Get(d.Ctx(""), path, &status); err == nil {
 			if status.Status == "stopped" {
 				if status.ExitStatus != "" && status.ExitStatus != "OK" {
 					return fmt.Errorf("任务返回失败状态: %s", status.ExitStatus)

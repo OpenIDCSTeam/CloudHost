@@ -56,7 +56,7 @@ func (d *ProxmoxDriver) runOnNode(cmd string, timeout time.Duration) (*nodeShell
 
 // runLocalShell 在宿主机本地执行 shell 命令
 func (d *ProxmoxDriver) runLocalShell(cmd string, timeout time.Duration) (*nodeShellResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(d.Ctx(""), timeout)
 	defer cancel()
 
 	var c *exec.Cmd
@@ -104,7 +104,7 @@ func (d *ProxmoxDriver) nodeStoragePath(storage string) string {
 	if err != nil {
 		return defaultStoragePath(storage)
 	}
-	ctx := context.Background()
+	ctx := d.Ctx("")
 
 	// 1) 节点级存储信息：/nodes/{node}/storage/{storage} 通常带 path
 	var nodeResp struct {
@@ -313,6 +313,34 @@ func (d *ProxmoxDriver) proxmoxBootOrder(cfg *model.VMConfig) string {
 	sort.Strings(rest)
 	ordered = append(ordered, rest...)
 
+	// 光驱（ide2）固定保留在启动顺序末位：
+	// 否则一旦 efi_all 里没有光盘项，order 就不含 ide2，
+	// 表现为「挂载了光盘但启动顺序里没有它」，必须重启/重设才生效。
+	// 注意 ide0 是系统盘，不能算作光驱位；光驱从 ide2 起
+	hasOptical := false
+	for _, dev := range ordered {
+		if dev == "ide2" || dev == "ide3" {
+			hasOptical = true
+			break
+		}
+	}
+	if !hasOptical {
+		ordered = append(ordered, "ide2")
+	}
+
+	// 网络引导（PXE）放在最后：之前 order 只含磁盘与光驱，
+	// PVE 的「启动顺序」里看不到网卡，无法从网络引导。
+	existing := make(map[string]bool, len(ordered))
+	for _, dev := range ordered {
+		existing[dev] = true
+	}
+	for i := 0; i < len(cfg.NicAll); i++ {
+		dev := fmt.Sprintf("net%d", i)
+		if !existing[dev] {
+			ordered = append(ordered, dev)
+		}
+	}
+
 	if len(ordered) == 0 {
 		return "order=ide0;ide2"
 	}
@@ -406,7 +434,7 @@ func (d *ProxmoxDriver) installSystem(cfg *model.VMConfig) (*model.ZMessage, err
 	}
 	bootOrder := d.proxmoxBootOrder(cfg)
 
-	ctx := context.Background()
+	ctx := d.Ctx(cfg.VmUUID)
 
 	// 判断模式：images_path 不含 "/" 视为 PVE 存储名
 	if !strings.Contains(imagesPath, "/") {

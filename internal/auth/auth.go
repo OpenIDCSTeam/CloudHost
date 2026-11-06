@@ -25,8 +25,9 @@ import (
 // ============================================================
 
 type loginAttempt struct {
-	count     int
-	lockedAt  time.Time
+	count    int
+	lockedAt time.Time
+	lastSeen time.Time
 }
 
 var (
@@ -37,7 +38,22 @@ var (
 const (
 	maxLoginAttempts = 5
 	lockDuration     = 300 * time.Second
+	// loginAttemptTTL 未达锁定阈值的失败记录的保留时长。
+	// 攻击者用大量不同 IP 各失败一次即可让 map 无限增长，必须定期清理。
+	loginAttemptTTL = 10 * time.Minute
+	// loginCleanupInterval 登录失败记录清理间隔
+	loginCleanupInterval = 5 * time.Minute
 )
+
+func init() {
+	go func() {
+		ticker := time.NewTicker(loginCleanupInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			CleanupLoginAttempts(time.Now())
+		}
+	}()
+}
 
 // CheckLoginLimit 检查IP是否被限流，返回true表示被锁定
 func CheckLoginLimit(ip string) bool {
@@ -69,9 +85,47 @@ func RecordLoginFailure(ip string) {
 		loginAttempts[ip] = attempt
 	}
 	attempt.count++
+	attempt.lastSeen = time.Now()
 	if attempt.count >= maxLoginAttempts {
-		attempt.lockedAt = time.Now()
+		attempt.lockedAt = attempt.lastSeen
 	}
+}
+
+// CleanupLoginAttempts 清理已解锁或长期未再失败的登录记录，返回清理条数。
+// 由后台协程定期调用，也可在运维接口中手动触发。
+func CleanupLoginAttempts(now time.Time) int {
+	loginMu.Lock()
+	defer loginMu.Unlock()
+
+	removed := 0
+	for ip, attempt := range loginAttempts {
+		if attempt == nil {
+			delete(loginAttempts, ip)
+			removed++
+			continue
+		}
+		if attempt.count >= maxLoginAttempts {
+			// 已过锁定期的直接丢弃，下一次失败重新计数
+			if now.Sub(attempt.lockedAt) >= lockDuration {
+				delete(loginAttempts, ip)
+				removed++
+			}
+			continue
+		}
+		// 未达阈值的记录：超过 TTL 未再失败即清理
+		if !attempt.lastSeen.IsZero() && now.Sub(attempt.lastSeen) >= loginAttemptTTL {
+			delete(loginAttempts, ip)
+			removed++
+		}
+	}
+	return removed
+}
+
+// LoginAttemptCount 返回当前登录失败记录条数（用于监控与测试）
+func LoginAttemptCount() int {
+	loginMu.Lock()
+	defer loginMu.Unlock()
+	return len(loginAttempts)
 }
 
 // ResetLoginAttempts 重置登录失败计数（登录成功后调用）

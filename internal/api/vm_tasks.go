@@ -81,7 +81,22 @@ func (app *App) submitVMTask(name string, taskType task.TaskType, createdBy,
 }
 
 // Execute 按任务类型分发执行
+//
+// 任务运行前把任务 context 绑定到对应虚拟机：驱动内部的平台调用
+// 通过 BaseDriver.Ctx(vmUUID) 取用，任务被终止（或超时）时
+// PVE 的 WaitFor / govmomi 的 task.Wait 会随之取消，
+// 而不再是「任务显示已终止、后台仍在创建虚拟机」。
 func (e *vmTaskExecutor) Execute(ctx context.Context, t *task.Task) error {
+	if d := e.app.HostSvc.GetDriver(t.HsName); d != nil {
+		type contextBinder interface {
+			BindContext(string, context.Context) func()
+		}
+		if binder, ok := d.(contextBinder); ok {
+			release := binder.BindContext(t.VmUUID, ctx)
+			defer release()
+		}
+	}
+
 	switch t.Type {
 	case task.TaskTypeVMCreate:
 		return e.createVM(ctx, t)
