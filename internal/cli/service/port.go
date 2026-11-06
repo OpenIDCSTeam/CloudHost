@@ -14,12 +14,42 @@ import (
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/appconfig"
 )
 
+var dataDirOverride string
+
+// SetDataDir 设置运行目录（来自 --data-dir）。
+func SetDataDir(dir string) {
+	dataDirOverride = strings.TrimSpace(dir)
+}
+
 // DataDir 返回主控运行目录（与 CLI 保持一致）。
+// 优先级：--data-dir > OPIDCS_DATA_DIR > 常见安装路径 > ./data。
 func DataDir() string {
+	if dataDirOverride != "" {
+		return dataDirOverride
+	}
 	if dir := strings.TrimSpace(os.Getenv("OPIDCS_DATA_DIR")); dir != "" {
 		return dir
 	}
+	for _, candidate := range installedDataDirs() {
+		if _, err := os.Stat(filepath.Join(candidate, "data.yaml")); err == nil {
+			return candidate
+		}
+	}
 	return "./data"
+}
+
+func installedDataDirs() []string {
+	switch runtime.GOOS {
+	case "windows":
+		if base := os.Getenv("ProgramData"); base != "" {
+			return []string{filepath.Join(base, "OpenIDCS", "HostAgent", "data")}
+		}
+	case "darwin":
+		return []string{"/usr/local/openidcs/data"}
+	default:
+		return []string{"/var/lib/openidcs"}
+	}
+	return nil
 }
 
 // ReadConfigPort 从 data.yaml 读取端口。

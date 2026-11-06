@@ -23,6 +23,9 @@ func newCoreCmd() *cobra.Command {
 			if !confirm("即将安装/更新主控服务，继续？") {
 				return nil
 			}
+			if coreInstallOpt.DataDir == "" && flagDataDir != "" {
+				coreInstallOpt.DataDir = flagDataDir
+			}
 			return service.Install(coreInstallOpt)
 		},
 	}

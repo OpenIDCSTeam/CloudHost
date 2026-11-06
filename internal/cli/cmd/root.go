@@ -14,6 +14,7 @@ import (
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/cli/client"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/cli/config"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/cli/output"
+	"github.com/OpenIDCSTeam/HostAgent-Go/internal/cli/service"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/cli/tui"
 )
 
@@ -22,6 +23,7 @@ var (
 	flagURL        string
 	flagToken      string
 	flagOutput     string
+	flagDataDir    string
 	flagYes        bool
 	flagShowSecret bool
 )
@@ -46,6 +48,10 @@ func NewRootCmd() *cobra.Command {
 不带参数运行会进入交互式菜单。`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			service.SetDataDir(flagDataDir)
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return tui.Run(func(argv []string) error {
 				r := NewRootCmd()
@@ -60,6 +66,7 @@ func NewRootCmd() *cobra.Command {
 	pf.StringVar(&flagURL, "url", "", "临时指定主控地址")
 	pf.StringVar(&flagToken, "token", "", "临时指定 Token（- 表示从 stdin 读取）")
 	pf.StringVar(&flagOutput, "output", "table", "输出格式：table|json|yaml")
+	pf.StringVar(&flagDataDir, "data-dir", "", "主控运行目录（默认 OPIDCS_DATA_DIR 或 ./data）")
 	pf.BoolVar(&flagYes, "yes", false, "跳过确认")
 	pf.BoolVar(&flagShowSecret, "show-secret", false, "明文显示 Token")
 

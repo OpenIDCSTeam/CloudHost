@@ -140,7 +140,7 @@ func run(cmd *cobra.Command, args []string) error {
 	consoleLevel, fileLevel, dbLevel := app.Logger.Levels()
 	fmt.Printf("\n========================================\n")
 	fmt.Printf("  OpenIDCS HostAgent-Go 已启动\n")
-	fmt.Printf("  监听端口: %d\n", port)
+	fmt.Printf("  监听地址: %s\n", fmt.Sprintf("%s:%d", cfg.Server.Host, port))
 	fmt.Printf("  数据目录: %s\n", dataDir)
 	fmt.Printf("  配置文件: %s\n", paths.Config())
 	fmt.Printf("  数据库: %s\n", db.Dialect())
@@ -198,9 +198,13 @@ func run(cmd *cobra.Command, args []string) error {
 	// defer 会在函数返回时执行，无法保证「先停服务再停调度器」的顺序，
 	// 且 Stop 内部会 close 通道，重复调用会 panic。
 
-	// 启动HTTP服务器
+	// 启动HTTP服务器（监听地址来自 data.yaml 的 server.host）
+	listenAddr := fmt.Sprintf(":%d", port)
+	if host := strings.TrimSpace(cfg.Server.Host); host != "" {
+		listenAddr = fmt.Sprintf("%s:%d", host, port)
+	}
 	srv := &http.Server{
-		Addr:              fmt.Sprintf(":%d", port),
+		Addr:              listenAddr,
 		Handler:           app.Router,
 		ReadHeaderTimeout: 20 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -211,7 +215,7 @@ func run(cmd *cobra.Command, args []string) error {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("[server] 开始监听 :%d", port)
+		log.Printf("[server] 开始监听 %s", listenAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[server] 启动失败: %v", err)
 		}
