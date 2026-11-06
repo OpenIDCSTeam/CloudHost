@@ -22,7 +22,7 @@ import (
 // registeredEngineTypes 全部已注册的虚拟化引擎类型（与 engine_config.go 保持一致）
 var registeredEngineTypes = []string{
 	"VMWareSetup", "PromoxSetup", "VirtualBoxs", "QEMUServer", "HyperVSetup",
-	"vSphereESXi", "LxContainer", "OCInterface", "MemuAndroid", "QingzhouYun",
+	"vSphereESXi", "LxContainer", "OCInterface", "MemuAndroid",
 	"SmolVM",
 }
 

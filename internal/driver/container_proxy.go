@@ -8,7 +8,7 @@
 //  3. add=true  → 通过 iptables 下发 DNAT + ACCEPT 规则
 //     add=false → 删除对应规则
 //
-// 与「青州云」这类云端通道不同，容器平台没有云端 NAT API，
+// 容器平台没有云端 NAT API，
 // 端口映射落在**宿主机 iptables** 上（nat/filter 的 DOCKER 链）。
 package driver
 

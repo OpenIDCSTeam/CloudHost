@@ -673,7 +673,7 @@ func (app *App) handleVMPowers(c *gin.Context) {
 
 // normalizePowerAction 把外部传入的电源操作归一化为驱动使用的指令常量。
 //
-// 驱动（Proxmox / Hyper-V / 青州云 等）只认 model 里的 S_START / S_CLOSE /
+// 驱动（Proxmox / Hyper-V 等）只认 model 里的 S_START / S_CLOSE /
 // S_RESET / H_CLOSE / H_RESET / A_PAUSE / A_WAKED；而前端部分页面发送的是
 // 语义值（start / stop / hard_stop / reset / pause / resume），直接透传会
 // 全部落到驱动的 default 分支，报「不支持的电源操作」。
@@ -2351,8 +2351,7 @@ func (app *App) handleIPDelete(c *gin.Context) {
 	// 删除网卡后同步解除路由器上的静态绑定，避免残留（不存在时幂等）。
 	// 网卡本来就没有 IP/MAC（例如旧版本添加、未分配地址）时无需解绑，
 	// 否则会打印「解绑静态绑定需要 ip 或 mac」这类无意义告警。
-	if removedIP, removedMAC := strings.TrimSpace(removed.IP4Addr), strings.TrimSpace(removed.MacAddr);
-		exists && app.NATService != nil && (removedIP != "" || removedMAC != "") {
+	if removedIP, removedMAC := strings.TrimSpace(removed.IP4Addr), strings.TrimSpace(removed.MacAddr); exists && app.NATService != nil && (removedIP != "" || removedMAC != "") {
 		if unbindErr := app.NATService.UnbindStatic(hsName, removedIP, removedMAC); unbindErr != nil {
 			app.Logger.Log(hsName, "WARNING", "网卡配置", "解除静态绑定失败: "+unbindErr.Error(), false)
 		}
@@ -3422,16 +3421,16 @@ func (app *App) handleOSImages(c *gin.Context) {
 	meta, _ := driver.EngineMetaOf(cfg.ServerType)
 
 	utils.Success(c, map[string]interface{}{
-		"host_name":   hsName,
-		"server_type": cfg.ServerType,
-		"filter_name": cfg.FilterName,
-		"system_maps": service.OSListToArray(cfg.SystemMaps),
-		"images_maps": service.OSListToArray(cfg.ImagesMaps),
-		"ban_init":    meta.BanInit,
-		"ban_edit":    meta.BanEdit,
-		"messages":    meta.Messages,
-		"tab_lock":    meta.TabLock,
-		"enable_host": cfg.EnableHost,
+		"host_name":    hsName,
+		"server_type":  cfg.ServerType,
+		"filter_name":  cfg.FilterName,
+		"system_maps":  service.OSListToArray(cfg.SystemMaps),
+		"images_maps":  service.OSListToArray(cfg.ImagesMaps),
+		"ban_init":     meta.BanInit,
+		"ban_edit":     meta.BanEdit,
+		"messages":     meta.Messages,
+		"tab_lock":     meta.TabLock,
+		"enable_host":  cfg.EnableHost,
 		"ipaddr_maps":  cfg.IPAddrMaps,
 		"ipaddr_ddns":  cfg.IPAddrDDNS,
 		"public_addr":  cfg.PublicAddr,
@@ -3565,7 +3564,50 @@ func (app *App) handleEFIList(c *gin.Context) {
 		utils.NotFound(c, "虚拟机不存在")
 		return
 	}
+	// 历史虚拟机没有 efi_all：按当前磁盘/光驱/网卡生成一份默认启动项并落库，
+	// 让前端首屏（含缓存）有内容可显示，而不是空白或占位。
+	if len(vm.EfiAll) == 0 {
+		vm.EfiAll = defaultBootOptions(vm)
+		if err := app.DB.UpsertVMConfig(hsName, vmUUID, vm); err != nil {
+			app.Logger.Log(hsName, "WARNING", "启动顺序", "保存默认启动项失败: "+err.Error(), false)
+		}
+	}
 	utils.Success(c, vm.EfiAll)
+}
+
+// defaultBootOptions 按平台语义生成默认启动项：系统盘 → 数据盘 → 光驱 → 网卡。
+//
+// efi_name 必须使用业务名称（虚拟机名 / 虚拟机名-数据盘名 / 光盘名），
+// 因为 proxmoxBootOrder 靠它映射到 ide0/scsiN/ideN；无法映射的项会被忽略，
+// 网卡会由 boot 逻辑自动补齐，因此这里多出的"网卡"项只用于展示。
+func defaultBootOptions(vm *model.VMConfig) []model.BootOpts {
+	list := []model.BootOpts{{EfiType: false, EfiName: vm.VmUUID}}
+
+	hddNames := make([]string, 0, len(vm.HddAll))
+	for name := range vm.HddAll {
+		hddNames = append(hddNames, name)
+	}
+	sort.Strings(hddNames)
+	for _, name := range hddNames {
+		if vm.HddAll[name].HddFlag == 0 {
+			continue
+		}
+		list = append(list, model.BootOpts{EfiType: false, EfiName: vm.VmUUID + "-" + name})
+	}
+
+	isoNames := make([]string, 0, len(vm.IsoAll))
+	for name := range vm.IsoAll {
+		isoNames = append(isoNames, name)
+	}
+	sort.Strings(isoNames)
+	for _, name := range isoNames {
+		list = append(list, model.BootOpts{EfiType: true, EfiName: name})
+	}
+
+	if len(vm.NicAll) > 0 {
+		list = append(list, model.BootOpts{EfiType: false, EfiName: "网卡(PXE)"})
+	}
+	return list
 }
 
 func (app *App) handleEFISetup(c *gin.Context) {

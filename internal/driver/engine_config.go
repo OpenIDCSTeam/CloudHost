@@ -22,10 +22,7 @@ type EngineMeta struct {
 	TabLock     []string          `json:"tab_lock"`
 }
 
-// engineConfigs 引擎配置表（内容与 Python HSEngine.HEConfig 一致）
-// 说明：QingzhouYun 与 Python 保持一致，以 Enabled=false 关闭对界面/接口的暴露
-// （不出现在 /api/system/engine 的 engine_types 中）；
-// 其驱动实现与 createDriver 分支完整保留，需要启用时把 Enabled 改为 true 即可。
+// engineConfigs 引擎配置表
 var engineConfigs = []EngineMeta{
 	{
 		Type:        "VMWareSetup",
@@ -198,22 +195,6 @@ var engineConfigs = []EngineMeta{
 		BanInit: []string{"gpu_num", "gpu_mem", "hdd_num", "speed_u", "speed_d"},
 		BanEdit: []string{"gpu_num", "gpu_mem", "hdd_num", "speed_u", "speed_d"},
 		TabLock: []string{"hdd", "pci", "usb"},
-	},
-	{
-		Type:        "QingzhouYun",
-		Description: "QingzhouYun Cloud",
-		Enabled:     false, // 与 Python 一致：不对外暴露（驱动代码保留）
-		IsRemote:    true,
-		Platform:    []string{"Linux", "Windows", "MacOS"},
-		CPUArch:     []string{"x86_64", "aarch64"},
-		Optional:    map[string]string{},
-		Messages: []string{
-			"1、云平台不支持PCI/USB 设备直通",
-			"2、通过HTTP API远程管理虚拟机",
-		},
-		BanInit: []string{"gpu_num", "gpu_mem"},
-		BanEdit: []string{"gpu_num", "gpu_mem"},
-		TabLock: []string{"pci", "usb"},
 	},
 }
 

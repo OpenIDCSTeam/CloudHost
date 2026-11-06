@@ -494,7 +494,7 @@ func (b *BaseDriver) GetPower(vmUUID string) string {
 // 原实现只返回时间戳，导致未覆盖该方法的平台（Hyper-V / QEMU / VirtualBox /
 // MEmu / VMware Workstation 等）主机状态恒为全 0，前端显示不出任何数据。
 //
-// 远程平台（Proxmox / ESXi / 青州云）必须覆写本方法，使用平台 API 采集，
+// 远程平台（Proxmox / ESXi 等）必须覆写本方法，使用平台 API 采集，
 // 否则会把 IDCClient 本机资源误报为远程主机状态。
 func (b *BaseDriver) GetStatus() (*model.HWStatus, error) {
 	return localHWStatus(), nil

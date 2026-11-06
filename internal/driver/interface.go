@@ -173,8 +173,6 @@ func createDriver(cfg *model.HSConfig) HostDriver {
 		return NewVirtualBoxDriver(cfg)
 	case "MemuAndroid":
 		return NewMemuDriver(cfg)
-	case "QingzhouYun":
-		return NewQingzhouDriver(cfg)
 	case "SmolVM":
 		return NewSmolVMDriver(cfg)
 	default:

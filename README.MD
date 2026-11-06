@@ -56,23 +56,23 @@ OpenIDC-Client是一个开源的IDC（Internet Data Center）虚拟化统一管�
 
 #### 功能支持
 
-| 方法名 | 功能描述 | VMware | LXC |  OCI   | PVE | HyperV | ESXi  | Qingzhou |
-|--------|----------|:------:|:-----------:|:------:|:---:|:------:|:-----:|:-----------:|
-| `VMPasswd` | 改密 |   ✅    | ✅外部 |  ✅外部   |  ✅  |   ✅    |   ✅   | ✅ |
-| `VMScreen` | 截图 |   ✅    | ❌ 不支持 | ❌ 不支持  |  ✅  |   ✅    |   ✅   | ✅ |
-| `VMBackup` | 备份 |   ✅    | ✅ |   ✅    |  ✅  |   ✅    |   ✅   | ✅ |
-| `Restores` | 还原 |   ✅    | ✅ |   ✅    |  ✅  |   ✅    |   ✅   | ✅ |
-| `LDBackup` | 列出备份 |   ✅    | ✅ |   ✅    | ⚠️  |   ✅    |   ✅   | ✅ |
-| `RMBackup` | 删除备份 |   ✅    | ✅ |   ✅    | ⚠️  |   ✅    |   ✅   | ✅ |
-| `HDDMount` | 挂载磁盘 |   ✅    | ✅ |   ✅    |  ✅  |   ✅    |   ✅   | ✅ |
-| `ISOMount` | 挂载ISO |   ✅    | ❌  不支持 |   ✅    |  ✅  |   ✅    |   ✅   | ✅ |
-| `RMMounts` | 卸载磁盘 |   ✅    | ✅ |   ✅    |  ✅  |   ✅    |   ✅   | ✅ |
-| `HDDCheck` | 磁盘检查 |   ✅    | ❌ |   ❌    |  ✅  |   ❌    |   ✅   | ❌ |
-| `HDDTrans` | 磁盘迁移 |   ✅    | ❌  不支持 | ❌  不支持 |  ✅  | ❌ 不适用  | ❌ 无方法 | ❌ 不适用 |
-| `PCIShows` | 列出PCI | ❌ 不支持  | ❌ 不支持 |   ✅    |  ✅  |   ✅    |   ✅   | ✅ |
-| `PCISetup` | 配置PCI |   ✅    | ❌ |   ❌    |  ✅  |   ✅    |   ✅   | ❌ 不适用 |
-| `USBShows` | 列出USB |   ✅    | ❌ |   ❌    |  ✅  |   ❌    |   ✅   | ❌ |
-| `USBSetup` | 配置USB |   ✅    | ❌ |   ❌    |  ✅  |   ❌    |   ✅   | ❌ 不适用 |
+| 方法名 | 功能描述 | VMware | LXC |  OCI   | PVE | HyperV | ESXi  |
+|--------|----------|:------:|:-----------:|:------:|:---:|:------:|:-----:|
+| `VMPasswd` | 改密 |   ✅    | ✅外部 |  ✅外部   |  ✅  |   ✅    |   ✅   |
+| `VMScreen` | 截图 |   ✅    | ❌ 不支持 | ❌ 不支持  |  ✅  |   ✅    |   ✅   |
+| `VMBackup` | 备份 |   ✅    | ✅ |   ✅    |  ✅  |   ✅    |   ✅   |
+| `Restores` | 还原 |   ✅    | ✅ |   ✅    |  ✅  |   ✅    |   ✅   |
+| `LDBackup` | 列出备份 |   ✅    | ✅ |   ✅    | ⚠️  |   ✅    |   ✅   |
+| `RMBackup` | 删除备份 |   ✅    | ✅ |   ✅    | ⚠️  |   ✅    |   ✅   |
+| `HDDMount` | 挂载磁盘 |   ✅    | ✅ |   ✅    |  ✅  |   ✅    |   ✅   |
+| `ISOMount` | 挂载ISO |   ✅    | ❌  不支持 |   ✅    |  ✅  |   ✅    |   ✅   |
+| `RMMounts` | 卸载磁盘 |   ✅    | ✅ |   ✅    |  ✅  |   ✅    |   ✅   |
+| `HDDCheck` | 磁盘检查 |   ✅    | ❌ |   ❌    |  ✅  |   ❌    |   ✅   |
+| `HDDTrans` | 磁盘迁移 |   ✅    | ❌  不支持 | ❌  不支持 |  ✅  | ❌ 不适用  | ❌ 无方法 |
+| `PCIShows` | 列出PCI | ❌ 不支持  | ❌ 不支持 |   ✅    |  ✅  |   ✅    |   ✅   |
+| `PCISetup` | 配置PCI |   ✅    | ❌ |   ❌    |  ✅  |   ✅    |   ✅   |
+| `USBShows` | 列出USB |   ✅    | ❌ |   ❌    |  ✅  |   ❌    |   ✅   |
+| `USBSetup` | 配置USB |   ✅    | ❌ |   ❌    |  ✅  |   ❌    |   ✅   |
 
 
 
@@ -277,7 +277,6 @@ graph LR
     HM --> DC[Docker/Podman/OCI]
     HM --> PX[Proxmox VE / QEMU]
     HM --> HV[Windows Hyper-V]
-    HM --> QZ[青州云]
 ```
 
 ### 技术栈
@@ -328,7 +327,6 @@ OpenIDC-Client/
 │   ├── ProxmoxQemu.py          # Proxmox VE / QEMU接口
 │   ├── Win64HyperV.py          # Windows Hyper-V接口
 │   │   └── Win64HyperVAPI/     # Hyper-V API子模块
-│   ├── QingzhouYun.py          # 青州云接口
 │   └── VPCTemplate.py          # VPC模板管理
 ├── 📁 HostModule/              # 业务逻辑模块
 │   ├── HostManager.py          # 主机管理

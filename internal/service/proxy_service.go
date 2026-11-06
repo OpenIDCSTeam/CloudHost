@@ -39,9 +39,17 @@ type ProxyService struct {
 	configFile string
 	managePort int
 	dataDir    string
+	// natSvc 中转模式下用于自动创建端口映射（relay 必须有一个公网入口）
+	natSvc *NATService
 }
 
-// SetDriverResolver 注入驱动解析器（用于识别平台自有的代理通道，如青州云）
+// SetNATService 注入 NAT 服务：中转模式的反向代理需要先有端口映射，
+// 缺失时由代理流程自动创建，而不是要求用户手工添加。
+func (s *ProxyService) SetNATService(svc *NATService) {
+	s.natSvc = svc
+}
+
+// SetDriverResolver 注入驱动解析器（用于识别平台自有的代理通道）
 func (s *ProxyService) SetDriverResolver(fn func(string) driver.HostDriver) {
 	s.resolver = fn
 }
@@ -200,7 +208,7 @@ func (s *ProxyService) Rebuild() error {
 	// 同时按主机的代理模式计算实际上游：直连虚拟机内网 IP，或经爱快公网中转。
 	entries := make(map[string]proxyEntry)
 	for _, h := range hosts {
-		// 平台自有代理通道（如青州云）由云端 API 管理，不纳入本地 Caddy 配置
+		// 平台自有代理通道由平台 API 管理，不纳入本地 Caddy 配置
 		if _, ok := s.provider(h.HsName); ok {
 			continue
 		}
@@ -232,9 +240,16 @@ func (s *ProxyService) Rebuild() error {
 				}
 				upHost, upPort := web.LanAddr, web.LanPort
 				if mode == "relay" {
+					// 中转模式绝不能回退直连：用户选择中转通常正是因为直连不通。
+					// 上游必须是「中转地址:公网端口」，缺任何一项都跳过并明确报错。
 					wanPort := natWanPortFor(vm.NatAll, web.LanPort)
-					if relay == "" || wanPort == 0 {
-						log.Printf("[proxy] 跳过 %s：中转模式缺少公网地址或 %s:%d 的端口映射",
+					if relay == "" {
+						log.Printf("[proxy] %s：中转模式未配置中转地址（relay_addr 或服务器公网IP），已跳过",
+							web.WebAddr)
+						continue
+					}
+					if wanPort == 0 {
+						log.Printf("[proxy] %s：中转模式缺少 %s:%d 的端口映射，已跳过",
 							web.WebAddr, web.LanAddr, web.LanPort)
 						continue
 					}
@@ -476,7 +491,7 @@ func (s *ProxyService) RebuildAndReload() error {
 	return nil
 }
 
-// HasProvider 判断主机是否使用平台自有的代理通道（如青州云）。
+// HasProvider 判断主机是否使用平台自有的代理通道。
 // 这类通道由云端 API 管理，删除时需要逐条调用云端接口销账。
 func (s *ProxyService) HasProvider(hsName string) bool {
 	_, ok := s.provider(hsName)
@@ -490,7 +505,7 @@ func (s *ProxyService) RevokeProxy(hsName, vmUUID string, proxy model.WebProxy) 
 }
 
 // ApplyProxy 下发反向代理
-// 平台自有通道优先（青州云云端 API），否则重建并重载本地 Caddy 配置。
+// 平台自有通道优先，否则重建并重载本地 Caddy 配置。
 func (s *ProxyService) ApplyProxy(hsName, vmUUID string, proxy model.WebProxy, add bool) error {
 	if p, ok := s.provider(hsName); ok {
 		msg, err := p.ProxyMap(vmUUID, proxy, add)
@@ -502,7 +517,61 @@ func (s *ProxyService) ApplyProxy(hsName, vmUUID string, proxy model.WebProxy, a
 		}
 		return nil
 	}
+
+	// 中转模式下反向代理必须有公网入口：没有对应端口映射时自动创建一条，
+	// 而不是要求用户先去端口映射页手工添加。
+	if add && s.isRelayMode(hsName) {
+		if err := s.ensureProxyPortMap(hsName, vmUUID, proxy); err != nil {
+			return err
+		}
+	}
 	return s.RebuildAndReload()
+}
+
+// isRelayMode 判断主机是否配置为「经爱快中转」。
+func (s *ProxyService) isRelayMode(hsName string) bool {
+	host, err := s.db.GetHost(hsName)
+	if err != nil || host == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(host.ProxyMode), "relay")
+}
+
+// ensureProxyPortMap 确保「内网端口」有一条可用的端口映射。
+//
+// 中转模式的上游是「中转地址:公网端口」，公网端口来自端口映射；
+// 没有映射时反向代理无从转发，因此在创建代理前先自动补一条。
+func (s *ProxyService) ensureProxyPortMap(hsName, vmUUID string, proxy model.WebProxy) error {
+	if s.natSvc == nil {
+		return fmt.Errorf("中转模式需要端口映射，但 NAT 服务不可用")
+	}
+	raw, err := s.db.GetVMConfig(hsName, vmUUID)
+	if err != nil || raw == "" {
+		return fmt.Errorf("读取虚拟机配置失败")
+	}
+	vm, err := DecodeVMConfig(raw)
+	if err != nil || vm == nil {
+		return fmt.Errorf("解析虚拟机配置失败")
+	}
+	if natWanPortFor(vm.NatAll, proxy.LanPort) > 0 {
+		return nil
+	}
+
+	nat := model.PortData{
+		LanPort: proxy.LanPort,
+		LanAddr: proxy.LanAddr,
+		NatTips: fmt.Sprintf("proxy-%s", proxy.WebAddr),
+	}
+	if err := s.natSvc.ApplyPortMap(hsName, vmUUID, &nat, 0); err != nil {
+		return fmt.Errorf("中转模式需要端口映射，自动创建 %d 端口映射失败: %w", proxy.LanPort, err)
+	}
+	vm.NatAll = append(vm.NatAll, nat)
+	if err := s.db.UpsertVMConfig(hsName, vmUUID, vm); err != nil {
+		log.Printf("[proxy] 自动创建端口映射后保存虚拟机配置失败: %v", err)
+	}
+	log.Printf("[proxy] 中转模式已自动创建端口映射：%s:%d → 公网端口 %d",
+		nat.LanAddr, nat.LanPort, nat.WanPort)
+	return nil
 }
 
 // proxyEntry 一条代理规则及其实际生效的上游地址。

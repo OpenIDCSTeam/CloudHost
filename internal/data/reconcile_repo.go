@@ -29,7 +29,7 @@ const (
 	OutboxActionStaticUnbind = "static_unbind"
 	// OutboxActionProxySync 重新下发反向代理配置
 	OutboxActionProxySync = "proxy_sync"
-	// OutboxActionProxyRevoke 撤销平台自有通道（如青州云）上的一条反向代理
+	// OutboxActionProxyRevoke 撤销平台自有通道上的一条反向代理
 	OutboxActionProxyRevoke = "proxy_revoke"
 )
 

@@ -4,7 +4,7 @@
 // 用于「驱动运行在 IDCClient 所在机器」的平台（Hyper-V / QEMU / VirtualBox /
 // MEmu / VMware Workstation 等）。
 //
-// 注意：远程平台（Proxmox / ESXi / 青州云）必须使用各自 API 的实现，
+// 注意：远程平台（Proxmox / ESXi 等）必须使用各自 API 的实现，
 // 否则会把 IDCClient 本机的资源误报为远程主机状态。
 package driver
 

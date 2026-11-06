@@ -142,9 +142,11 @@ func NewApp(db *data.DB, dataDir string) *App {
 	} else {
 		app.Logger.Info("", "反向代理", "使用 Caddy: "+bin)
 	}
-	// 平台自有下发通道（如青州云）优先：注入驱动解析器（未加载时惰性创建）
+	// 平台自有下发通道优先：注入驱动解析器（未加载时惰性创建）
 	app.NATService.SetDriverResolver(app.HostSvc.GetOrCreateDriver)
 	app.ProxyService.SetDriverResolver(app.HostSvc.GetOrCreateDriver)
+	// 中转模式的反向代理需要端口映射：缺失时由代理流程自动创建
+	app.ProxyService.SetNATService(app.NATService)
 
 	// 初始化异步任务管理器（4个工作线程）
 	taskMgr := task.NewManager(db, 4)

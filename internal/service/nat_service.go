@@ -32,16 +32,14 @@ func NewNATService(db *data.DB) *NATService {
 	}
 }
 
-// SetDriverResolver 注入驱动解析器（用于识别平台自有的下发通道，如青州云）
+// SetDriverResolver 注入驱动解析器（用于识别平台自有的下发通道）
 func (s *NATService) SetDriverResolver(fn func(string) driver.HostDriver) {
 	s.resolver = fn
 }
 
 // provider 返回主机驱动实现的平台自有端口映射通道（若支持）。
 //
-// 目前两类平台自持通道：
-//   - 青州云：云端 NAT API
-//   - 容器类（Docker / LXD / SmolVM）：宿主机 iptables
+// 目前由容器类平台（Docker / LXD / SmolVM）通过宿主机 iptables 自持通道。
 //
 // 均未实现时回落到爱快路由器下发。
 func (s *NATService) provider(hsName string) (driver.NatPortProvider, bool) {
@@ -80,7 +78,7 @@ func (s *NATService) client(routerAddr, user, pass, token string) *ikuaiClient {
 // ============================================================
 
 // ApplyPortMap 添加端口映射
-// 未指定外网端口时自动分配；平台自有通道优先（青州云），否则下发爱快路由器。
+// 未指定外网端口时自动分配；平台自有通道优先，否则下发爱快路由器。
 // nat 为指针，便于回填自动分配的端口。
 //
 // 端口分配同时避开两类占用：本地数据库中已分配的端口，以及爱快路由器上已存在的
@@ -130,7 +128,7 @@ func (s *NATService) ApplyPortMap(hsName, vmUUID string, nat *model.PortData, us
 
 	// 平台自有下发通道
 	if hasProvider {
-		// 端口分配交给驱动：青州云按云端规则分配，容器类（Docker/LXD/SmolVM）
+		// 端口分配交给驱动：容器类（Docker/LXD/SmolVM）
 		// 则需查询**宿主机 iptables 实际占用**才能选到真正可用的端口
 		// （对齐 Python 版 BasicServer.PortsMap_TTY 的 allocate_port 语义）。
 		// 指定了端口时驱动会自行校验宿主机占用。
