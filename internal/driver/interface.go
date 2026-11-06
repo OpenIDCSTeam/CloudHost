@@ -126,8 +126,11 @@ type HostDriver interface {
 // 主机被删除且本机已无其它 Hyper-V 主机时调用 UninstallBandwidthDriver 回收，
 // 避免 WFP 过滤器与限速规则长期驻留。
 type BandwidthDriverProvider interface {
-	// EnsureBandwidthDriver 安装并启动限速驱动（幂等），已就绪时立即返回。
+	// EnsureBandwidthDriver 按需安装（幂等）：无任何虚拟机配置限速时不加载驱动，
+	// 也不会覆盖管理员的手动卸载。
 	EnsureBandwidthDriver() error
+	// InstallBandwidthDriver 显式安装：解除手动卸载抑制并强制加载驱动。
+	InstallBandwidthDriver() error
 	// UninstallBandwidthDriver 停止并删除内核服务与驱动文件。
 	UninstallBandwidthDriver() error
 	// BandwidthDriverStatus 返回驱动状态（installed / running / rules 等）。

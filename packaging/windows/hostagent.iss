@@ -145,5 +145,11 @@ begin
     end;
     Exec('netsh', 'advfirewall firewall delete rule name="OpenIDCS HostAgent"',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+    // 移除 Hyper-V 带宽限速驱动（内核服务 + 驱动文件）。
+    // 驱动为机器级 WFP 组件，若随 agent 一起卸载时不清理，会长期残留注册项。
+    Exec('sc.exe', 'stop NetLimiter.sys', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec('sc.exe', 'delete NetLimiter.sys', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    DeleteFile(ExpandConstant('{sys}\drivers\NetLimiter.sys'));
   end;
 end;

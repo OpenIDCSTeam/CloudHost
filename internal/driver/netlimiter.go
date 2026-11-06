@@ -35,6 +35,10 @@ import (
 // errNetLimiterUnsupported 非 Windows 平台不支持 NetLimiter 限速驱动。
 var errNetLimiterUnsupported = errors.New("当前系统不支持 NetLimiter 限速驱动（仅 Windows Hyper-V 宿主可用）")
 
+// errNetLimiterDisabled 管理员显式卸载驱动后，后台自动安装被抑制。
+// 显式安装（EnsureBandwidthDriver / 运维接口）可解除该状态。
+var errNetLimiterDisabled = errors.New("限速驱动已被手动卸载，需重新安装后才能限速")
+
 // netLimiterDriverBytes 内置的 NetLimiter.sys（WFP 限速驱动）。
 // 运行时释放到 %SystemRoot%\System32\drivers\ 并以内核服务方式加载。
 //
@@ -123,6 +127,8 @@ var (
 	nlMu sync.Mutex
 	// nlReady 驱动已加载、设备已打开且全局开关已启用
 	nlReady bool
+	// nlDisabled 管理员显式卸载后置位，抑制后台自动安装（机器级状态，多主机实例共用）
+	nlDisabled bool
 	// nlDriverPath 最近一次使用的驱动文件路径
 	nlDriverPath string
 )
@@ -168,6 +174,7 @@ type netLimiterStatus struct {
 	Installed  bool   // 内核服务是否已注册
 	Running    bool   // 内核服务是否在运行
 	DeviceOpen bool   // 控制设备是否已打开
+	Disabled   bool   // 已被管理员显式卸载（后台不再自动安装）
 	Rules      int    // 驱动内规则条数（无法读取时为 -1）
 	DriverPath string // 驱动文件路径
 }
@@ -191,6 +198,7 @@ func netLimiterReport(driverPath string) netLimiterStatus {
 	}
 	st.DriverPath = driverPath
 	st.DeviceOpen = nlReady
+	st.Disabled = nlDisabled
 	nlMu.Unlock()
 
 	if st.DeviceOpen {
@@ -206,6 +214,8 @@ func netLimiterReport(driverPath string) netLimiterStatus {
 func netLimiterUninstall(driverPath string) error {
 	nlMu.Lock()
 	defer nlMu.Unlock()
+	// 先置位再卸载：即使下面的停服务/删文件失败，也不会被后台流程立刻装回去
+	nlDisabled = true
 	_ = nlCloseDevice()
 	nlReady = false
 	if !nlSupported() {
@@ -225,9 +235,20 @@ func netLimiterUninstall(driverPath string) error {
 }
 
 // netLimiterEnsure 幂等地安装并启动驱动、打开设备并启用全局开关。
+//
+// 管理员显式卸载过驱动时直接返回 errNetLimiterDisabled，
+// 避免 Crontab / 创建虚拟机等后台流程把驱动又装回去。
 func netLimiterEnsure(driverPath string) error {
 	nlMu.Lock()
 	defer nlMu.Unlock()
+	return nlEnsureLocked(driverPath)
+}
+
+// netLimiterEnsureForce 显式安装入口：解除「手动卸载」抑制后安装。
+func netLimiterEnsureForce(driverPath string) error {
+	nlMu.Lock()
+	defer nlMu.Unlock()
+	nlDisabled = false
 	return nlEnsureLocked(driverPath)
 }
 
@@ -235,6 +256,9 @@ func netLimiterEnsure(driverPath string) error {
 func nlEnsureLocked(driverPath string) error {
 	if nlReady {
 		return nil
+	}
+	if nlDisabled {
+		return errNetLimiterDisabled
 	}
 	if strings.TrimSpace(driverPath) != "" {
 		nlDriverPath = driverPath

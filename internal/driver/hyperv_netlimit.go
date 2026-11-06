@@ -23,6 +23,9 @@ import (
 // hvLimitInterval 全量同步最小间隔，避免每轮状态采集都去枚举网卡。
 const hvLimitInterval = 30 * time.Second
 
+// HyperVDriver 实现限速驱动生命周期接口（编译期约束）。
+var _ BandwidthDriverProvider = (*HyperVDriver)(nil)
+
 // hvAdapterInfo Hyper-V 虚拟网卡条目（Get-VMNetworkAdapter 输出）
 type hvAdapterInfo struct {
 	VM  string `json:"vm"`
@@ -121,20 +124,10 @@ func hvLimitWarn(err error) string {
 	return "（带宽限速下发失败：" + err.Error() + "）"
 }
 
-// hvLimitSuppressed 报告限速驱动是否已被管理员显式卸载。
-func (d *HyperVDriver) hvLimitSuppressed() bool {
-	d.hvLimitMu.Lock()
-	defer d.hvLimitMu.Unlock()
-	return d.hvLimitOff
-}
-
 // hvLimitDue 判断是否到了本轮同步时间（并记录本次尝试时间）。
 func (d *HyperVDriver) hvLimitDue() bool {
 	d.hvLimitMu.Lock()
 	defer d.hvLimitMu.Unlock()
-	if d.hvLimitOff {
-		return false
-	}
 	if !d.hvLimitAt.IsZero() && time.Since(d.hvLimitAt) < hvLimitInterval {
 		return false
 	}
@@ -142,20 +135,43 @@ func (d *HyperVDriver) hvLimitDue() bool {
 	return true
 }
 
-// EnsureBandwidthDriver 安装并启动内核限速驱动（幂等）。
+// EnsureBandwidthDriver 按需安装并启动内核限速驱动（幂等）。
 //
-// 触发时机：主机加载 / 启用、首次配置带宽、以及管理员手动调用。
-// 驱动就绪后规则表为空，不影响任何网络；规则由 Crontab 与创建/修改虚拟机时下发。
+// 触发时机：主机加载 / 启用、agent 启动加载配置。
+// 当前没有任何虚拟机配置带宽时直接跳过，避免为不用的功能加载内核组件；
+// 管理员手动卸载过的驱动不会被后台流程装回（需显式 InstallBandwidthDriver）。
 func (d *HyperVDriver) EnsureBandwidthDriver() error {
 	if !nlSupported() {
 		return errNetLimiterUnsupported
 	}
+	if len(d.hvLimitedConfigs()) == 0 {
+		return nil
+	}
+	return d.installBandwidthDriver(false)
+}
+
+// InstallBandwidthDriver 显式安装（运维接口使用）：解除手动卸载抑制并强制加载。
+func (d *HyperVDriver) InstallBandwidthDriver() error {
+	if !nlSupported() {
+		return errNetLimiterUnsupported
+	}
+	return d.installBandwidthDriver(true)
+}
+
+// installBandwidthDriver 驱动安装主流程：force=false 时尊重手动卸载标记。
+func (d *HyperVDriver) installBandwidthDriver(force bool) error {
 	wasReady := netLimiterAvailable()
 	d.hvLimitMu.Lock()
-	d.hvLimitOff = false
 	d.hvLimitAt = time.Time{}
 	d.hvLimitMu.Unlock()
-	if err := netLimiterEnsure(d.hvDriverPath()); err != nil {
+
+	var err error
+	if force {
+		err = netLimiterEnsureForce(d.hvDriverPath())
+	} else {
+		err = netLimiterEnsure(d.hvDriverPath())
+	}
+	if err != nil {
 		return err
 	}
 	if wasReady {
@@ -168,11 +184,11 @@ func (d *HyperVDriver) EnsureBandwidthDriver() error {
 
 // UninstallBandwidthDriver 停止并删除内核服务与驱动文件。
 //
-// 卸载后虚拟机的限速立即失效，且后台 Crontab 不会自动装回（避免「刚卸载又被装回」）；
-// 需要恢复时调用 EnsureBandwidthDriver 或重新安装。
+// 卸载后虚拟机的限速立即失效，且后台 Crontab / 创建虚拟机不会把驱动装回
+// （机器级抑制标记，跨主机实例保留）；需要恢复时调用 InstallBandwidthDriver，
+// 或重启 agent 服务（内存标记复位后按配置重新加载）。
 func (d *HyperVDriver) UninstallBandwidthDriver() error {
 	d.hvLimitMu.Lock()
-	d.hvLimitOff = true
 	d.hvLimitAt = time.Time{}
 	d.hvLimitMu.Unlock()
 	return netLimiterUninstall(d.hvDriverPath())
@@ -189,7 +205,7 @@ func (d *HyperVDriver) BandwidthDriverStatus() map[string]interface{} {
 		"device_open": st.DeviceOpen,
 		"rules":       rules,
 		"driver_path": st.DriverPath,
-		"uninstalled": d.hvLimitSuppressed(),
+		"uninstalled": st.Disabled,
 	}
 	if rules > 0 {
 		if list, err := netLimiterRules(); err == nil {
@@ -244,9 +260,6 @@ func (d *HyperVDriver) hvApplyVMBandwidth(cfg *model.VMConfig) error {
 	up, down := hvLimitValues(cfg)
 	if up == nlUnlimited && down == nlUnlimited {
 		return d.hvClearVMBandwidth(cfg)
-	}
-	if d.hvLimitSuppressed() {
-		return fmt.Errorf("限速驱动已被卸载，请重新安装后再设置带宽")
 	}
 	if err := netLimiterEnsure(d.hvDriverPath()); err != nil {
 		return err

@@ -938,7 +938,7 @@ func (app *App) handleBandwidthDriverInstall(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := p.EnsureBandwidthDriver(); err != nil {
+	if err := p.InstallBandwidthDriver(); err != nil {
 		app.logEvent(c, "host", "安装带宽限速驱动").Host(hsName).Err(err).
 			Errorf("安装带宽限速驱动失败：%v", err)
 		utils.Fail(c, 500, "安装带宽限速驱动失败: "+err.Error())

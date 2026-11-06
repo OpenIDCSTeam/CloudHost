@@ -201,8 +201,6 @@ type HyperVDriver struct {
 	hvLimitMu sync.Mutex
 	// hvLimitAt 上一次全量同步限速规则的时间
 	hvLimitAt time.Time
-	// hvLimitOff 管理员显式卸载驱动后置位，抑制后台自动重装
-	hvLimitOff bool
 }
 
 func NewHyperVDriver(cfg *model.HSConfig) *HyperVDriver {
