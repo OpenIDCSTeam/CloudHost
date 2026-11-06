@@ -27,11 +27,11 @@ import (
 
 // PortForwardEntry 一条 socat 端口转发记录
 type PortForwardEntry struct {
-	WanPort  int    `json:"wan_port"`  // 外部端口
-	LanAddr  string `json:"lan_addr"`  // 内部地址
-	LanPort  int    `json:"lan_port"`  // 内部端口
-	Protocol string `json:"protocol"`  // TCP / UDP
-	Pid      int    `json:"pid"`       // socat 进程号
+	WanPort  int    `json:"wan_port"` // 外部端口
+	LanAddr  string `json:"lan_addr"` // 内部地址
+	LanPort  int    `json:"lan_port"` // 内部端口
+	Protocol string `json:"protocol"` // TCP / UDP
+	Pid      int    `json:"pid"`      // socat 进程号
 }
 
 // portForward socat 端口转发管理器

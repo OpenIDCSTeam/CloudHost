@@ -820,15 +820,15 @@ func (app *App) handleHostBackupScan(c *gin.Context) {
 // protectedEmptyKeys 主机更新时「提交空值视为未修改」的敏感字段
 // 与 Python update_host 的 protected_empty_keys 一致
 var protectedEmptyKeys = map[string]bool{
-	"system_maps": true,
-	"images_maps": true,
-	"ipaddr_maps": true,
-	"ipaddr_ddns": true,
-	"public_addr": true,
-	"extend_data": true,
-	"server_plan": true,
-	"server_pass": true,
-	"i_kuai_pass": true,
+	"system_maps":  true,
+	"images_maps":  true,
+	"ipaddr_maps":  true,
+	"ipaddr_ddns":  true,
+	"public_addr":  true,
+	"extend_data":  true,
+	"server_plan":  true,
+	"server_pass":  true,
+	"i_kuai_pass":  true,
 	"i_kuai_token": true,
 }
 

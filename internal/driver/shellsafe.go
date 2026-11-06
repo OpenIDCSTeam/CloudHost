@@ -13,7 +13,7 @@ import (
 
 // psEscape 转义 PowerShell 单引号字面量内容。
 //
-// 单引号字符串内只有 ' 需要转义（双写为 ''）；
+// 单引号字符串内只有 ' 需要转义（双写为 ”）；
 // 同时移除 CR/LF/NUL，避免脚本被拆分成多条语句。
 func psEscape(v string) string {
 	v = strings.ReplaceAll(v, "'", "''")
@@ -26,7 +26,7 @@ func psEscape(v string) string {
 // shEscape 转义 POSIX shell 单引号字面量内容。
 //
 // 单引号字符串内无法直接表示单引号，需要先闭合再转义：
-// ' -> '\''
+// ' -> '\”
 func shEscape(v string) string {
 	v = strings.ReplaceAll(v, "\r", "")
 	v = strings.ReplaceAll(v, "\n", "")

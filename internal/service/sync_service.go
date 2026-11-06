@@ -224,8 +224,8 @@ func (s *SyncService) fetchRemoteHosts(baseURL, token string) (map[string]interf
 // fetchRemoteVMs 获取远端指定主机的虚拟机列表（解包 {config: {...}} 形式）
 func (s *SyncService) fetchRemoteVMs(baseURL, token, hsName string) (map[string]map[string]interface{}, error) {
 	var resp struct {
-		Code int                                `json:"code"`
-		Msg  string                             `json:"msg"`
+		Code int                               `json:"code"`
+		Msg  string                            `json:"msg"`
 		Data map[string]map[string]interface{} `json:"data"`
 	}
 	if err := s.doGet(baseURL+"/api/client/detail/"+hsName, token, &resp); err != nil {

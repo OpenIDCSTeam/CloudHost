@@ -65,21 +65,21 @@ func (s *TempTokenStore) GenerateWithExpire(hsName, vmUUID, virtualUser string) 
 func (s *TempTokenStore) Consume(token string) (hsName, vmUUID, virtualUser string, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	data, exists := s.tokens[token]
 	if !exists {
 		return "", "", "", false
 	}
-	
+
 	// 检查是否过期
 	if time.Now().After(data.Expire) {
 		delete(s.tokens, token)
 		return "", "", "", false
 	}
-	
+
 	// 消费后立即删除（一次性使用）
 	delete(s.tokens, token)
-	
+
 	return data.HsName, data.VmUUID, data.VirtualUser, true
 }
 
@@ -87,7 +87,7 @@ func (s *TempTokenStore) Consume(token string) (hsName, vmUUID, virtualUser stri
 func (s *TempTokenStore) PurgeExpired() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	now := time.Now()
 	count := 0
 	for token, data := range s.tokens {
@@ -103,7 +103,7 @@ func (s *TempTokenStore) PurgeExpired() int {
 func (s *TempTokenStore) cleanupLoop() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
-	
+
 	for range ticker.C {
 		s.PurgeExpired()
 	}

@@ -482,11 +482,11 @@ func TestIKuaiTagTruncation(t *testing.T) {
 	}{
 		{"", ""},
 		{"  spaced  ", "spaced"},
-		{"pve-1oFN4o6C", "pve-1oFN4o6C"},                 // 12 字节：原样
-		{"0123456789abcde", "0123456789abcde"},           // 15 字节：边界值，允许
-		{"0123456789abcdef", "0123456789abcde"},          // 16 字节：截断
-		{"verify-netcheck-1", "verify-netcheck"},         // 17 字节：截断到 15
-		{"端口映射说明文字很长", "端口映射说"},              // 多字节：15 字节恰好 5 个汉字，须落在合法 rune 边界
+		{"pve-1oFN4o6C", "pve-1oFN4o6C"},         // 12 字节：原样
+		{"0123456789abcde", "0123456789abcde"},   // 15 字节：边界值，允许
+		{"0123456789abcdef", "0123456789abcde"},  // 16 字节：截断
+		{"verify-netcheck-1", "verify-netcheck"}, // 17 字节：截断到 15
+		{"端口映射说明文字很长", "端口映射说"},                  // 多字节：15 字节恰好 5 个汉字，须落在合法 rune 边界
 	}
 	for _, c := range cases {
 		got := ikuaiTag(c.in)
@@ -567,9 +567,9 @@ func TestIKuaiRowsCompatibility(t *testing.T) {
 // fakeAPIRouter 模拟爱快 4.0 正式版：/Action/login 返回 405，
 // 业务接口挂在 /api/v4.0 下并要求 Authorization: Bearer <token>。
 type fakeAPIRouter struct {
-	token string
-	dnat  []map[string]interface{}
-	dhcp  []map[string]interface{}
+	token  string
+	dnat   []map[string]interface{}
+	dhcp   []map[string]interface{}
 	nextID int
 
 	mu   sync.Mutex

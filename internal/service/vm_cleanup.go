@@ -41,7 +41,7 @@ func (s *VMCleanupService) SetProxyService(svc *ProxyService) {
 func (s *VMCleanupService) CleanupVMResources(hsName, vmUUID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	// 获取VM配置
 	vmJSON, err := s.DB.GetVMConfig(hsName, vmUUID)
 	if err != nil || vmJSON == "" {

@@ -48,7 +48,7 @@ func TestIsValidAccessKey(t *testing.T) {
 		{"abcdefghijklmnop", true},
 		{"ABCDEFGHIJKLMNOP", true},
 		{"0123456789ABCDef", true},
-		{"abcdefghijklmno", false},  // 15 位
+		{"abcdefghijklmno", false},   // 15 位
 		{"abcdefghijklmnopq", false}, // 17 位
 		{"abcdefghijklmno!", false},  // 含非法字符
 		{"abcdefghijklmno-", false},

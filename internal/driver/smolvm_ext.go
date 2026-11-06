@@ -164,11 +164,11 @@ func (d *SmolVMDriver) GetVNCInfo(vmUUID string, ipAddr string) (*model.ZMessage
 	return &model.ZMessage{Success: true, Action: "VCRemote",
 		Message: "串口控制台信息获取成功",
 		Results: map[string]interface{}{
-			"type":      "tty",
-			"vm_uuid":   vmUUID,
-			"socket":    sock,
-			"connect":   fmt.Sprintf("socat -,raw,echo=0 UNIX-CONNECT:%s", sock),
-			"password":  "",
+			"type":     "tty",
+			"vm_uuid":  vmUUID,
+			"socket":   sock,
+			"connect":  fmt.Sprintf("socat -,raw,echo=0 UNIX-CONNECT:%s", sock),
+			"password": "",
 		}}, nil
 }
 

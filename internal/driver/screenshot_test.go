@@ -82,5 +82,3 @@ func TestPPMBytesToBase64PNGRejectsInvalid(t *testing.T) {
 		}
 	}
 }
-
-

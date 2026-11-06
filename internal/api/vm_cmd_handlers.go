@@ -116,7 +116,7 @@ func (app *App) handleVMCmdResult(c *gin.Context) {
 		logLevel = "ERROR"
 	}
 	logMessage := fmt.Sprintf("虚拟机 %s 命令执行%s: %s", vmUUID, map[bool]string{true: "成功", false: "失败"}[success], command[:min(100, len(command))])
-	
+
 	app.Logger.Log(hsName, logLevel, "远程命令执行", logMessage, success)
 
 	app.Logger.Log("cmd", "INFO", "远程命令", fmt.Sprintf("[远程命令] 结果已存储: %s/%s, 退出码=%.0f", hsName, vmUUID, exitCode), true)

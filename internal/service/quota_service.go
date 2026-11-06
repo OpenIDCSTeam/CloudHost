@@ -79,7 +79,7 @@ func (s *QuotaService) CheckQuota(username string, vmCfg *model.VMConfig) error 
 	userID := model.SafeGetInt(userMap, "id")
 	quotaNatPorts := model.SafeGetInt(userMap, "quota_nat_ports")
 	quotaWebProxy := model.SafeGetInt(userMap, "quota_web_proxy")
-	
+
 	natCount := len(vmCfg.NatAll)
 	existingNatCount, _ := s.DB.CountUserNATRules(userID)
 	if existingNatCount+natCount > quotaNatPorts {

@@ -280,7 +280,9 @@ func (d *SmolVMDriver) buildRootfs(image, outRootfs string, sizeMB int, rootPass
 	containerName := fmt.Sprintf("smolvm-build-%s", workTag[len(workTag)-8:])
 
 	cleanupFns := []func(){
-		func() { d.execHost(fmt.Sprintf("docker rm -f %s >/dev/null 2>&1 || true", containerName), 30*time.Second) },
+		func() {
+			d.execHost(fmt.Sprintf("docker rm -f %s >/dev/null 2>&1 || true", containerName), 30*time.Second)
+		},
 		func() { d.execHost(fmt.Sprintf("rm -f \"%s\"", exportTar), 10*time.Second) },
 		func() { d.execHost(fmt.Sprintf("rm -rf \"%s\"", workDir), 30*time.Second) },
 	}

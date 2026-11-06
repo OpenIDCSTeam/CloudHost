@@ -34,7 +34,7 @@ type remoteStatusState struct {
 }
 
 var (
-	remoteStatusMu    sync.Mutex
+	remoteStatusMu       sync.Mutex
 	remoteStatusStateMap = map[string]*remoteStatusState{}
 )
 

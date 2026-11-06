@@ -32,13 +32,13 @@ func NewIPAllocService(db *data.DB) *IPAllocService {
 
 // ipPool 单个地址池配置（对应 ipaddr_maps 中的一项）
 type ipPool struct {
-	Name   string
-	Vers   string // ipv4 / ipv6
-	Type   string // nat / pub
-	From   string
-	Nums   int
-	Gate   string
-	Mask   string
+	Name string
+	Vers string // ipv4 / ipv6
+	Type string // nat / pub
+	From string
+	Nums int
+	Gate string
+	Mask string
 }
 
 // NetCheck 检查并自动分配虚拟机网卡 IP（对应 Python BasicServer.NetCheck）
