@@ -1,0 +1,5 @@
+<form action="{$VistaPanel['登陆地址']}" name="vistapanellogin" method="post" target="_blank">
+	{$plang['Language']} : <select size="1" name="language"><option selected="selected">Chinese_simplified</option><option>Arabic</option><option>Bulgarian</option><option>Chinese_simplified</option><<option>Croatian</option><option>Czech</option><option>Danish</option><option>Dutch</option><option>English</option><option>Farsi</option><option>Finnish</option><option>French</option><option>German</option><option>Hungarian</option><option>Greek</option><option>Indonesian</option><option>Japanese</option><option>Korean</option><option>Latvian</option><option>Norwegian</option><option>Persian</option><option>Polish</option><option>Portuguese</option><option>Romanian</option><option>Russian</option><option>Serbian</option><option>Spanish</option><option>Swedish</option><option>Turkish</option><option>Ukrainian</option></select>
+	<input type="hidden" name="uname" value="{$VistaPanel['用户名']}" />
+	<input type="hidden" name="passwd" value="{$VistaPanel['密码']}" />
+</form>
