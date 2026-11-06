@@ -96,7 +96,8 @@ jobs:
           mkdir -p pkg
           cp dist/hostagent pkg/
           cp -R static pkg/
-          tar -C pkg -czf "dist/hostagent-linux-${{ matrix.arch }}.tar.gz" hostagent static
+          cp -R VNCConsole pkg/
+          tar -C pkg -czf "dist/hostagent-linux-${{ matrix.arch }}.tar.gz" hostagent static VNCConsole
 
       - uses: actions/upload-artifact@v4
         with:
@@ -152,7 +153,7 @@ jobs:
       - name: Package portable zip
         shell: pwsh
         run: |
-          Compress-Archive -Path dist\hostagent.exe, static -DestinationPath "dist\hostagent-windows-amd64.zip" -Force
+          Compress-Archive -Path dist\hostagent.exe, static, VNCConsole -DestinationPath "dist\hostagent-windows-amd64.zip" -Force
           Copy-Item "BuildCache\windows\*.exe" dist\ -Force
 
       - uses: actions/upload-artifact@v4

@@ -58,6 +58,7 @@ Name: "firewall"; Description: "Open Web / VNC / SSH terminal ports in Windows F
 [Files]
 Source: "..\..\dist\hostagent.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\static\*"; DestDir: "{app}\static"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\..\VNCConsole\*"; DestDir: "{app}\VNCConsole"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "nssm.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Dirs]

@@ -158,6 +158,11 @@ func TestIKuaiAddrNormalize(t *testing.T) {
 		{"http://10.2.1.20", "http://10.2.1.20", true},
 		{"HTTPS://10.2.1.20/", "https://10.2.1.20", true},
 		{"  https://10.2.1.20:8443  ", "https://10.2.1.20:8443", true},
+		// 浏览器地址栏整段粘贴：必须丢弃路径/hash，
+		// 否则请求会拼成 .../login#/login/Action/login 并收到 HTTP 405
+		{"https://10.2.1.20/login#/login", "https://10.2.1.20", true},
+		{"http://10.2.1.20:8080/login", "http://10.2.1.20:8080", true},
+		{"10.2.1.20/login#/login", "http://10.2.1.20", false},
 	}
 	for _, c := range cases {
 		base, exp := normalizeIKuaiAddr(c.in)
@@ -186,7 +191,7 @@ func TestIKuaiV3LoginAndParams(t *testing.T) {
 	srv := httptest.NewServer(f.handler())
 	defer srv.Close()
 
-	c := newIKuaiClient(srv.URL, "admin", pass)
+	c := newIKuaiClient(srv.URL, "admin", pass, "")
 	if err := c.login(); err != nil {
 		t.Fatalf("爱快3 登录失败: %v", err)
 	}
@@ -256,7 +261,7 @@ func TestIKuaiV4TLSLoginAndParams(t *testing.T) {
 	srv := httptest.NewTLSServer(f.handler())
 	defer srv.Close()
 
-	c := newIKuaiClient(srv.URL, "admin", pass)
+	c := newIKuaiClient(srv.URL, "admin", pass, "")
 	if err := c.login(); err != nil {
 		t.Fatalf("自签名 https 登录失败: %v", err)
 	}
@@ -321,7 +326,7 @@ func TestIKuaiVersionFallbackOnHTTPS(t *testing.T) {
 	srv := httptest.NewTLSServer(f.handler())
 	defer srv.Close()
 
-	c := newIKuaiClient(srv.URL, "admin", pass)
+	c := newIKuaiClient(srv.URL, "admin", pass, "")
 	if err := c.login(); err != nil {
 		t.Fatalf("版本回退登录失败: %v", err)
 	}
@@ -343,7 +348,7 @@ func TestIKuaiSessionExpiryTriggersRelogin(t *testing.T) {
 	srv := httptest.NewTLSServer(f.handler())
 	defer srv.Close()
 
-	c := newIKuaiClient(srv.URL, "admin", "pwd")
+	c := newIKuaiClient(srv.URL, "admin", "pwd", "")
 	if err := c.addARP("1.1.1.1", "11:22:33:44:55:66", "vm-1"); err != nil {
 		t.Fatalf("会话失效后重登失败: %v", err)
 	}
@@ -384,7 +389,7 @@ func TestIKuaiDeleteUsesRowIDAndIsIdempotent(t *testing.T) {
 	srv := httptest.NewTLSServer(f.handler())
 	defer srv.Close()
 
-	c := newIKuaiClient(srv.URL, "admin", "pwd")
+	c := newIKuaiClient(srv.URL, "admin", "pwd", "")
 
 	if err := c.deleteDHCPStatic("1.1.1.1", "11:22:33:44:55:66"); err != nil {
 		t.Fatalf("删除DHCP静态地址失败: %v", err)
@@ -428,7 +433,7 @@ func TestIKuaiV3ShowParamsMatchPython(t *testing.T) {
 	srv := httptest.NewServer(f.handler())
 	defer srv.Close()
 
-	c := newIKuaiClient(srv.URL, "admin", "pwd")
+	c := newIKuaiClient(srv.URL, "admin", "pwd", "")
 
 	// get_dhcp
 	if _, err := c.findDHCPStaticID("1.1.1.1", ""); err != nil {
@@ -552,5 +557,255 @@ func TestIKuaiRowsCompatibility(t *testing.T) {
 	v4b := map[string]interface{}{"code": 0, "results": []interface{}{map[string]interface{}{"rowid": 3}}}
 	if rows := ikuaiRows(v4b); len(rows) != 1 {
 		t.Errorf("爱快4 results 数组解析失败: %v", v4b)
+	}
+}
+
+// ============================================================
+// 爱快 4.0 正式版：/Action/login 已下线，仅支持 /api/v4.0 + Bearer
+// ============================================================
+
+// fakeAPIRouter 模拟爱快 4.0 正式版：/Action/login 返回 405，
+// 业务接口挂在 /api/v4.0 下并要求 Authorization: Bearer <token>。
+type fakeAPIRouter struct {
+	token string
+	dnat  []map[string]interface{}
+	dhcp  []map[string]interface{}
+	nextID int
+
+	mu   sync.Mutex
+	reqs []apiReq
+}
+
+type apiReq struct {
+	method string
+	path   string
+	auth   string
+	body   map[string]interface{}
+}
+
+func (f *fakeAPIRouter) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/Action/login", func(w http.ResponseWriter, r *http.Request) {
+		// 4.0 正式版移除了模拟登录接口，这正是线上 405 的来源
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	})
+	mux.HandleFunc("/api/v4.0/", f.handleAPI)
+	return mux
+}
+
+func (f *fakeAPIRouter) handleAPI(w http.ResponseWriter, r *http.Request) {
+	var body map[string]interface{}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+
+	f.mu.Lock()
+	f.reqs = append(f.reqs, apiReq{method: r.Method, path: r.URL.Path,
+		auth: r.Header.Get("Authorization"), body: body})
+	dnat := append([]map[string]interface{}{}, f.dnat...)
+	token := f.token
+	f.mu.Unlock()
+
+	if token != "" && r.Header.Get("Authorization") != "Bearer "+token {
+		w.WriteHeader(http.StatusUnauthorized)
+		writeFakeJSON(w, map[string]interface{}{"code": 3007, "message": "token 无效"})
+		return
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, ikuaiV4APIPrefix)
+	switch {
+	case path == ikuaiV4DNATPath && r.Method == http.MethodGet:
+		writeFakeJSON(w, map[string]interface{}{"code": 0, "message": "Success",
+			"results": map[string]interface{}{"total": len(dnat), "data": dnat}})
+	case path == ikuaiV4DNATPath && r.Method == http.MethodPost:
+		f.mu.Lock()
+		f.nextID++
+		id := f.nextID
+		row := map[string]interface{}{"id": id}
+		for k, v := range body {
+			row[k] = v
+		}
+		f.dnat = append(f.dnat, row)
+		f.mu.Unlock()
+		writeFakeJSON(w, map[string]interface{}{"code": 0, "message": "Success", "rowid": id})
+	case strings.HasPrefix(path, ikuaiV4DNATPath+"/") && r.Method == http.MethodDelete:
+		writeFakeJSON(w, map[string]interface{}{"code": 0, "message": "Success"})
+	case path == ikuaiV4DHCPStaticPath:
+		writeFakeJSON(w, map[string]interface{}{"code": 0, "message": "Success",
+			"results": map[string]interface{}{"static_total": 0, "static_data": []interface{}{}}})
+	default:
+		w.WriteHeader(http.StatusNotFound)
+		writeFakeJSON(w, map[string]interface{}{"code": 404, "message": "not found"})
+	}
+}
+
+func (f *fakeAPIRouter) last() apiReq {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.reqs) == 0 {
+		return apiReq{}
+	}
+	return f.reqs[len(f.reqs)-1]
+}
+
+func TestIKuaiV4APILoginAndAddPortMap(t *testing.T) {
+	const token = "0123456789abcdef0123456789abcdef"
+	f := &fakeAPIRouter{token: token}
+	srv := httptest.NewTLSServer(f.handler())
+	defer srv.Close()
+
+	c := newIKuaiClient(srv.URL, "admin", "pwd", token)
+	if err := c.login(); err != nil {
+		t.Fatalf("4.0 OpenAPI 认证失败: %v", err)
+	}
+	if c.ver != ikuaiVer4API {
+		t.Fatalf("应识别为 4.0 OpenAPI，实际 %d", c.ver)
+	}
+
+	// 令牌有效时不应再调用已下线的 /Action/login
+	for _, req := range f.reqs {
+		if strings.HasSuffix(req.path, ikuaiLoginPath) {
+			t.Errorf("配置了 API Token 却仍调用旧版登录: %+v", req)
+		}
+	}
+
+	ports, err := c.listWanPorts()
+	if err != nil {
+		t.Fatalf("拉取端口映射列表失败: %v", err)
+	}
+	if len(ports) != 0 {
+		t.Errorf("空列表应解析出 0 个端口，实际 %v", ports)
+	}
+
+	if err := c.addPortMap(model.PortData{WanPort: 12000, LanPort: 22, LanAddr: "10.2.1.9", NatTips: "ssh"}); err != nil {
+		t.Fatalf("添加端口映射失败: %v", err)
+	}
+	req := f.last()
+	if req.method != http.MethodPost || req.path != ikuaiV4APIPrefix+ikuaiV4DNATPath {
+		t.Fatalf("添加端口映射应 POST %s，实际 %s %s", ikuaiV4DNATPath, req.method, req.path)
+	}
+	if req.auth != "Bearer "+token {
+		t.Errorf("应携带 Bearer Token，实际 %q", req.auth)
+	}
+	if got := strVal(req.body["tagname"]); got != "ssh" {
+		t.Errorf("tagname 应为备注，实际 %q", got)
+	}
+	// 4.0 的端口字段是字符串，且必须有 interface / protocol
+	for key, want := range map[string]string{
+		"wan_port": "12000", "lan_port": "22", "protocol": "tcp+udp",
+		"interface": "wan1", "enabled": "yes", "lan_addr": "10.2.1.9",
+	} {
+		if got := strVal(req.body[key]); got != want {
+			t.Errorf("%s = %q，期望 %q", key, got, want)
+		}
+	}
+	if _, ok := req.body["src_addr"].(map[string]interface{}); !ok {
+		t.Errorf("src_addr 必须是对象，实际 %#v", req.body["src_addr"])
+	}
+}
+
+func TestIKuaiV4APIListAndDelete(t *testing.T) {
+	const token = "tok"
+	f := &fakeAPIRouter{token: token, dnat: []map[string]interface{}{
+		{"id": 12, "wan_port": "12000", "lan_addr": "10.2.1.9", "lan_port": "22"},
+	}}
+	srv := httptest.NewTLSServer(f.handler())
+	defer srv.Close()
+
+	c := newIKuaiClient(srv.URL, "admin", "pwd", token)
+	ports, err := c.listWanPorts()
+	if err != nil {
+		t.Fatalf("拉取端口映射列表失败: %v", err)
+	}
+	if !ports[12000] {
+		t.Errorf("应识别出已占用的 12000，实际 %v", ports)
+	}
+
+	if err := c.deletePortMap(22, "10.2.1.9"); err != nil {
+		t.Fatalf("删除端口映射失败: %v", err)
+	}
+	req := f.last()
+	if req.method != http.MethodDelete || req.path != ikuaiV4APIPrefix+ikuaiV4DNATPath+"/12" {
+		t.Errorf("应按 rowid 删除，实际 %s %s", req.method, req.path)
+	}
+}
+
+// 405 是线上原始报错：必须给出「配置 API Token」的明确指引，而不是「响应无法解析」。
+func TestIKuaiLegacyLogin405SuggestsToken(t *testing.T) {
+	f := &fakeAPIRouter{}
+	srv := httptest.NewTLSServer(f.handler())
+	defer srv.Close()
+
+	c := newIKuaiClient(srv.URL, "admin", "pwd", "")
+	err := c.login()
+	if err == nil {
+		t.Fatal("旧版登录接口 405 时应返回错误")
+	}
+	if !strings.Contains(err.Error(), "405") {
+		t.Errorf("错误信息应保留 405 以便定位，实际 %q", err)
+	}
+	if !strings.Contains(err.Error(), "API Token") {
+		t.Errorf("错误信息应指引配置 API Token，实际 %q", err)
+	}
+}
+
+func TestIKuaiV4APIInvalidToken(t *testing.T) {
+	f := &fakeAPIRouter{token: "right-token"}
+	srv := httptest.NewTLSServer(f.handler())
+	defer srv.Close()
+
+	c := newIKuaiClient(srv.URL, "admin", "pwd", "wrong-token")
+	err := c.login()
+	if err == nil {
+		t.Fatal("令牌被拒绝时应返回错误")
+	}
+	if !strings.Contains(err.Error(), "API Token") {
+		t.Errorf("应提示 API Token 无效，实际 %q", err)
+	}
+}
+
+// 4.0 的 DHCP 静态绑定同样走 OpenAPI，且删除要按 rowid 定位。
+func TestIKuaiV4APIDHCPStatic(t *testing.T) {
+	const token = "tok"
+	f := &fakeAPIRouter{token: token}
+	srv := httptest.NewTLSServer(f.handler())
+	defer srv.Close()
+
+	c := newIKuaiClient(srv.URL, "admin", "pwd", token)
+	if err := c.addDHCPStatic("10.2.1.9", "aa:bb:cc:dd:ee:ff", "vm-1", "119.29.29.29", "223.5.5.5"); err != nil {
+		t.Fatalf("添加DHCP静态地址失败: %v", err)
+	}
+	req := f.last()
+	if req.method != http.MethodPost || req.path != ikuaiV4APIPrefix+ikuaiV4DHCPStaticPath {
+		t.Fatalf("应 POST %s，实际 %s %s", ikuaiV4DHCPStaticPath, req.method, req.path)
+	}
+	for key, want := range map[string]string{
+		"tagname": "vm-1", "mac": "aa:bb:cc:dd:ee:ff", "ip_addr": "10.2.1.9",
+		"enabled": "yes", "dns1": "119.29.29.29",
+	} {
+		if got := strVal(req.body[key]); got != want {
+			t.Errorf("%s = %q，期望 %q", key, got, want)
+		}
+	}
+
+	// 列表为空 → 删除时按幂等语义返回 errIKuaiNotFound
+	if err := c.deleteDHCPStatic("10.2.1.9", "aa:bb:cc:dd:ee:ff"); !errors.Is(err, errIKuaiNotFound) {
+		t.Errorf("不存在的静态绑定应返回 errIKuaiNotFound，实际 %v", err)
+	}
+}
+
+func TestIKuaiRESTSuccess(t *testing.T) {
+	if !ikuaiRESTSuccess(map[string]interface{}{"code": 0, "results": map[string]interface{}{}}) {
+		t.Error("code=0 应判为成功")
+	}
+	if ikuaiRESTSuccess(map[string]interface{}{"code": 3001, "message": "请求参数不合法"}) {
+		t.Error("code!=0 应判为失败")
+	}
+	// 无 code 字段的 data/results 信封属于成功响应
+	if !ikuaiRESTSuccess(map[string]interface{}{"results": map[string]interface{}{"total": 0}}) {
+		t.Error("无 code 字段的 results 信封应判为成功")
+	}
+	if ikuaiRESTSuccess(nil) {
+		t.Error("nil 响应应判为失败")
 	}
 }

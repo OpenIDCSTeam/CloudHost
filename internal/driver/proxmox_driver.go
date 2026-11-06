@@ -204,10 +204,18 @@ func (d *ProxmoxDriver) pveVNCSession(vmid int64) (int, string, string, error) {
 const proxmoxAPIPath = "/api2/json"
 
 // pveAudioDevice PVE 声卡配置。
+//
 // 会议、媒体播放等桌面应用在没有任何音频设备时会直接不工作，
-// 因此新建虚拟机默认分配一块 HDA 声卡。
-// 个别老版本 PVE 不认识该型号，创建时会自动去掉该项重试。
-const pveAudioDevice = "device=ich9-intel-hda,driver=spice"
+// 因此默认分配一块 HDA 声卡。
+//
+// 注意 driver 必须是 none：spice 音频要求虚拟机同时启用 SPICE 显示
+// （QEMU 需要 -spice 参数），普通 VNC 显示下会直接启动失败：
+//
+//	kvm: Cannot use spice audio without -spice
+//
+// driver=none 仍然会创建音频设备（应用能检测到声卡），只是没有音频后端。
+// 个别老版本 PVE 不认识该型号时，创建会自动去掉该项重试。
+const pveAudioDevice = "device=ich9-intel-hda,driver=none"
 
 // proxmoxBaseURL 归一化出 go-proxmox 的 API 基地址 https://host:port/api2/json。
 //
@@ -980,10 +988,19 @@ func (d *ProxmoxDriver) UpdateVM(cfg *model.VMConfig, oldCfg *model.VMConfig) (*
 	}
 
 	// 旧虚拟机没有声卡：补一块，否则部分桌面应用（会议/媒体）无法工作。
-	// 已在配置里存在时不重复下发，避免每次更新配置都多一次 API 调用。
+	// 已在配置里存在且驱动正确时不重复下发，避免每次更新都多一次 API 调用。
 	if vmid, vmidErr := d.getVMID(cfg.VmUUID); vmidErr == nil {
 		if cfgMap, cfgErr := d.pveVMConfigMap(vmid); cfgErr == nil {
-			if _, exists := cfgMap["audio0"]; !exists {
+			audio := cfgMap["audio0"]
+			needFix := audio == ""
+			// 历史遗留：spice 音频在没有 -spice 显示时会让 QEMU 直接退出
+			// （kvm: Cannot use spice audio without -spice）
+			if !needFix && strings.Contains(audio, "driver=spice") &&
+				!strings.Contains(cfgMap["vga"], "spice") {
+				log.Printf("[proxmox] 修正声卡配置：spice 音频需要 SPICE 显示，改为 none（原 %s）", audio)
+				needFix = true
+			}
+			if needFix {
 				if _, err := vm.Config(ctx, proxmox.VirtualMachineOption{
 					Name:  "audio0",
 					Value: pveAudioDevice,

@@ -170,7 +170,7 @@ func TestIKuaiListWanPorts(t *testing.T) {
 	srv := httptest.NewTLSServer(f.handler())
 	defer srv.Close()
 
-	c := newIKuaiClient(srv.URL, "admin", "pwd")
+	c := newIKuaiClient(srv.URL, "admin", "pwd", "")
 	ports, err := c.listWanPorts()
 	if err != nil {
 		t.Fatalf("拉取端口映射列表失败: %v", err)

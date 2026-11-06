@@ -155,6 +155,13 @@ do_install() {
     install -m 0755 "${tmp}/pkg/hostagent" "${PREFIX}/hostagent"
     rm -rf "${PREFIX}/static"
     cp -R "${tmp}/pkg/static" "${PREFIX}/static"
+    # noVNC 页面（VNC 控制台）资源；旧版本安装包可能不含该目录
+    if [[ -d "${tmp}/pkg/VNCConsole" ]]; then
+        rm -rf "${PREFIX}/VNCConsole"
+        cp -R "${tmp}/pkg/VNCConsole" "${PREFIX}/VNCConsole"
+    else
+        warn "安装包内缺少 VNCConsole，VNC 控制台页面将不可用"
+    fi
     install -d -m 0750 "${DATA_DIR}"
     ln -sfn "${PREFIX}/hostagent" "${BIN_LINK}"
 

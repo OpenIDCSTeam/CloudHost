@@ -42,9 +42,10 @@ type HSConfig struct {
 	SystemMaps []OSConfig `json:"system_maps"` // 系统镜像列表
 	ImagesMaps []OSConfig `json:"images_maps"` // 光盘镜像列表
 	// 区域网络
-	IKuaiAddr  string              `json:"i_kuai_addr"` // 爱快OS地址
-	IKuaiUser  string              `json:"i_kuai_user"` // 爱快OS用户
-	IKuaiPass  string              `json:"i_kuai_pass"` // 爱快OS密码
+	IKuaiAddr  string              `json:"i_kuai_addr"`  // 爱快OS地址
+	IKuaiUser  string              `json:"i_kuai_user"`  // 爱快OS用户
+	IKuaiPass  string              `json:"i_kuai_pass"`  // 爱快OS密码
+	IKuaiToken string              `json:"i_kuai_token"` // 爱快OS个人API令牌（4.0+ 必填）
 	IPAddrDDNS []string            `json:"ipaddr_ddns"` // DNS服务器列表
 	IPAddrMaps map[string]map[string]interface{} `json:"ipaddr_maps"` // IP地址映射
 	PublicAddr []string            `json:"public_addr"` // 公共IP列表

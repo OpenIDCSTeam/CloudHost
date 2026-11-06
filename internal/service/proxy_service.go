@@ -11,7 +11,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -57,17 +59,20 @@ func (s *ProxyService) provider(hsName string) (driver.NatProxyProvider, bool) {
 }
 
 // NewProxyService 创建反向代理服务
+//
+// dataDir / Caddyfile 统一转绝对路径：caddy 由子进程启动，
+// 相对路径会随工作目录变化而解析到不同位置。
 func NewProxyService(db *data.DB, dataDir string) *ProxyService {
-	binary := os.Getenv("CADDY_BIN")
-	if binary == "" {
-		binary = "caddy"
+	absDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		absDir = dataDir
 	}
 	return &ProxyService{
 		db:         db,
-		binaryPath: binary,
-		configFile: filepath.Join(dataDir, "Caddyfile"),
+		binaryPath: strings.TrimSpace(os.Getenv("CADDY_BIN")),
+		configFile: filepath.Join(absDir, "Caddyfile"),
 		managePort: 2019,
-		dataDir:    dataDir,
+		dataDir:    absDir,
 	}
 }
 
@@ -76,6 +81,100 @@ func (s *ProxyService) SetBinaryPath(path string) {
 	if path != "" {
 		s.binaryPath = path
 	}
+}
+
+// BinaryPath 返回当前可用的 caddy 可执行文件绝对路径，未找到时返回空串。
+func (s *ProxyService) BinaryPath() string {
+	return s.resolveBinary()
+}
+
+// caddyExecName 返回当前平台的 caddy 可执行文件名
+func caddyExecName() string {
+	if runtime.GOOS == "windows" {
+		return "caddy.exe"
+	}
+	return "caddy"
+}
+
+// resolveBinary 定位 caddy 可执行文件，顺序：
+//  1. CADDY_BIN / SetBinaryPath 的显式配置
+//  2. 程序所在目录/bin、程序所在目录、上级目录/bin（源码运行时即仓库 bin）
+//  3. PATH
+//
+// 之前只认 "caddy" 走 PATH：部署包里把 caddy 放在 hostagent 旁边时
+// 会直接报 "executable file not found in %PATH%"，且每次下发都重试。
+func (s *ProxyService) resolveBinary() string {
+	if s.binaryPath != "" {
+		if p := lookCaddy(s.binaryPath); p != "" {
+			return p
+		}
+	}
+	for _, dir := range s.caddySearchDirs() {
+		if p := lookCaddy(filepath.Join(dir, caddyExecName())); p != "" {
+			return p
+		}
+	}
+	if p, err := exec.LookPath("caddy"); err == nil {
+		return p
+	}
+	return ""
+}
+
+// lookCaddy 校验候选路径：纯文件名按 PATH 查找，带路径的按文件存在性判断。
+func lookCaddy(candidate string) string {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return ""
+	}
+	if !strings.ContainsAny(candidate, `/\`) {
+		if p, err := exec.LookPath(candidate); err == nil {
+			return p
+		}
+		return ""
+	}
+	abs, err := filepath.Abs(candidate)
+	if err != nil {
+		return ""
+	}
+	info, err := os.Stat(abs)
+	if err != nil || info.IsDir() {
+		return ""
+	}
+	return abs
+}
+
+// caddySearchDirs 返回 caddy 的候选目录。
+//
+// 除了「程序所在目录」，还必须包含「部署目录」与「工作目录」：
+// 用 GoLand 等 IDE 直接运行时，os.Executable() 指向 IDE 的临时目录
+// （...\GoLand\tmp\...），真正的 bin/caddy.exe 在项目里，
+// 只按 exe 目录搜索会永远找不到，表现为「未找到 caddy 可执行文件」。
+func (s *ProxyService) caddySearchDirs() []string {
+	var dirs []string
+	add := func(dir string) {
+		if strings.TrimSpace(dir) == "" {
+			return
+		}
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return
+		}
+		dirs = append(dirs, filepath.Join(abs, "bin"), abs)
+	}
+
+	if exe, err := os.Executable(); err == nil {
+		base := filepath.Dir(exe)
+		add(base)
+		add(filepath.Join(base, ".."))
+	}
+	// 数据目录（<部署目录>/DataSaving/Caddyfile）的上级即部署目录
+	if s.configFile != "" {
+		add(filepath.Dir(filepath.Dir(s.configFile)))
+	}
+	if wd, err := os.Getwd(); err == nil {
+		add(wd)
+	}
+	return dirs
 }
 
 // ConfigFile 返回配置文件路径
@@ -152,15 +251,23 @@ func (s *ProxyService) Reload() error {
 	}
 
 	// 1) Admin API：POST /load?adapter=caddyfile
-	if err := s.reloadViaAdminAPI(caddyfile); err == nil {
+	// Caddy 已由外部托管时，这一步不需要本地可执行文件。
+	apiErr := s.reloadViaAdminAPI(caddyfile)
+	if apiErr == nil {
 		return nil
-	} else {
-		log.Printf("[proxy] Admin API 重载失败，尝试 CLI: %v", err)
 	}
 
-	// 2) CLI reload
+	// 2) CLI reload：先确认可执行文件存在，避免连续两次无效 exec
+	bin := s.resolveBinary()
+	if bin == "" {
+		return fmt.Errorf("未找到 caddy 可执行文件（Admin API 不可用: %v）："+
+			"请安装 Caddy，把 %s 放到程序目录或 bin 子目录，或设置环境变量 CADDY_BIN",
+			apiErr, caddyExecName())
+	}
+	log.Printf("[proxy] Admin API 不可用（%v），改用 %s", apiErr, bin)
+
 	args := []string{
-		s.binaryPath, "reload",
+		bin, "reload",
 		"--config", s.configFile,
 		"--adapter", "caddyfile",
 		"--address", fmt.Sprintf("localhost:%d", s.managePort),
@@ -173,14 +280,56 @@ func (s *ProxyService) Reload() error {
 
 	// 3) 回退：后台启动
 	startArgs := []string{
-		s.binaryPath, "start",
+		bin, "start",
 		"--config", s.configFile,
 		"--adapter", "caddyfile",
 	}
 	if out, _, err := security.SafeExecWithTimeout(startArgs, 30*time.Second); err != nil {
 		return fmt.Errorf("启动Caddy失败: %v (%s)", err, strings.TrimSpace(out))
 	}
+	// start 是异步拉起进程：稍等 Admin API 就绪，避免「命令成功但配置尚未生效」
+	if err := s.waitAdminReady(3 * time.Second); err != nil {
+		log.Printf("[proxy] Caddy 已启动，但 Admin API 在 3s 内未就绪: %v", err)
+	}
 	return nil
+}
+
+// adminAlive 判断 Caddy Admin API 是否可用（本地探测，成本极低）。
+func (s *ProxyService) adminAlive() bool {
+	client := &http.Client{Timeout: time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://localhost:%d/config/", s.managePort))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode == http.StatusOK
+}
+
+// waitAdminReady 轮询 Admin API，等待 Caddy 完成启动。
+func (s *ProxyService) waitAdminReady(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	url := fmt.Sprintf("http://localhost:%d/config/", s.managePort)
+	client := &http.Client{Timeout: time.Second}
+
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+		} else {
+			lastErr = err
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("超时")
+	}
+	return lastErr
 }
 
 // reloadViaAdminAPI 通过 Caddy Admin API 直接加载 Caddyfile
@@ -220,6 +369,15 @@ func (s *ProxyService) RebuildAndReload() error {
 
 	if err := s.Rebuild(); err != nil {
 		return err
+	}
+
+	// 配置内容没有变化且 Caddy 仍在运行时无需重载：
+	// 删除虚拟机、重复下发等操作会反复触发全量重建，
+	// 每次都 POST /load 属于无谓的全量配置替换。
+	if backupErr == nil && s.adminAlive() {
+		if current, err := os.ReadFile(s.configFile); err == nil && bytes.Equal(backup, current) {
+			return nil
+		}
 	}
 
 	if err := s.Reload(); err != nil {

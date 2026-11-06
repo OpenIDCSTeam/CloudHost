@@ -58,18 +58,19 @@ func (s *NATService) provider(hsName string) (driver.NatPortProvider, bool) {
 
 // client 获取（并缓存）指定路由器的客户端。
 // 缓存键使用归一化后的地址，避免大小写/末尾斜杠导致同一路由器被重复建连。
-func (s *NATService) client(routerAddr, user, pass string) *ikuaiClient {
+// token 为爱快 4.0 的个人 API 令牌，参与缓存键：改令牌后必须拿到新客户端。
+func (s *NATService) client(routerAddr, user, pass, token string) *ikuaiClient {
 	if strings.TrimSpace(routerAddr) == "" {
 		return nil
 	}
 	base, _ := normalizeIKuaiAddr(routerAddr)
-	key := base + "|" + user + "|" + pass
+	key := base + "|" + user + "|" + pass + "|" + token
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if c, ok := s.clients[key]; ok {
 		return c
 	}
-	c := newIKuaiClient(routerAddr, user, pass)
+	c := newIKuaiClient(routerAddr, user, pass, token)
 	s.clients[key] = c
 	return c
 }
@@ -88,6 +89,17 @@ func (s *NATService) ApplyPortMap(hsName, vmUUID string, nat *model.PortData, us
 	if nat == nil {
 		return fmt.Errorf("端口映射参数为空")
 	}
+
+	// 内网地址兜底：前端/自动流程常常只给外网与内网端口，
+	// 爱快会直接以「参数错误: lan_addr」拒绝（整条规则下发失败）。
+	// 这里用虚拟机第一块已分配 IP 的网卡补齐。
+	if strings.TrimSpace(nat.LanAddr) == "" {
+		nat.LanAddr = s.vmPrimaryIP(hsName, vmUUID)
+	}
+	if strings.TrimSpace(nat.LanAddr) == "" {
+		return fmt.Errorf("缺少内网地址：虚拟机尚未分配 IP，请先为网卡分配 IP 后重试")
+	}
+
 	host, err := s.db.GetHost(hsName)
 	if err != nil || host == nil {
 		return fmt.Errorf("主机 %s 不存在", hsName)
@@ -102,7 +114,7 @@ func (s *NATService) ApplyPortMap(hsName, vmUUID string, nat *model.PortData, us
 		if strings.TrimSpace(host.IKuaiAddr) == "" {
 			return fmt.Errorf("主机 %s 未配置爱快路由器地址", hsName)
 		}
-		ikuai = s.client(host.IKuaiAddr, host.IKuaiUser, host.IKuaiPass)
+		ikuai = s.client(host.IKuaiAddr, host.IKuaiUser, host.IKuaiPass, host.IKuaiToken)
 		if ikuai == nil {
 			return fmt.Errorf("爱快路由器配置无效")
 		}
@@ -167,7 +179,7 @@ func (s *NATService) RevokePortMap(hsName, vmUUID string, nat model.PortData) er
 	}
 
 	if host, err := s.db.GetHost(hsName); err == nil && host != nil && host.IKuaiAddr != "" {
-		if c := s.client(host.IKuaiAddr, host.IKuaiUser, host.IKuaiPass); c != nil {
+		if c := s.client(host.IKuaiAddr, host.IKuaiUser, host.IKuaiPass, host.IKuaiToken); c != nil {
 			_ = c.deletePortMap(nat.LanPort, nat.LanAddr)
 		}
 	}
@@ -262,7 +274,7 @@ func (s *NATService) ikuaiClientFor(hsName string) (*ikuaiClient, *data.HSConfig
 	if strings.TrimSpace(host.IKuaiAddr) == "" {
 		return nil, host, nil
 	}
-	c := s.client(host.IKuaiAddr, host.IKuaiUser, host.IKuaiPass)
+	c := s.client(host.IKuaiAddr, host.IKuaiUser, host.IKuaiPass, host.IKuaiToken)
 	if c == nil {
 		return nil, host, fmt.Errorf("爱快路由器配置无效")
 	}
@@ -444,6 +456,24 @@ func (s *NATService) UnbindStaticForVM(hsName string, vm *model.VMConfig) error 
 		return errors.New(strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+// vmPrimaryIP 返回虚拟机第一块已分配地址的网卡 IP。
+func (s *NATService) vmPrimaryIP(hsName, vmUUID string) string {
+	raw, err := s.db.GetVMConfig(hsName, vmUUID)
+	if err != nil || raw == "" {
+		return ""
+	}
+	vm, err := DecodeVMConfig(raw)
+	if err != nil || vm == nil {
+		return ""
+	}
+	for _, item := range sortedNics(vm.NicAll) {
+		if ip := strings.TrimSpace(item.Nic.IP4Addr); ip != "" {
+			return ip
+		}
+	}
+	return ""
 }
 
 // namedNic 网卡名与其配置（map 的键即网卡名，可能未写入 NCConfig.NicName）

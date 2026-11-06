@@ -13,7 +13,7 @@ import (
 )
 
 // 主机配置中不得下发给普通用户的凭据字段
-var hostSecretFields = []string{"server_pass", "i_kuai_pass"}
+var hostSecretFields = []string{"server_pass", "i_kuai_pass", "i_kuai_token"}
 
 // HostVMAccessMiddleware 统一执行「主机访问权 + 虚拟机所有权」校验。
 //

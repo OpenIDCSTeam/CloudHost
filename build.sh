@@ -25,5 +25,6 @@ esac
 
 echo "正在构建 ${GOOS}/${GOARCH}..."
 go mod tidy
-GOOS=$GOOS GOARCH=$GOARCH go build -v -o $OUTPUT $MAIN
+# SQLite 驱动为纯 Go 实现，关闭 CGO 可免装 C 工具链并支持交叉编译
+CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -v -o $OUTPUT $MAIN
 echo "构建完成: $OUTPUT"

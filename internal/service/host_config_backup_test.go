@@ -209,3 +209,24 @@ func TestDecodeHostConfigBackupValidation(t *testing.T) {
 		t.Fatal("accepted oversized backup")
 	}
 }
+
+// i_kuai_token 是后新增的可选字段：旧版本导出的备份缺少它时必须仍能还原，
+// 否则升级后所有历史备份都会被判成「缺少完整字段」。
+func TestDecodeHostConfigBackupAllowsMissingOptionalFields(t *testing.T) {
+	raw := backupTestFile(t, backupTestConfig("legacy"))
+
+	var file map[string]interface{}
+	if err := json.Unmarshal(raw, &file); err != nil {
+		t.Fatal(err)
+	}
+	delete(file["hosts"].([]interface{})[0].(map[string]interface{}), "i_kuai_token")
+	stripped, _ := json.Marshal(file)
+
+	backup, err := DecodeHostConfigBackup(stripped)
+	if err != nil {
+		t.Fatalf("缺少可选字段的旧备份应可解码: %v", err)
+	}
+	if len(backup.Hosts) != 1 || backup.Hosts[0].IKuaiToken != "" {
+		t.Fatalf("可选字段应取零值，实际 %+v", backup.Hosts)
+	}
+}

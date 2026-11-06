@@ -1,16 +1,20 @@
 // Package driver 截图能力实现。
 //
-// 与 Python 版各平台 VMScreen 对齐，统一返回 "data:image/png;base64,..."：
+// 与 Python 版各平台 VMScreen 对齐：
+//   - Proxmox   : SSH + qm monitor screendump → PPM → PNG
 //   - QEMU      : virsh screenshot 生成 PPM → 转 PNG
 //   - VirtualBox: VBoxManage controlvm <vm> screenshotpng
 //   - MEmu      : adb shell screencap + adb pull
+//
+// 返回格式历史上并不统一（有的带 data: 前缀、有的是裸 base64），
+// 由 API 层 handleVMScreenshot 统一剥离前缀后再下发：前端固定按
+// data:image/png;base64,<base64> 拼接，多一层前缀会导致图片损坏。
 //
 // 容器类平台（LXD / Docker / SmolVM）在 Python 版中同样走基类返回空，
 // 因此这里保持基类行为（空字符串），不做伪实现。
 package driver
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/base64"
 	"fmt"
@@ -38,44 +42,57 @@ func readFileAsDataURL(path string) (string, error) {
 	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(data), nil
 }
 
-// ppmToDataURL 把 P6 格式的 PPM 图像转换为 PNG data URL。
-//
-// Go 标准库没有 PPM 解码器，而 QEMU 的 virsh screenshot 只输出 PPM，
-// 因此这里手写最小 P6 解析：跳过注释 → 读取宽高与最大灰度 → 读原始 RGB → 编码 PNG。
+// ppmToDataURL 把 P6 格式的 PPM 文件转换为 PNG data URL。
 func ppmToDataURL(path string) (string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
 	}
-	reader := bufio.NewReader(bytes.NewReader(raw))
+	b64, err := ppmBytesToBase64PNG(raw)
+	if err != nil {
+		return "", err
+	}
+	return "data:image/png;base64," + b64, nil
+}
+
+// ppmBytesToBase64PNG 把 P6 格式的 PPM 数据转换为 PNG 的纯 base64。
+//
+// Go 标准库没有 PPM 解码器，而 QEMU 的 screendump/virsh screenshot
+// 只输出 PPM，因此这里手写最小 P6 解析：跳过注释 → 读取宽高与最大灰度
+// → 读原始 RGB → 编码 PNG。
+func ppmBytesToBase64PNG(raw []byte) (string, error) {
+	// 直接在字节切片上维护游标，不能用 bufio.Reader.Buffered() 推算偏移：
+	// 它只反映当前 4KB 缓冲区内的未读字节，读到 3MB 的 PPM 时会算出
+	// 一个远大于真实头部长度的偏移，把数据截成 4080 字节。
+	pos := 0
+
+	isSpace := func(b byte) bool {
+		return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+	}
 
 	token := func() (string, error) {
-		for {
-			b, err := reader.ReadByte()
-			if err != nil {
-				return "", err
-			}
-			if b == '#' { // 注释行
-				if _, err := reader.ReadString('\n'); err != nil {
-					return "", err
+		// 跳过前导空白与注释行
+		for pos < len(raw) {
+			if raw[pos] == '#' {
+				for pos < len(raw) && raw[pos] != '\n' {
+					pos++
 				}
 				continue
 			}
-			if b == ' ' || b == '\t' || b == '\n' || b == '\r' {
+			if isSpace(raw[pos]) {
+				pos++
 				continue
 			}
-			buf := []byte{b}
-			for {
-				nb, err := reader.ReadByte()
-				if err != nil {
-					return string(buf), nil
-				}
-				if nb == ' ' || nb == '\t' || nb == '\n' || nb == '\r' {
-					return string(buf), nil
-				}
-				buf = append(buf, nb)
-			}
+			break
 		}
+		start := pos
+		for pos < len(raw) && !isSpace(raw[pos]) {
+			pos++
+		}
+		if start == pos {
+			return "", fmt.Errorf("PPM头部不完整")
+		}
+		return string(raw[start:pos]), nil
 	}
 
 	magic, err := token()
@@ -110,12 +127,19 @@ func ppmToDataURL(path string) (string, error) {
 		return "", fmt.Errorf("仅支持8位PPM，最大灰度=%s", maxStr)
 	}
 
-	// 头部结束后有且仅有一个空白字符，其后为像素数据
-	headerEnd := len(raw) - reader.Buffered()
-	if headerEnd < 0 || headerEnd >= len(raw) {
+	// maxval 之后按规范只有一个空白字符（CRLF 视为一个）
+	if pos >= len(raw) {
 		return "", fmt.Errorf("PPM数据不完整")
 	}
-	pixels := raw[headerEnd+1:]
+	if raw[pos] == '\r' && pos+1 < len(raw) && raw[pos+1] == '\n' {
+		pos += 2
+	} else if isSpace(raw[pos]) {
+		pos++
+	}
+	if pos > len(raw) {
+		return "", fmt.Errorf("PPM数据不完整")
+	}
+	pixels := raw[pos:]
 	need := width * height * 3
 	if len(pixels) < need {
 		return "", fmt.Errorf("PPM像素数据不足: 期望 %d 字节，实际 %d", need, len(pixels))
@@ -133,7 +157,7 @@ func ppmToDataURL(path string) (string, error) {
 	if err := png.Encode(&buf, img); err != nil {
 		return "", err
 	}
-	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
 }
 
 // ============================================================

@@ -23,3 +23,7 @@ vendor/
 # 操作系统
 .DS_Store
 Thumbs.db
+
+# third-party runtime binary (install per environment, never commit)
+/bin/caddy
+/bin/caddy.exe
