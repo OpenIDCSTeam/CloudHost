@@ -27,3 +27,8 @@ echo 正在构建 %GOOS%/%GOARCH%...
 go mod tidy
 go build -v -o %OUTPUT% %MAIN%
 echo 构建完成: %OUTPUT%
+
+set OPIDCS_OUTPUT=opidcs-%GOOS%-%GOARCH%
+if "%GOOS%"=="windows" set OPIDCS_OUTPUT=%OPIDCS_OUTPUT%.exe
+go build -trimpath -ldflags "-s -w" -o %OPIDCS_OUTPUT% ./cmd/opidcs
+echo 构建完成: %OPIDCS_OUTPUT%

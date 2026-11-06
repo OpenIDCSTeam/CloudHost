@@ -21,7 +21,7 @@
 
 #define AppName "OpenIDCS HostAgent"
 #define AppPublisher "OpenIDCSTeam"
-#define AppURL "https://github.com/OpenIDCSTeam/IDCClient"
+#define AppURL "https://github.com/OpenIDCSTeam/CloudHost"
 #define ServiceName "OpenIDCS-HostAgent"
 #define ServiceDisplayName "OpenIDCS HostAgent"
 
