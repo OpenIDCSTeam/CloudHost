@@ -1,59 +1,107 @@
 name: Release
 
-# 触发方式：
-#   1) push 形如 v1.0.0 的 tag
-#   2) 手动运行（可只填版本号）
+# 触发与通道：
+#   - push tag v*        -> release 通道（正式版，tag=vX.Y.Z）
+#   - push main          -> beta 通道（滚动预发布，tag=beta）
+#   - workflow_dispatch  -> 可选 channel=auto|beta|release 与版本号
+#
+# 一次流水线同时产出：主控 HostAgent、opidcs CLI、opidcs 桌面客户端（Inno/AppImage/app+dmg）。
+
 on:
   push:
     tags:
       - 'v*'
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号（不含 v；留空则使用 0.0.<run_number>）'
+        description: '版本号（不含 v；beta 留空则用 0.0.<run_number>）'
         required: false
         type: string
+      channel:
+        description: '发布通道'
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - beta
+          - release
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # ==========================================================================
-  # 解析版本号
+  # 解析通道与版本
   # ==========================================================================
   prepare:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
       tag: ${{ steps.ver.outputs.tag }}
+      channel: ${{ steps.ver.outputs.channel }}
       prerelease: ${{ steps.ver.outputs.prerelease }}
+      name: ${{ steps.ver.outputs.name }}
     steps:
       - name: Resolve version
         id: ver
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_CHANNEL: ${{ inputs.channel }}
         run: |
           set -euo pipefail
-          input_version='${{ inputs.version }}'
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${input_version}" ]]; then
-            version="${input_version#v}"
-            tag="v${version}"
-          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+          channel=""
+          tag=""
+          version=""
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             tag="${GITHUB_REF_NAME}"
             version="${tag#v}"
+            case "${tag}" in
+              *alpha*|*beta*|*rc*) channel="beta" ;;
+              *) channel="release" ;;
+            esac
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            channel="${INPUT_CHANNEL:-auto}"
+            if [[ "${channel}" == "auto" ]]; then
+              if [[ -n "${INPUT_VERSION:-}" ]]; then channel="release"; else channel="beta"; fi
+            fi
+            version="${INPUT_VERSION:-0.0.${GITHUB_RUN_NUMBER}}"
+            version="${version#v}"
+            if [[ "${channel}" == "beta" ]]; then
+              tag="beta"
+            else
+              tag="v${version}"
+            fi
           else
+            channel="beta"
+            tag="beta"
             version="0.0.${GITHUB_RUN_NUMBER}"
-            tag="v${version}"
           fi
-          prerelease=false
-          if [[ "${tag}" == *alpha* || "${tag}" == *beta* ]]; then
+
+          if [[ "${channel}" == "beta" ]]; then
             prerelease=true
+            name="Beta build ${version}"
+          else
+            prerelease=false
+            name="v${version}"
           fi
+
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "channel=${channel}" >> "$GITHUB_OUTPUT"
           echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
 
   # ==========================================================================
-  # Linux amd64 / arm64（CGO 依赖交叉工具链，产物含 static 目录）
+  # 主控 HostAgent：Linux amd64 / arm64（纯 Go，无 CGO）
   # ==========================================================================
   build-linux:
     needs: prepare
@@ -61,13 +109,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: amd64
-            cc: gcc
-            apt: gcc
-          - arch: arm64
-            cc: aarch64-linux-gnu-gcc
-            apt: gcc-aarch64-linux-gnu
+        arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
 
@@ -76,24 +118,14 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.apt }}
-
       - name: Build
         env:
-          CGO_ENABLED: '1'
+          CGO_ENABLED: '0'
           GOOS: linux
           GOARCH: ${{ matrix.arch }}
-          CC: ${{ matrix.cc }}
         run: |
-          mkdir -p dist
+          mkdir -p dist pkg
           go build -trimpath -ldflags "-s -w" -v -o dist/hostagent ./cmd/server
-
-      - name: Package tar.gz
-        run: |
-          mkdir -p pkg
           cp dist/hostagent pkg/
           cp -R static pkg/
           cp -R VNCConsole pkg/
@@ -106,7 +138,7 @@ jobs:
           if-no-files-found: error
 
   # ==========================================================================
-  # Windows amd64：MinGW 编译 + Inno Setup 打包（NSSM 注册系统服务）
+  # 主控 HostAgent：Windows amd64（Inno Setup + NSSM）
   # ==========================================================================
   build-windows:
     needs: prepare
@@ -119,17 +151,14 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install MinGW and Inno Setup
+      - name: Install Inno Setup
         shell: pwsh
-        run: |
-          choco install mingw innosetup -y --no-progress
-          "C:\ProgramData\chocolatey\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-          gcc --version
+        run: choco install innosetup -y --no-progress
 
       - name: Build
         shell: pwsh
         env:
-          CGO_ENABLED: '1'
+          CGO_ENABLED: '0'
           GOOS: windows
           GOARCH: amd64
         run: |
@@ -165,53 +194,7 @@ jobs:
           if-no-files-found: error
 
   # ==========================================================================
-  # macOS（暂时不启用，需要时取消注释）
-  #
-  # 说明：mattn/go-sqlite3 需要 CGO，macos runner 自带 clang，可直接编译。
-  # 产物为 .pkg（安装到 /usr/local/openidcs + launchd 服务）。
-  # ==========================================================================
-  # build-macos:
-  #   needs: prepare
-  #   runs-on: macos-latest
-  #   strategy:
-  #     fail-fast: false
-  #     matrix:
-  #       include:
-  #         - arch: arm64
-  #         - arch: amd64
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #
-  #     - uses: actions/setup-go@v5
-  #       with:
-  #         go-version-file: go.mod
-  #         cache: true
-  #
-  #     - name: Build
-  #       env:
-  #         CGO_ENABLED: '1'
-  #         GOOS: darwin
-  #         GOARCH: ${{ matrix.arch }}
-  #       run: |
-  #         mkdir -p dist
-  #         go build -trimpath -ldflags "-s -w" -v -o "dist/hostagent-darwin-${{ matrix.arch }}" ./cmd/server
-  #
-  #     - name: Build pkg
-  #       run: |
-  #         chmod +x packaging/macos/build-pkg.sh
-  #         ./packaging/macos/build-pkg.sh "${{ needs.prepare.outputs.version }}" "${{ matrix.arch }}"
-  #
-  #     - uses: actions/upload-artifact@v4
-  #       with:
-  #         name: hostagent-macos-${{ matrix.arch }}
-  #         path: BuildCache/*.pkg
-  #         if-no-files-found: error
-
-  # ==========================================================================
-  # 创建 Release
-  # ==========================================================================
-  # ==========================================================================
-  # opidcs CLI（Linux / macOS / Windows，amd64 + arm64）
+  # opidcs CLI：Linux / macOS / Windows
   # ==========================================================================
   build-opidcs:
     needs: prepare
@@ -258,9 +241,196 @@ jobs:
           name: opidcs-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/opidcs-*
 
-  release:
-    needs: [prepare, build-linux, build-windows, build-opidcs]
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+  # ==========================================================================
+  # GUI：Windows（Tauri 构建 + Inno Setup 自打包）
+  # ==========================================================================
+  build-gui-windows:
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: tools/opidcs-gui/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+      - name: Install frontend dependencies
+        working-directory: tools/opidcs-gui
+        run: npm ci
+      - name: Generate icons
+        working-directory: tools/opidcs-gui
+        run: npm run icon
+      - name: Set app version
+        shell: bash
+        working-directory: tools/opidcs-gui
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));j.version=process.env.APP_VERSION;fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
+      - name: Build sidecar
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tools/opidcs-gui/src-tauri/binaries
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w -X github.com/OpenIDCSTeam/HostAgent-Go/internal/cli/version.Version=${{ needs.prepare.outputs.version }}" \
+            -o "tools/opidcs-gui/src-tauri/binaries/opidcs-x86_64-pc-windows-msvc.exe" ./cmd/opidcs
+      - name: Build desktop client
+        working-directory: tools/opidcs-gui
+        run: npm run tauri build -- --no-bundle
+      - name: Build Inno Setup installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc "/DAppVersion=${{ needs.prepare.outputs.version }}" "packaging\windows\opidcs.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gui-windows-inno
+          path: BuildCache/windows/opidcs-*-win-x64-setup.exe
+          if-no-files-found: error
+
+  # ==========================================================================
+  # GUI：Linux AppImage
+  # ==========================================================================
+  build-gui-linux:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: tools/opidcs-gui/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: Install frontend dependencies
+        working-directory: tools/opidcs-gui
+        run: npm ci
+      - name: Generate icons
+        working-directory: tools/opidcs-gui
+        run: npm run icon
+      - name: Set app version
+        working-directory: tools/opidcs-gui
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+        run: node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));j.version=process.env.APP_VERSION;fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
+      - name: Build sidecar
+        run: |
+          set -euo pipefail
+          mkdir -p tools/opidcs-gui/src-tauri/binaries
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w -X github.com/OpenIDCSTeam/HostAgent-Go/internal/cli/version.Version=${{ needs.prepare.outputs.version }}" \
+            -o "tools/opidcs-gui/src-tauri/binaries/opidcs-x86_64-unknown-linux-gnu" ./cmd/opidcs
+      - name: Build AppImage
+        working-directory: tools/opidcs-gui
+        run: npm run tauri build -- --bundles appimage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gui-linux-appimage
+          path: tools/opidcs-gui/src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+
+  # ==========================================================================
+  # GUI：macOS（.app + .dmg，arm64 / Intel）
+  # ==========================================================================
+  build-gui-macos:
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            triple: aarch64-apple-darwin
+            goarch: arm64
+            suffix: arm64
+          - runner: macos-15-intel
+            triple: x86_64-apple-darwin
+            goarch: amd64
+            suffix: intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: tools/opidcs-gui/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+      - name: Install frontend dependencies
+        working-directory: tools/opidcs-gui
+        run: npm ci
+      - name: Generate icons
+        working-directory: tools/opidcs-gui
+        run: npm run icon
+      - name: Set app version
+        working-directory: tools/opidcs-gui
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+        run: node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));j.version=process.env.APP_VERSION;fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
+      - name: Build sidecar
+        run: |
+          set -euo pipefail
+          mkdir -p tools/opidcs-gui/src-tauri/binaries
+          CGO_ENABLED=0 GOOS=darwin GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags "-s -w -X github.com/OpenIDCSTeam/HostAgent-Go/internal/cli/version.Version=${{ needs.prepare.outputs.version }}" \
+            -o "tools/opidcs-gui/src-tauri/binaries/opidcs-${{ matrix.triple }}" ./cmd/opidcs
+      - name: Build app and dmg
+        working-directory: tools/opidcs-gui
+        run: npm run tauri build -- --target ${{ matrix.triple }} --bundles app,dmg
+      - name: Collect artifacts
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp tools/opidcs-gui/src-tauri/target/${{ matrix.triple }}/release/bundle/dmg/*.dmg dist/
+          ditto -c -k --sequesterRsrc --keepParent \
+            "tools/opidcs-gui/src-tauri/target/${{ matrix.triple }}/release/bundle/macos/opidcs.app" \
+            "dist/opidcs-${APP_VERSION}-macos-${{ matrix.suffix }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gui-macos-${{ matrix.suffix }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ==========================================================================
+  # 汇总并发布到对应通道（beta 为滚动预发布，release 为正式版）
+  # ==========================================================================
+  publish:
+    needs:
+      - prepare
+      - build-linux
+      - build-windows
+      - build-opidcs
+      - build-gui-windows
+      - build-gui-linux
+      - build-gui-macos
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -271,104 +441,34 @@ jobs:
       - name: List artifacts
         run: ls -lh dist
 
-      - name: Generate checksums
-        run: |
-          cd dist
-          sha256sum opidcs-* > checksums.txt || true
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.prepare.outputs.tag }}
-          name: ${{ needs.prepare.outputs.tag }}
-          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
-          generate_release_notes: true
-          files: |
-            dist/*.tar.gz
-            dist/*.zip
-            dist/*-setup.exe
-            dist/opidcs-*
-            dist/checksums.txt
+      - name: Clean beta release assets
+        if: needs.prepare.outputs.channel == 'beta'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ==========================================================================
-  # opidcs 桌面客户端（Tauri：Windows NSIS / Linux AppImage / macOS app+dmg）
-  # ==========================================================================
-  build-gui:
-    needs: [prepare, release]
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: windows-latest
-            triple: x86_64-pc-windows-msvc
-            goos: windows
-            goarch: amd64
-            ext: .exe
-            args: --target x86_64-pc-windows-msvc --bundles nsis
-          - runner: ubuntu-22.04
-            triple: x86_64-unknown-linux-gnu
-            goos: linux
-            goarch: amd64
-            ext: ""
-            args: --bundles appimage
-          - runner: macos-latest
-            triple: aarch64-apple-darwin
-            goos: darwin
-            goarch: arm64
-            ext: ""
-            args: --target aarch64-apple-darwin --bundles app,dmg
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: tools/opidcs-gui/package-lock.json
-
-      - name: Install Linux dependencies
-        if: matrix.runner == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.triple }}
-
-      - name: Install frontend dependencies
-        working-directory: tools/opidcs-gui
-        run: npm ci
-
-      - name: Generate icons
-        working-directory: tools/opidcs-gui
-        run: npm run icon
-
-      - name: Build opidcs sidecar
-        shell: bash
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p tools/opidcs-gui/src-tauri/binaries
-          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -trimpath -ldflags "-s -w -X github.com/OpenIDCSTeam/HostAgent-Go/internal/cli/version.Version=${{ needs.prepare.outputs.version }}" \
-            -o "tools/opidcs-gui/src-tauri/binaries/opidcs-${{ matrix.triple }}${{ matrix.ext }}" ./cmd/opidcs
+          if gh release view "${{ needs.prepare.outputs.tag }}" >/dev/null 2>&1; then
+            gh release view "${{ needs.prepare.outputs.tag }}" --json assets --jq '.assets[].name' |
+            while read -r name; do
+              [ -n "${name}" ] && gh release delete-asset "${{ needs.prepare.outputs.tag }}" "${name}" -y || true
+            done
+          fi
 
-      - name: Build desktop client and upload
-        uses: tauri-apps/tauri-action@v0
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          find . -maxdepth 1 -type f ! -name checksums.txt -printf '%f\n' | sort | xargs -r sha256sum > checksums.txt
+          cat checksums.txt
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.name }}
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
+          make_latest: ${{ needs.prepare.outputs.channel == 'release' && 'true' || 'false' }}
+          generate_release_notes: true
+          files: dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          projectPath: tools/opidcs-gui
-          tagName: ${{ needs.prepare.outputs.tag }}
-          releaseName: ${{ needs.prepare.outputs.tag }}
-          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
-          includeUpdaterJson: false
-          args: ${{ matrix.args }}

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -53,15 +54,20 @@ func newVersionCmd() *cobra.Command {
 
 func newUpdateCmd() *cobra.Command {
 	var checkOnly bool
+	var channel string
 	cmd := &cobra.Command{
 		Use:   "update",
-		Short: "更新 opidcs 到最新版本",
+		Short: "更新 opidcs（stable / beta 通道）",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			rel, err := fetchRelease()
+			channel = strings.ToLower(strings.TrimSpace(channel))
+			if channel != "stable" && channel != "beta" {
+				return fmt.Errorf("通道必须是 stable 或 beta")
+			}
+			rel, err := fetchRelease(channel)
 			if err != nil {
 				return err
 			}
-			fmt.Printf("最新版本: %s（当前 %s）\n", rel.TagName, version.Version)
+			fmt.Printf("通道 %s，最新版本: %s（当前 %s）\n", channel, rel.TagName, version.Version)
 			if checkOnly {
 				return nil
 			}
@@ -80,6 +86,7 @@ func newUpdateCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&checkOnly, "check", false, "只检查不下载")
+	cmd.Flags().StringVar(&channel, "channel", "stable", "发布通道：stable|beta")
 	return cmd
 }
 
@@ -109,9 +116,13 @@ func newUninstallCmd() *cobra.Command {
 	}
 }
 
-func fetchRelease() (*releaseInfo, error) {
+func fetchRelease(channel string) (*releaseInfo, error) {
+	endpoint := releaseAPI
+	if channel == "beta" {
+		endpoint = strings.Replace(releaseAPI, "/releases/latest", "/releases/tags/beta", 1)
+	}
 	client := &http.Client{Timeout: 20 * time.Second}
-	req, _ := http.NewRequest(http.MethodGet, releaseAPI, nil)
+	req, _ := http.NewRequest(http.MethodGet, endpoint, nil)
 	req.Header.Set("User-Agent", "opidcs/"+version.Version)
 	resp, err := client.Do(req)
 	if err != nil {
