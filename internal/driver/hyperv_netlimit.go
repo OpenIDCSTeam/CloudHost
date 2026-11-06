@@ -150,6 +150,7 @@ func (d *HyperVDriver) EnsureBandwidthDriver() error {
 	if !nlSupported() {
 		return errNetLimiterUnsupported
 	}
+	wasReady := netLimiterAvailable()
 	d.hvLimitMu.Lock()
 	d.hvLimitOff = false
 	d.hvLimitAt = time.Time{}
@@ -157,7 +158,11 @@ func (d *HyperVDriver) EnsureBandwidthDriver() error {
 	if err := netLimiterEnsure(d.hvDriverPath()); err != nil {
 		return err
 	}
-	// 驱动刚就绪时立即补一次全量同步，避免等待下一个调度周期
+	if wasReady {
+		// 已就绪（主机配置被重新保存等场景）：不做全量同步，交给 Crontab 的节流同步
+		return nil
+	}
+	// 首次就绪：立即补一次全量同步，避免最多一个调度周期的限速空窗
 	return d.hvSyncBandwidth()
 }
 
@@ -191,8 +196,8 @@ func (d *HyperVDriver) BandwidthDriverStatus() map[string]interface{} {
 			items := make([]map[string]interface{}, 0, len(list))
 			for _, r := range list {
 				items = append(items, map[string]interface{}{
-					"mac":      formatMAC(r.MAC),
-					"rate_up":  rateLabel(r.RateUp),
+					"mac":       formatMAC(r.MAC),
+					"rate_up":   rateLabel(r.RateUp),
 					"rate_down": rateLabel(r.RateDown),
 				})
 			}
