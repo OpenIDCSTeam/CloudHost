@@ -147,6 +147,9 @@ func Port() string {
 			}
 		}
 	}
+	if p, ok := ReadConfigPort(); ok {
+		return p
+	}
 	return "1881"
 }
 

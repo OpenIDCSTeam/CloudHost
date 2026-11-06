@@ -28,6 +28,7 @@ UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 DEFAULT_PORT="1881"
 
 PORT="${DEFAULT_PORT}"
+PORT_EXPLICIT=0
 VERSION="latest"
 OFFLINE_FILE=""
 DO_UNINSTALL=0
@@ -51,7 +52,7 @@ usage() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --version|-v)   VERSION="${2:?缺少版本号}"; shift 2 ;;
-        --port|-p)      PORT="${2:?缺少端口}"; shift 2 ;;
+        --port|-p)      PORT="${2:?缺少端口}"; PORT_EXPLICIT=1; shift 2 ;;
         --dir)          PREFIX="${2:?缺少目录}"; shift 2 ;;
         --data-dir)     DATA_DIR="${2:?缺少目录}"; shift 2 ;;
         --file|-f)      OFFLINE_FILE="${2:?缺少文件路径}"; shift 2 ;;
@@ -162,7 +163,7 @@ do_install() {
     else
         warn "安装包内缺少 VNCConsole，VNC 控制台页面将不可用"
     fi
-    install -d -m 0750 "${DATA_DIR}"
+    install -d -m 0750 "${DATA_DIR}" "${DATA_DIR}/bins" "${DATA_DIR}/logs" "${DATA_DIR}/temp"
     ln -sfn "${PREFIX}/hostagent" "${BIN_LINK}"
 
     cat > "${PREFIX}/.install_info" <<EOF
@@ -175,6 +176,10 @@ DATA_DIR=${DATA_DIR}
 EOF
 
     info "写入 systemd 服务 ..."
+    EXEC_PORT_ARG=""
+    if [[ ${PORT_EXPLICIT} -eq 1 ]]; then
+        EXEC_PORT_ARG="--port ${PORT}"
+    fi
     cat > "${UNIT_FILE}" <<EOF
 [Unit]
 Description=OpenIDCS HostAgent (Go)
@@ -187,7 +192,7 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=${PREFIX}
-ExecStart=${PREFIX}/hostagent --port ${PORT} --data-dir ${DATA_DIR}
+ExecStart=${PREFIX}/hostagent ${EXEC_PORT_ARG} --data-dir ${DATA_DIR}
 Restart=on-failure
 RestartSec=5
 StartLimitInterval=60

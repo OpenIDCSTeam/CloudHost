@@ -6,6 +6,7 @@ package service
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -67,10 +68,12 @@ func NewProxyService(db *data.DB, dataDir string) *ProxyService {
 	if err != nil {
 		absDir = dataDir
 	}
+	// Caddyfile 位于 data/temp/，首次运行先确保目录存在
+	_ = os.MkdirAll(filepath.Join(absDir, "temp"), 0o750)
 	return &ProxyService{
 		db:         db,
 		binaryPath: strings.TrimSpace(os.Getenv("CADDY_BIN")),
-		configFile: filepath.Join(absDir, "Caddyfile"),
+		configFile: filepath.Join(absDir, "temp", "Caddyfile"),
 		managePort: 2019,
 		dataDir:    absDir,
 	}
@@ -167,9 +170,10 @@ func (s *ProxyService) caddySearchDirs() []string {
 		add(base)
 		add(filepath.Join(base, ".."))
 	}
-	// 数据目录（<部署目录>/DataSaving/Caddyfile）的上级即部署目录
+	// <部署目录>/data/temp/Caddyfile：向外两级即部署目录
 	if s.configFile != "" {
-		add(filepath.Dir(filepath.Dir(s.configFile)))
+		add(filepath.Dir(filepath.Dir(filepath.Dir(s.configFile))))
+		add(filepath.Join(s.dataDir, "bins"))
 	}
 	if wd, err := os.Getwd(); err == nil {
 		add(wd)
@@ -193,11 +197,20 @@ func (s *ProxyService) Rebuild() error {
 	}
 
 	// 域名去重（与 Python proxys_list 以 domain 为 key 的行为一致）
-	proxies := make(map[string]model.WebProxy)
+	// 同时按主机的代理模式计算实际上游：直连虚拟机内网 IP，或经爱快公网中转。
+	entries := make(map[string]proxyEntry)
 	for _, h := range hosts {
 		// 平台自有代理通道（如青州云）由云端 API 管理，不纳入本地 Caddy 配置
 		if _, ok := s.provider(h.HsName); ok {
 			continue
+		}
+		mode := strings.TrimSpace(h.ProxyMode)
+		if mode == "" {
+			mode = "direct"
+		}
+		relay := strings.TrimSpace(h.RelayAddr)
+		if mode == "relay" && relay == "" {
+			relay = firstPublicAddr(h.PublicAddr)
 		}
 		vms, err := s.db.GetVMSaving(h.HsName)
 		if err != nil {
@@ -217,17 +230,39 @@ func (s *ProxyService) Rebuild() error {
 				if web.WebAddr == "" {
 					continue
 				}
-				if _, exists := proxies[web.WebAddr]; !exists {
-					proxies[web.WebAddr] = web
+				upHost, upPort := web.LanAddr, web.LanPort
+				if mode == "relay" {
+					wanPort := natWanPortFor(vm.NatAll, web.LanPort)
+					if relay == "" || wanPort == 0 {
+						log.Printf("[proxy] 跳过 %s：中转模式缺少公网地址或 %s:%d 的端口映射",
+							web.WebAddr, web.LanAddr, web.LanPort)
+						continue
+					}
+					upHost, upPort = relay, wanPort
+				}
+				if _, exists := entries[web.WebAddr]; !exists {
+					entries[web.WebAddr] = proxyEntry{web: web, host: upHost, port: upPort}
 				}
 			}
 		}
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("{\n\tadmin localhost:%d\n}\n\n", s.managePort))
-	for _, web := range proxies {
-		sb.WriteString(buildCaddyBlock(web))
+	// 注意：这里**不能**写 admin 段。
+	// Caddy 的 /load 会尝试按新配置重新绑定管理端点，而该端口正被
+	// 它自己占用，于是返回 400：
+	//   starting caddy administration endpoint: bind: Only one usage of ...
+	// 结果是每次下发都失败。管理端点用 Caddy 默认值（localhost:2019）即可，
+	// 我们只需要把**客户端**的请求地址写成 127.0.0.1（避免 Windows 上
+	// localhost 解析到 IPv6 ::1）。
+	for _, e := range entries {
+		sb.WriteString(buildCaddyBlock(e.web, e.host, e.port))
+	}
+	if len(entries) == 0 {
+		// 全部规则删除后 Caddyfile 只剩空行，Caddy 适配器会以
+		// 「adapting config using caddyfile: EOF」拒绝加载，
+		// 于是每次删除最后一条规则都失败并回滚。留一行注释便于识别。
+		sb.WriteString("# 当前没有启用中的反向代理规则\n")
 	}
 
 	if err := os.MkdirAll(filepath.Dir(s.configFile), 0755); err != nil {
@@ -270,7 +305,7 @@ func (s *ProxyService) Reload() error {
 		bin, "reload",
 		"--config", s.configFile,
 		"--adapter", "caddyfile",
-		"--address", fmt.Sprintf("localhost:%d", s.managePort),
+		"--address", fmt.Sprintf("127.0.0.1:%d", s.managePort),
 	}
 	if out, _, err := security.SafeExecWithTimeout(args, 30*time.Second); err == nil {
 		return nil
@@ -297,7 +332,7 @@ func (s *ProxyService) Reload() error {
 // adminAlive 判断 Caddy Admin API 是否可用（本地探测，成本极低）。
 func (s *ProxyService) adminAlive() bool {
 	client := &http.Client{Timeout: time.Second}
-	resp, err := client.Get(fmt.Sprintf("http://localhost:%d/config/", s.managePort))
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/config/", s.managePort))
 	if err != nil {
 		return false
 	}
@@ -309,7 +344,7 @@ func (s *ProxyService) adminAlive() bool {
 // waitAdminReady 轮询 Admin API，等待 Caddy 完成启动。
 func (s *ProxyService) waitAdminReady(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	url := fmt.Sprintf("http://localhost:%d/config/", s.managePort)
+	url := fmt.Sprintf("http://127.0.0.1:%d/config/", s.managePort)
 	client := &http.Client{Timeout: time.Second}
 
 	var lastErr error
@@ -332,11 +367,47 @@ func (s *ProxyService) waitAdminReady(timeout time.Duration) error {
 	return lastErr
 }
 
+// isEmptyCaddyfile 判断配置里是否只有注释与空行（没有任何站点）。
+func isEmptyCaddyfile(data []byte) bool {
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// reloadEmptyJSON 用 JSON 空配置清空 Caddy 运行态。
+//
+// caddyfile 适配器不接受空文件（EOF），但 Admin API 接受 JSON，
+// 传 `{}` 即可移除全部站点。
+func (s *ProxyService) reloadEmptyJSON() error {
+	url := fmt.Sprintf("http://127.0.0.1:%d/load", s.managePort)
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader("{}"))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
 // reloadViaAdminAPI 通过 Caddy Admin API 直接加载 Caddyfile
 // Caddy 支持 POST /load 并以 Content-Type + ?adapter 指定配置格式，
 // 因此无需引入 caddy Go 模块，也无需本地 caddy 可执行文件。
 func (s *ProxyService) reloadViaAdminAPI(caddyfile []byte) error {
-	url := fmt.Sprintf("http://localhost:%d/load?adapter=caddyfile", s.managePort)
+	url := fmt.Sprintf("http://127.0.0.1:%d/load?adapter=caddyfile", s.managePort)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(caddyfile))
 	if err != nil {
 		return err
@@ -378,6 +449,16 @@ func (s *ProxyService) RebuildAndReload() error {
 		if current, err := os.ReadFile(s.configFile); err == nil && bytes.Equal(backup, current) {
 			return nil
 		}
+	}
+
+	// 没有任何规则时，Caddyfile 只有注释：caddyfile 适配器会报 EOF。
+	// 直接用 JSON 空配置清空运行态（等价于移除所有站点）。
+	if current, err := os.ReadFile(s.configFile); err == nil && isEmptyCaddyfile(current) {
+		if err := s.reloadEmptyJSON(); err != nil {
+			log.Printf("[proxy] 清空 Caddy 配置失败: %v", err)
+			return err
+		}
+		return nil
 	}
 
 	if err := s.Reload(); err != nil {
@@ -424,12 +505,45 @@ func (s *ProxyService) ApplyProxy(hsName, vmUUID string, proxy model.WebProxy, a
 	return s.RebuildAndReload()
 }
 
+// proxyEntry 一条代理规则及其实际生效的上游地址。
+//
+// 上游取决于主机的代理模式：
+//   - direct：虚拟机内网 IP : 内网端口
+//   - relay ：中转地址（爱快公网） : 该内网端口对应的公网端口
+type proxyEntry struct {
+	web  model.WebProxy
+	host string
+	port int
+}
+
+// firstPublicAddr 取 public_addr（JSON 数组）中的首个非空地址。
+func firstPublicAddr(raw string) string {
+	var list []string
+	if err := json.Unmarshal([]byte(raw), &list); err != nil {
+		return ""
+	}
+	for _, a := range list {
+		if v := strings.TrimSpace(a); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// natWanPortFor 找到内网端口对应的公网端口（同端口多条时取第一条）。
+func natWanPortFor(rules []model.PortData, lanPort int) int {
+	for _, r := range rules {
+		if r.LanPort == lanPort && r.WanPort > 0 {
+			return r.WanPort
+		}
+	}
+	return 0
+}
+
 // buildCaddyBlock 生成单个反向代理的 Caddyfile 片段
 // 规则与 Python HttpManager.config_all 保持一致
-func buildCaddyBlock(web model.WebProxy) string {
+func buildCaddyBlock(web model.WebProxy, ip string, port int) string {
 	domain := web.WebAddr
-	ip := web.LanAddr
-	port := web.LanPort
 	isHTTPS := web.IsHTTPS
 
 	backendProtocol := "http"

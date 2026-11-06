@@ -1,17 +1,19 @@
-// Package data 数据访问层 - SQLite数据库封装
+// Package data 数据访问层，支持 SQLite / MySQL / PostgreSQL。
 package data
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/OpenIDCSTeam/HostAgent-Go/internal/appconfig"
 
 	// 纯 Go 实现的 SQLite 驱动：不依赖 CGO，CGO_ENABLED=0 也可正常工作，
 	// 同时支持从任意平台交叉编译出 linux/windows/darwin 单文件二进制。
@@ -20,49 +22,89 @@ import (
 
 // DB 数据库连接封装
 type DB struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect Dialect
 }
 
-// NewDB 初始化数据库连接
-// dataDir: 数据目录路径，如 "./DataSaving"
+// NewDB 初始化 SQLite 数据库连接（兼容旧调用）。
+// dataDir: 数据目录路径，如 "./data"
 func NewDB(dataDir string) (*DB, error) {
-	// 确保数据目录存在
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	return Open(appconfig.DatabaseConfig{Driver: "sqlite"}, dataDir)
+}
+
+// Open 按配置连接数据库并初始化表结构。
+func Open(cfg appconfig.DatabaseConfig, dataDir string) (*DB, error) {
+	if err := os.MkdirAll(dataDir, 0o750); err != nil {
 		return nil, fmt.Errorf("创建数据目录失败: %w", err)
 	}
 
-	dbPath := filepath.Join(dataDir, "hostmanage.db")
-	// modernc 驱动用 _pragma 传 PRAGMA，且对每个新建连接都会生效：
-	// WAL 提升读写并发，busy_timeout 缓解写锁竞争，foreign_keys 保证级联删除。
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	dialect, err := ParseDialect(cfg.Driver)
+	if err != nil {
+		return nil, err
+	}
+
+	driverName, dsn, err := cfg.DSNString(dataDir)
+	if err != nil {
+		return nil, err
+	}
+
+	if dialect == DialectSQLite {
+		// modernc 驱动用 _pragma 传 PRAGMA，且对每个新建连接都会生效：
+		// WAL 提升读写并发，busy_timeout 缓解写锁竞争，foreign_keys 保证级联删除。
+		sep := "?"
+		if strings.Contains(dsn, "?") {
+			sep = "&"
+		}
+		dsn += sep + "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	}
+
+	db, err := sql.Open(driverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("打开数据库失败: %w", err)
 	}
 
-	// 配置连接池
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(10)
-	db.SetConnMaxLifetime(5 * time.Minute)
+	if dialect == DialectSQLite {
+		db.SetMaxOpenConns(25)
+		db.SetMaxIdleConns(10)
+	} else {
+		db.SetMaxOpenConns(50)
+		db.SetMaxIdleConns(20)
+	}
+	db.SetConnMaxLifetime(30 * time.Minute)
 
-	// 启用WAL模式
-	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		return nil, fmt.Errorf("启用WAL模式失败: %w", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("连接 %s 失败: %w", dialect, err)
 	}
 
-	d := &DB{db: db}
+	if dialect == DialectSQLite {
+		if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("启用WAL模式失败: %w", err)
+		}
+	}
+
+	d := &DB{db: db, dialect: dialect}
 
 	// 初始化表结构
 	if err := d.initSchema(); err != nil {
+		_ = db.Close()
 		return nil, fmt.Errorf("初始化数据库表结构失败: %w", err)
 	}
 
 	// 执行迁移
 	if err := d.migrate(); err != nil {
+		_ = db.Close()
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
 	}
 
 	return d, nil
 }
+
+// Dialect 返回当前数据库方言。
+func (d *DB) Dialect() Dialect { return d.dialect }
 
 // Close 关闭数据库连接
 func (d *DB) Close() error {
@@ -79,6 +121,16 @@ type sqlTime struct {
 }
 
 const sqlTimeLayout = "2006-01-02 15:04:05"
+
+// daysAgo 返回 N 天前的时间参数：PostgreSQL 直接传 time.Time 以匹配 TIMESTAMP，
+// SQLite/MySQL 传文本以与既有存储格式保持一致。
+func (d *DB) daysAgo(days int) interface{} {
+	t := time.Now().AddDate(0, 0, -days)
+	if d.dialect == DialectPostgres {
+		return t
+	}
+	return t.Format(sqlTimeLayout)
+}
 
 func (t *sqlTime) Scan(src interface{}) error {
 	switch v := src.(type) {
@@ -329,8 +381,47 @@ CREATE INDEX IF NOT EXISTS idx_nat_rules_user ON nat_rules (user_id);
 CREATE INDEX IF NOT EXISTS idx_web_proxies_name ON web_proxies (hs_name);
 CREATE INDEX IF NOT EXISTS idx_web_proxies_user ON web_proxies (user_id);
 `
-	_, err := d.db.Exec(schema)
-	return err
+	return d.execStatements(SplitStatements(schema))
+}
+
+// execStatements 逐条执行 DDL，按方言转换并容忍幂等错误。
+func (d *DB) execStatements(stmts []string) error {
+	for _, stmt := range stmts {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+		translated := d.dialect.TranslateDDL(stmt)
+		if _, err := d.db.Exec(translated); err != nil {
+			if isIdempotentSchemaError(err) {
+				continue
+			}
+			return fmt.Errorf("执行 %q 失败: %w", firstLine(translated), err)
+		}
+	}
+	return nil
+}
+
+func isIdempotentSchemaError(err error) bool {
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"already exists", "duplicate column", "duplicate key name", "duplicate index",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 120 {
+		s = s[:120]
+	}
+	return s
 }
 
 // migrate 执行数据库迁移（添加新字段）
@@ -344,6 +435,16 @@ func (d *DB) migrate() error {
 		`ALTER TABLE hs_config ADD COLUMN n_mem_price REAL DEFAULT 0`,
 		`ALTER TABLE hs_config ADD COLUMN n_hdd_price REAL DEFAULT 0`,
 		`ALTER TABLE hs_config ADD COLUMN n_net_price REAL DEFAULT 0`,
+		// 反向代理模式与 VNC 对外地址：
+		//   proxy_mode  direct=主控与平台同机，Caddy 直连虚拟机内网 IP
+		//               relay =主控与平台分离，Caddy 经爱快公网地址中转
+		//   relay_addr 中转地址（留空取 public_addr[0]）
+		//   vnc_ip     VNC 连接目标 IP（留空取平台地址）
+		//   vnc_wan    VNC 对外地址（如 vnc.example.com:6080），留空则用本机
+		`ALTER TABLE hs_config ADD COLUMN proxy_mode TEXT DEFAULT 'direct'`,
+		`ALTER TABLE hs_config ADD COLUMN relay_addr TEXT DEFAULT ''`,
+		`ALTER TABLE hs_config ADD COLUMN vnc_ip TEXT DEFAULT ''`,
+		`ALTER TABLE hs_config ADD COLUMN vnc_wan TEXT DEFAULT ''`,
 		// 异步任务增加主机与虚拟机标识，用于按资源过滤与并发互斥
 		`ALTER TABLE async_tasks ADD COLUMN hs_name TEXT DEFAULT ''`,
 		`ALTER TABLE async_tasks ADD COLUMN vm_uuid TEXT DEFAULT ''`,
@@ -415,16 +516,14 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_hs_logger_operator ON hs_logger (operator)`,
 	}
 	for _, m := range migrations {
-		if _, err := d.db.Exec(m); err != nil {
+		if err := d.execStatements(SplitStatements(m)); err != nil {
 			// 只跳过「对象已存在」这一类幂等错误。
 			// 原实现用 `err.Error() != ""` 判断，等于把所有迁移失败都吞掉：
 			// 磁盘满、库被锁、语法错误都会静默通过，启动后功能才莫名缺失。
-			msg := strings.ToLower(err.Error())
-			if strings.Contains(msg, "duplicate column") ||
-				strings.Contains(msg, "already exists") {
+			if isIdempotentSchemaError(err) {
 				continue
 			}
-			return fmt.Errorf("数据库迁移失败 [%s]: %w", m, err)
+			return fmt.Errorf("数据库迁移失败 [%s]: %w", firstLine(m), err)
 		}
 	}
 
@@ -444,6 +543,10 @@ func (d *DB) migrate() error {
 //
 // SQLite 不支持 DROP CONSTRAINT，只能重建表；该函数幂等，无外键时直接返回。
 func (d *DB) migrateLoggerTable() error {
+	// PostgreSQL / MySQL 由本程序建表时就没有外键，无需重建。
+	if d.dialect != DialectSQLite {
+		return nil
+	}
 	rows, err := d.db.Query("PRAGMA foreign_key_list(hs_logger)")
 	if err != nil {
 		return err
@@ -524,7 +627,7 @@ func (d *DB) GetGlobal(id string) (string, error) {
 // SetGlobal 设置全局配置
 func (d *DB) SetGlobal(id, data string) error {
 	_, err := d.db.Exec(
-		"INSERT OR REPLACE INTO hs_global (id, data) VALUES (?, ?)",
+		"INSERT INTO hs_global (id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
 		id, data,
 	)
 	return err
@@ -536,37 +639,37 @@ func (d *DB) SetGlobal(id, data string) error {
 
 // HSConfigRow 主机配置数据库行
 type HSConfigRow struct {
-	ID         int    `db:"id"`
-	HsName     string `db:"hs_name"`
-	ServerName string `db:"server_name"`
-	ServerType string `db:"server_type"`
-	ServerAddr string `db:"server_addr"`
-	ServerUser string `db:"server_user"`
-	ServerPass string `db:"server_pass"`
-	ServerPort int    `db:"server_port"`
-	ImagesPath string `db:"images_path"`
-	DvdromPath string `db:"dvdrom_path"`
-	SystemPath string `db:"system_path"`
-	BackupPath string `db:"backup_path"`
-	ExternPath string `db:"extern_path"`
-	LaunchPath string `db:"launch_path"`
-	NetworkNat string `db:"network_nat"`
-	NetworkPub string `db:"network_pub"`
-	FilterName string `db:"filter_name"`
-	IKuaiAddr  string `db:"i_kuai_addr"`
-	IKuaiUser  string `db:"i_kuai_user"`
-	IKuaiPass  string `db:"i_kuai_pass"`
-	IKuaiToken string `db:"i_kuai_token"`
-	PortsStart int    `db:"ports_start"`
-	PortsClose int    `db:"ports_close"`
-	RemotePort int    `db:"remote_port"`
-	SystemMaps string `db:"system_maps"`
-	ImagesMaps string `db:"images_maps"`
-	PublicAddr string `db:"public_addr"`
-	ExtendData string `db:"extend_data"`
-	LimitsNums int    `db:"limits_nums"`
-	IPAddrMaps string `db:"ipaddr_maps"`
-	IPAddrDDNS string `db:"ipaddr_ddns"`
+	ID         int     `db:"id"`
+	HsName     string  `db:"hs_name"`
+	ServerName string  `db:"server_name"`
+	ServerType string  `db:"server_type"`
+	ServerAddr string  `db:"server_addr"`
+	ServerUser string  `db:"server_user"`
+	ServerPass string  `db:"server_pass"`
+	ServerPort int     `db:"server_port"`
+	ImagesPath string  `db:"images_path"`
+	DvdromPath string  `db:"dvdrom_path"`
+	SystemPath string  `db:"system_path"`
+	BackupPath string  `db:"backup_path"`
+	ExternPath string  `db:"extern_path"`
+	LaunchPath string  `db:"launch_path"`
+	NetworkNat string  `db:"network_nat"`
+	NetworkPub string  `db:"network_pub"`
+	FilterName string  `db:"filter_name"`
+	IKuaiAddr  string  `db:"i_kuai_addr"`
+	IKuaiUser  string  `db:"i_kuai_user"`
+	IKuaiPass  string  `db:"i_kuai_pass"`
+	IKuaiToken string  `db:"i_kuai_token"`
+	PortsStart int     `db:"ports_start"`
+	PortsClose int     `db:"ports_close"`
+	RemotePort int     `db:"remote_port"`
+	SystemMaps string  `db:"system_maps"`
+	ImagesMaps string  `db:"images_maps"`
+	PublicAddr string  `db:"public_addr"`
+	ExtendData string  `db:"extend_data"`
+	LimitsNums int     `db:"limits_nums"`
+	IPAddrMaps string  `db:"ipaddr_maps"`
+	IPAddrDDNS string  `db:"ipaddr_ddns"`
 	EnableHost int     `db:"enable_host"`
 	ServerArea string  `db:"server_area"`
 	NCpuPrice  float64 `db:"n_cpu_price"`
@@ -574,8 +677,13 @@ type HSConfigRow struct {
 	NHddPrice  float64 `db:"n_hdd_price"`
 	NNetPrice  float64 `db:"n_net_price"`
 	ServerPlan string  `db:"server_plan"`
-	CreatedAt  string  `db:"created_at"`
-	UpdatedAt  string  `db:"updated_at"`
+	// 反向代理模式与 VNC 对外地址
+	ProxyMode string `db:"proxy_mode"`
+	RelayAddr string `db:"relay_addr"`
+	VncIP     string `db:"vnc_ip"`
+	VncWan    string `db:"vnc_wan"`
+	CreatedAt string `db:"created_at"`
+	UpdatedAt string `db:"updated_at"`
 }
 
 // GetAllHosts 获取所有主机配置
@@ -587,7 +695,8 @@ func (d *DB) GetAllHosts() ([]*HSConfigRow, error) {
 		system_maps, images_maps, public_addr, extend_data, limits_nums, ipaddr_maps,
 		ipaddr_ddns, enable_host, server_area,
 		COALESCE(n_cpu_price,0), COALESCE(n_mem_price,0), COALESCE(n_hdd_price,0), COALESCE(n_net_price,0),
-		server_plan, created_at, updated_at
+		server_plan, COALESCE(proxy_mode,'direct'), COALESCE(relay_addr,''), COALESCE(vnc_ip,''), COALESCE(vnc_wan,''),
+		created_at, updated_at
 		FROM hs_config ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -607,7 +716,9 @@ func (d *DB) GetAllHosts() ([]*HSConfigRow, error) {
 			&row.PublicAddr, &row.ExtendData, &row.LimitsNums, &row.IPAddrMaps, &row.IPAddrDDNS,
 			&row.EnableHost, &row.ServerArea,
 			&row.NCpuPrice, &row.NMemPrice, &row.NHddPrice, &row.NNetPrice,
-			&row.ServerPlan, &createdAt, &updatedAt,
+			&row.ServerPlan,
+			&row.ProxyMode, &row.RelayAddr, &row.VncIP, &row.VncWan,
+			&createdAt, &updatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -628,7 +739,8 @@ func (d *DB) GetHost(hsName string) (*HSConfigRow, error) {
 		system_maps, images_maps, public_addr, extend_data, limits_nums, ipaddr_maps,
 		ipaddr_ddns, enable_host, server_area,
 		COALESCE(n_cpu_price,0), COALESCE(n_mem_price,0), COALESCE(n_hdd_price,0), COALESCE(n_net_price,0),
-		server_plan, created_at, updated_at
+		server_plan, COALESCE(proxy_mode,'direct'), COALESCE(relay_addr,''), COALESCE(vnc_ip,''), COALESCE(vnc_wan,''),
+		created_at, updated_at
 		FROM hs_config WHERE hs_name = ?`, hsName).Scan(
 		&row.ID, &row.HsName, &row.ServerName, &row.ServerType, &row.ServerAddr,
 		&row.ServerUser, &row.ServerPass, &row.ServerPort, &row.ImagesPath, &row.DvdromPath,
@@ -638,7 +750,9 @@ func (d *DB) GetHost(hsName string) (*HSConfigRow, error) {
 		&row.PublicAddr, &row.ExtendData, &row.LimitsNums, &row.IPAddrMaps, &row.IPAddrDDNS,
 		&row.EnableHost, &row.ServerArea,
 		&row.NCpuPrice, &row.NMemPrice, &row.NHddPrice, &row.NNetPrice,
-		&row.ServerPlan, &createdAt, &updatedAt,
+		&row.ServerPlan,
+		&row.ProxyMode, &row.RelayAddr, &row.VncIP, &row.VncWan,
+		&createdAt, &updatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -664,8 +778,8 @@ func createHostRow(executor hostConfigExecutor, row *HSConfigRow) error {
 		system_maps, images_maps, public_addr, extend_data, limits_nums, ipaddr_maps,
 		ipaddr_ddns, enable_host, server_area,
 		n_cpu_price, n_mem_price, n_hdd_price, n_net_price,
-		server_plan)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		server_plan, proxy_mode, relay_addr, vnc_ip, vnc_wan)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		row.HsName, row.ServerName, row.ServerType, row.ServerAddr,
 		row.ServerUser, row.ServerPass, row.ServerPort, row.ImagesPath, row.DvdromPath,
 		row.SystemPath, row.BackupPath, row.ExternPath, row.LaunchPath, row.NetworkNat,
@@ -674,7 +788,7 @@ func createHostRow(executor hostConfigExecutor, row *HSConfigRow) error {
 		row.PublicAddr, row.ExtendData, row.LimitsNums, row.IPAddrMaps, row.IPAddrDDNS,
 		row.EnableHost, row.ServerArea,
 		row.NCpuPrice, row.NMemPrice, row.NHddPrice, row.NNetPrice,
-		row.ServerPlan,
+		row.ServerPlan, row.ProxyMode, row.RelayAddr, row.VncIP, row.VncWan,
 	)
 	return err
 }
@@ -692,7 +806,7 @@ func updateHostRow(executor hostConfigExecutor, row *HSConfigRow) error {
 		system_maps=?, images_maps=?, public_addr=?, extend_data=?, limits_nums=?, ipaddr_maps=?,
 		ipaddr_ddns=?, enable_host=?, server_area=?,
 		n_cpu_price=?, n_mem_price=?, n_hdd_price=?, n_net_price=?,
-		server_plan=?, updated_at=CURRENT_TIMESTAMP
+		server_plan=?, proxy_mode=?, relay_addr=?, vnc_ip=?, vnc_wan=?, updated_at=CURRENT_TIMESTAMP
 		WHERE hs_name=?`,
 		row.ServerName, row.ServerType, row.ServerAddr,
 		row.ServerUser, row.ServerPass, row.ServerPort, row.ImagesPath, row.DvdromPath,
@@ -702,7 +816,7 @@ func updateHostRow(executor hostConfigExecutor, row *HSConfigRow) error {
 		row.PublicAddr, row.ExtendData, row.LimitsNums, row.IPAddrMaps, row.IPAddrDDNS,
 		row.EnableHost, row.ServerArea,
 		row.NCpuPrice, row.NMemPrice, row.NHddPrice, row.NNetPrice,
-		row.ServerPlan, row.HsName,
+		row.ServerPlan, row.ProxyMode, row.RelayAddr, row.VncIP, row.VncWan, row.HsName,
 	)
 	return err
 }
@@ -782,8 +896,6 @@ func (d *DB) DeleteVMConfig(hsName, vmUUID string) error {
 	}
 	return err
 }
-
-
 
 // SetAllVMConfigs 批量保存主机下所有虚拟机配置
 func (d *DB) SetAllVMConfigs(hsName string, configs map[string]interface{}) error {
@@ -1047,8 +1159,8 @@ func (d *DB) QueryLoggers(q LogQuery) ([]map[string]interface{}, error) {
 		}
 	}
 	if q.SinceDays > 0 {
-		query += " AND created_at >= datetime('now', ?)"
-		args = append(args, fmt.Sprintf("-%d days", q.SinceDays))
+		query += " AND created_at >= ?"
+		args = append(args, d.daysAgo(q.SinceDays))
 	}
 	if kw := strings.TrimSpace(q.Keyword); kw != "" {
 		query += " AND (log_action LIKE ? OR log_message LIKE ? OR detail LIKE ? OR operator LIKE ? OR vm_uuid LIKE ?)"
@@ -1198,8 +1310,8 @@ func (d *DB) LogStats(days int) (map[string]interface{}, error) {
 	where := ""
 	args := []interface{}{}
 	if days > 0 {
-		where = " WHERE created_at >= datetime('now', ?)"
-		args = append(args, fmt.Sprintf("-%d days", days))
+		where = " WHERE created_at >= ?"
+		args = append(args, d.daysAgo(days))
 	}
 
 	// 按级别统计
@@ -1270,11 +1382,10 @@ func (d *DB) DeleteOldLoggers(hsName string, days int) (int64, error) {
 	var res sql.Result
 	var err error
 	if hsName != "" {
-		res, err = d.db.Exec("DELETE FROM hs_logger WHERE hs_name=? AND created_at < datetime('now', ?)",
-			hsName, fmt.Sprintf("-%d days", days))
+		res, err = d.db.Exec("DELETE FROM hs_logger WHERE hs_name=? AND created_at < ?",
+			hsName, d.daysAgo(days))
 	} else {
-		res, err = d.db.Exec("DELETE FROM hs_logger WHERE created_at < datetime('now', ?)",
-			fmt.Sprintf("-%d days", days))
+		res, err = d.db.Exec("DELETE FROM hs_logger WHERE created_at < ?", d.daysAgo(days))
 	}
 	if err != nil {
 		return 0, err
@@ -1368,17 +1479,17 @@ func (d *DB) getUserBy(field string, value interface{}) (map[string]interface{},
 
 func (d *DB) scanUser(row *sql.Row) (map[string]interface{}, error) {
 	var (
-		id, isAdmin, isActive, emailVerified int
-		canCreateVM, canDeleteVM, canModifyVM int
-		quotaCPU, quotaRAM, quotaSSD, quotaGPU int
+		id, isAdmin, isActive, emailVerified                   int
+		canCreateVM, canDeleteVM, canModifyVM                  int
+		quotaCPU, quotaRAM, quotaSSD, quotaGPU                 int
 		quotaNatPorts, quotaWebProxy, quotaNatIPs, quotaPubIPs int
-		quotaBandwidthUp, quotaBandwidthDown, quotaTraffic int
-		usedCPU, usedRAM, usedSSD, usedGPU int
-		usedNatPorts, usedWebProxy, usedNatIPs, usedPubIPs int
-		usedBandwidthUp, usedBandwidthDown, usedTraffic int
-		username, password, email, verifyToken, resetToken string
-		assignedHosts string
-		createdAt, updatedAt, lastLogin sqlTime
+		quotaBandwidthUp, quotaBandwidthDown, quotaTraffic     int
+		usedCPU, usedRAM, usedSSD, usedGPU                     int
+		usedNatPorts, usedWebProxy, usedNatIPs, usedPubIPs     int
+		usedBandwidthUp, usedBandwidthDown, usedTraffic        int
+		username, password, email, verifyToken, resetToken     string
+		assignedHosts                                          string
+		createdAt, updatedAt, lastLogin                        sqlTime
 	)
 	err := row.Scan(
 		&id, &username, &password, &email, &isAdmin, &isActive,
@@ -1457,17 +1568,17 @@ func (d *DB) GetAllUsersPage(limit, offset int) ([]map[string]interface{}, error
 	var result []map[string]interface{}
 	for rows.Next() {
 		var (
-			id, isAdmin, isActive, emailVerified int
-			canCreateVM, canDeleteVM, canModifyVM int
-			quotaCPU, quotaRAM, quotaSSD, quotaGPU int
+			id, isAdmin, isActive, emailVerified                   int
+			canCreateVM, canDeleteVM, canModifyVM                  int
+			quotaCPU, quotaRAM, quotaSSD, quotaGPU                 int
 			quotaNatPorts, quotaWebProxy, quotaNatIPs, quotaPubIPs int
-			quotaBandwidthUp, quotaBandwidthDown, quotaTraffic int
-			usedCPU, usedRAM, usedSSD, usedGPU int
-			usedNatPorts, usedWebProxy, usedNatIPs, usedPubIPs int
-			usedBandwidthUp, usedBandwidthDown, usedTraffic int
-			username, password, email, verifyToken, resetToken string
-			assignedHosts string
-			createdAt, updatedAt, lastLogin sqlTime
+			quotaBandwidthUp, quotaBandwidthDown, quotaTraffic     int
+			usedCPU, usedRAM, usedSSD, usedGPU                     int
+			usedNatPorts, usedWebProxy, usedNatIPs, usedPubIPs     int
+			usedBandwidthUp, usedBandwidthDown, usedTraffic        int
+			username, password, email, verifyToken, resetToken     string
+			assignedHosts                                          string
+			createdAt, updatedAt, lastLogin                        sqlTime
 		)
 		if err := rows.Scan(
 			&id, &username, &password, &email, &isAdmin, &isActive,
@@ -1533,53 +1644,53 @@ func (d *DB) UpdateUser(id int, fields map[string]interface{}) error {
 	if len(fields) == 0 {
 		return nil
 	}
-	
+
 	// 字段白名单 - 防止SQL注入
 	allowedFields := map[string]bool{
-		"username":              true,
-		"email":                 true,
-		"password":              true,
-		"is_admin":              true,
-		"is_active":             true,
-		"email_verified":        true,
-		"verify_token":          true,
-		"reset_token":           true,
-		"reset_token_expires":   true,
-		"can_create_vm":         true,
-		"can_delete_vm":         true,
-		"can_modify_vm":         true,
-		"quota_cpu":             true,
-		"quota_ram":             true,
-		"quota_ssd":             true,
-		"quota_gpu":             true,
-		"quota_nat_ports":       true,
-		"quota_web_proxy":       true,
-		"quota_nat_ips":         true,
-		"quota_pub_ips":         true,
-		"quota_bandwidth_up":    true,
-		"quota_bandwidth_down":  true,
-		"quota_traffic":         true,
-		"used_cpu":              true,
-		"used_ram":              true,
-		"used_ssd":              true,
-		"used_gpu":              true,
-		"used_traffic":          true,
-		"used_nat_ports":        true,
-		"used_web_proxy":        true,
-		"used_nat_ips":          true,
-		"used_pub_ips":          true,
-		"used_bandwidth_up":     true,
-		"used_bandwidth_down":   true,
-		"assigned_hosts":        true,
+		"username":             true,
+		"email":                true,
+		"password":             true,
+		"is_admin":             true,
+		"is_active":            true,
+		"email_verified":       true,
+		"verify_token":         true,
+		"reset_token":          true,
+		"reset_token_expires":  true,
+		"can_create_vm":        true,
+		"can_delete_vm":        true,
+		"can_modify_vm":        true,
+		"quota_cpu":            true,
+		"quota_ram":            true,
+		"quota_ssd":            true,
+		"quota_gpu":            true,
+		"quota_nat_ports":      true,
+		"quota_web_proxy":      true,
+		"quota_nat_ips":        true,
+		"quota_pub_ips":        true,
+		"quota_bandwidth_up":   true,
+		"quota_bandwidth_down": true,
+		"quota_traffic":        true,
+		"used_cpu":             true,
+		"used_ram":             true,
+		"used_ssd":             true,
+		"used_gpu":             true,
+		"used_traffic":         true,
+		"used_nat_ports":       true,
+		"used_web_proxy":       true,
+		"used_nat_ips":         true,
+		"used_pub_ips":         true,
+		"used_bandwidth_up":    true,
+		"used_bandwidth_down":  true,
+		"assigned_hosts":       true,
 	}
-	
+
 	// 验证所有字段名
 	for k := range fields {
 		if !allowedFields[k] {
 			return fmt.Errorf("不允许更新字段: %s", k)
 		}
 	}
-	
+
 	query := "UPDATE web_users SET "
 	args := []interface{}{}
 	i := 0
@@ -1813,43 +1924,43 @@ func (d *DB) GetHostByName(hsName string) (map[string]interface{}, error) {
 		return nil, nil
 	}
 	return map[string]interface{}{
-		"hs_name":        row.HsName,
-		"server_name":    row.ServerName,
-		"server_type":    row.ServerType,
-		"server_addr":    row.ServerAddr,
-		"server_user":    row.ServerUser,
-		"server_pass":    row.ServerPass,
-		"server_port":    row.ServerPort,
-		"server_area":    row.ServerArea,
-		"enable_host":    row.EnableHost,
-		"network_nat":    row.NetworkNat,
-		"network_pub":    row.NetworkPub,
-		"ports_start":    row.PortsStart,
-		"ports_close":    row.PortsClose,
-		"i_kuai_addr":    row.IKuaiAddr,
-		"i_kuai_user":    row.IKuaiUser,
-		"i_kuai_pass":    row.IKuaiPass,
-		"i_kuai_token":   row.IKuaiToken,
-		"system_path":    row.SystemPath,
-		"images_path":    row.ImagesPath,
-		"backup_path":    row.BackupPath,
-		"extern_path":    row.ExternPath,
-		"launch_path":    row.LaunchPath,
-		"dvdrom_path":    row.DvdromPath,
-		"filter_name":    row.FilterName,
-		"remote_port":    row.RemotePort,
-		"limits_nums":    row.LimitsNums,
-		"ipaddr_ddns":    row.IPAddrDDNS,
-		"ipaddr_maps":    row.IPAddrMaps,
-		"public_addr":    row.PublicAddr,
-		"system_maps":    row.SystemMaps,
-		"images_maps":    row.ImagesMaps,
-		"extend_data":    row.ExtendData,
-		"server_plan":    row.ServerPlan,
-		"n_cpu_price":    row.NCpuPrice,
-		"n_mem_price":    row.NMemPrice,
-		"n_hdd_price":    row.NHddPrice,
-		"n_net_price":    row.NNetPrice,
+		"hs_name":      row.HsName,
+		"server_name":  row.ServerName,
+		"server_type":  row.ServerType,
+		"server_addr":  row.ServerAddr,
+		"server_user":  row.ServerUser,
+		"server_pass":  row.ServerPass,
+		"server_port":  row.ServerPort,
+		"server_area":  row.ServerArea,
+		"enable_host":  row.EnableHost,
+		"network_nat":  row.NetworkNat,
+		"network_pub":  row.NetworkPub,
+		"ports_start":  row.PortsStart,
+		"ports_close":  row.PortsClose,
+		"i_kuai_addr":  row.IKuaiAddr,
+		"i_kuai_user":  row.IKuaiUser,
+		"i_kuai_pass":  row.IKuaiPass,
+		"i_kuai_token": row.IKuaiToken,
+		"system_path":  row.SystemPath,
+		"images_path":  row.ImagesPath,
+		"backup_path":  row.BackupPath,
+		"extern_path":  row.ExternPath,
+		"launch_path":  row.LaunchPath,
+		"dvdrom_path":  row.DvdromPath,
+		"filter_name":  row.FilterName,
+		"remote_port":  row.RemotePort,
+		"limits_nums":  row.LimitsNums,
+		"ipaddr_ddns":  row.IPAddrDDNS,
+		"ipaddr_maps":  row.IPAddrMaps,
+		"public_addr":  row.PublicAddr,
+		"system_maps":  row.SystemMaps,
+		"images_maps":  row.ImagesMaps,
+		"extend_data":  row.ExtendData,
+		"server_plan":  row.ServerPlan,
+		"n_cpu_price":  row.NCpuPrice,
+		"n_mem_price":  row.NMemPrice,
+		"n_hdd_price":  row.NHddPrice,
+		"n_net_price":  row.NNetPrice,
 	}, nil
 }
 
@@ -1860,7 +1971,7 @@ func (d *DB) GetVMsByHost(hsName string) ([]map[string]interface{}, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var result []map[string]interface{}
 	for rows.Next() {
 		var configJSON string
@@ -1883,7 +1994,7 @@ func (d *DB) GetNATRulesByHost(hsName string) ([]map[string]interface{}, error) 
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var result []map[string]interface{}
 	for rows.Next() {
 		var vmUUID, lanAddr string
@@ -1908,7 +2019,7 @@ func (d *DB) GetWebProxiesByHost(hsName string) ([]map[string]interface{}, error
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var result []map[string]interface{}
 	for rows.Next() {
 		var vmUUID, webName, webDomain, webHost string
@@ -1926,5 +2037,3 @@ func (d *DB) GetWebProxiesByHost(hsName string) ([]map[string]interface{}, error
 	}
 	return result, rows.Err()
 }
-
-

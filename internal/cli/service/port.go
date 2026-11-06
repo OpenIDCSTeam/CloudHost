@@ -5,10 +5,45 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
+
+	"github.com/OpenIDCSTeam/HostAgent-Go/internal/appconfig"
 )
+
+// DataDir 返回主控运行目录（与 CLI 保持一致）。
+func DataDir() string {
+	if dir := strings.TrimSpace(os.Getenv("OPIDCS_DATA_DIR")); dir != "" {
+		return dir
+	}
+	return "./data"
+}
+
+// ReadConfigPort 从 data.yaml 读取端口。
+func ReadConfigPort() (string, bool) {
+	cfg, err := appconfig.Read(filepath.Join(DataDir(), "data.yaml"))
+	if err != nil {
+		return "", false
+	}
+	return strconv.Itoa(cfg.Server.Port), true
+}
+
+func saveConfigPort(port string) error {
+	path := filepath.Join(DataDir(), "data.yaml")
+	cfg, err := appconfig.Read(path)
+	if err != nil {
+		return err
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return err
+	}
+	cfg.Server.Port = n
+	return appconfig.Save(path, cfg)
+}
 
 // SetPort 修改服务监听端口并重启。
 func SetPort(port string) error {
@@ -22,11 +57,23 @@ func SetPort(port string) error {
 		}
 	}
 
+	configUpdated := false
+	if _, err := appconfig.Read(filepath.Join(DataDir(), "data.yaml")); err == nil {
+		if err := saveConfigPort(port); err != nil {
+			return fmt.Errorf("写入 data.yaml 失败: %w", err)
+		}
+		configUpdated = true
+	}
+
 	switch runtime.GOOS {
 	case "linux":
 		unit := "/etc/systemd/system/" + linuxUnit + ".service"
 		data, err := os.ReadFile(unit)
 		if err != nil {
+			if configUpdated {
+				fmt.Printf("端口已写入 %s，重启主控后生效\n", filepath.Join(DataDir(), "data.yaml"))
+				return nil
+			}
 			return fmt.Errorf("读取服务文件失败（是否已安装主控？）: %w", err)
 		}
 		updated, err := replacePortFlag(string(data), port)

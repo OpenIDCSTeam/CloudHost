@@ -4,7 +4,9 @@
 /HostAgent-Go
 /HostAgent-Go.exe
 
-# 数据目录（包含数据库和日志）
+# 运行时数据目录（bins/ logs/ temp/ data.db data.yaml）
+/data/
+# 旧版目录，仅用于迁移识别
 DataSaving/
 
 # Go工具链

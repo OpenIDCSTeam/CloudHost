@@ -122,7 +122,7 @@ sudo bash install.sh --uninstall   # 卸载（保留数据）
 
 ### Windows 安装（Inno Setup）
 
-1. 从 [Releases](https://github.com/OpenIDCSTeam/IDCClient/releases) 下载
+1. 从 [Releases](https://github.com/OpenIDCSTeam/CloudHost/releases) 下载
    `OpenIDCS-HostAgent-<版本>-win-x64-setup.exe`。
 2. 双击安装，安装器会通过 NSSM 注册系统服务 `OpenIDCS-HostAgent`（LocalSystem，
    开机自启，异常自动重启），并可选放行 1881 / 6080 / 7681 端口。
@@ -130,7 +130,7 @@ sudo bash install.sh --uninstall   # 卸载（保留数据）
 | 项目 | 路径 |
 |------|------|
 | 程序目录 | `C:\Program Files\OpenIDCS\HostAgent` |
-| 数据目录 | `C:\ProgramData\OpenIDCS\HostAgent\DataSaving`（升级不丢失） |
+| 数据目录 | `C:\ProgramData\OpenIDCS\HostAgent\data`（升级不丢失，内含 `data.db` 与 `data.yaml`） |
 | 服务名 | `OpenIDCS-HostAgent` |
 
 也可以下载 `hostagent-windows-amd64.zip` 免安装运行。
@@ -183,7 +183,7 @@ sudo installer -pkg BuildCache/OpenIDCS-HostAgent-1.0.0-macos-arm64.pkg -target 
 #### 克隆项目
 ```bash
 git clone https://github.com/OpenIDCSTeam/IDCClient.git
-cd IDCClient
+cd CloudHost
 ```
 
 #### 编译
@@ -197,8 +197,9 @@ go build -o hostagent ./cmd/server      # Windows: -o hostagent.exe
 
 #### 启动后端
 ```bash
-./hostagent --port 1881 --data-dir ./DataSaving
+./hostagent --data-dir ./data
 ```
+首次启动会创建 `data/data.yaml`（端口、数据库、日志级别），后续修改该文件即可，无需再传参数。
 
 前端资源已随仓库 `static/` 目录提供，程序按工作目录读取 `./static`，启动时请保持目录一致。
 
@@ -212,8 +213,8 @@ go build -o hostagent ./cmd/server      # Windows: -o hostagent.exe
 | Windows 安装包 | `packaging/windows/hostagent.iss`（Inno Setup 6 + NSSM） |
 | macOS pkg | `packaging/macos/build-pkg.sh` |
 
-> `mattn/go-sqlite3` 依赖 CGO，交叉编译需要目标平台的 C 工具链；CI 中 Linux arm64 使用
-> `aarch64-linux-gnu-gcc`，Windows 使用 MinGW。
+> SQLite 使用纯 Go 驱动 `modernc.org/sqlite`，不依赖 CGO；MySQL / PostgreSQL 驱动同样为纯 Go，
+> 因此 `CGO_ENABLED=0` 可直接交叉编译。
 
 欢迎通过 Issue、Pull Request、文档完善或测试反馈等方式参与贡献。
 
@@ -291,7 +292,7 @@ graph LR
 | **状态管理** | Zustand | >= 4.4.7 |
 | **HTTP客户端(前端)** | Axios | >= 1.6.2 |
 | **后端** | Python Flask | >= 2.3.3 |
-| **数据库** | SQLite | - |
+| **数据库** | SQLite（默认）/ MySQL 8.0.13+ / PostgreSQL 13+ | - |
 | **日志** | Loguru | >= 0.6.0 |
 | **HTTP客户端(后端)** | Requests | >= 2.28.0 |
 | **系统监控** | psutil/GPUtil/py-cpuinfo | >= 5.9.0 |
@@ -370,9 +371,50 @@ OpenIDC-Client/
 
 | 项目 | 说明 |
 |------|------|
-| 数据/日志 | 保存在 `DataSaving/` 目录，按主机名分文件 |
+| 数据目录 | `data/`：`bins/` 外部二进制、`logs/` 日志、`temp/` 临时文件与备份、`data.db`、`data.yaml` |
+| 配置文件 | `data/data.yaml`：端口、VNC/SSH 端口、数据库驱动与连接、日志级别 |
+| 数据库 | 默认 SQLite（`data/data.db`）；可切换 MySQL / PostgreSQL，详见下节 |
 | 多语言 | 前端 `FrontPages/src/utils/i18n.ts`，后端 `HostConfig/translates/` |
 | API认证 | 支持 Token 与 Session 双重认证 |
+
+### data.yaml 与多数据库
+
+```yaml
+server:
+  host: 0.0.0.0
+  port: 1881
+  vnc_port: 6080
+  ssh_port: 7681
+database:
+  driver: sqlite          # sqlite | mysql | postgres
+  dsn: ""                 # 填了则优先于下方分段配置
+  sqlite:
+    file: data.db
+  mysql:
+    host: 127.0.0.1
+    port: 3306
+    user: openidcs
+    password: ""
+    database: openidcs
+    params: charset=utf8mb4&parseTime=true&loc=Local
+  postgres:
+    host: 127.0.0.1
+    port: 5432
+    user: openidcs
+    password: ""
+    database: openidcs
+    sslmode: disable
+log:
+  console: info
+  file: debug
+  db: info
+```
+
+- 端口优先级：命令行 `--port` > `data.yaml` > 默认 1881。
+- SQLite 之外的数据库需先建库，并给账号授予建表/索引权限；首次启动自动建表。
+- 切换数据库不会自动搬迁旧数据，请用 `opidcs host export` / SQL 工具迁移。
+- 环境变量 `OPIDCS_PORT`、`OPIDCS_DB_DRIVER`、`OPIDCS_DB_DSN`、`OPIDCS_DATA_DIR` 可覆盖配置。
+- 旧版 `DataSaving/` 会在首次启动时自动迁移到 `data/`（数据库、日志、Caddyfile、备份、密钥），原目录保留。
 
 可选环境变量：
 

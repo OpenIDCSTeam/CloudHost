@@ -48,7 +48,10 @@ func TestProxyServiceResolveCaddyBinary(t *testing.T) {
 // 缺少 caddy 时 Reload 必须给出可操作提示，且不再执行两次无效命令。
 func TestProxyServiceReloadWithoutCaddy(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "Caddyfile"),
+	if err := os.MkdirAll(filepath.Join(dir, "temp"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "temp", "Caddyfile"),
 		[]byte("{\n\tadmin localhost:2019\n}\n"), 0644); err != nil {
 		t.Fatal(err)
 	}

@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -128,7 +129,7 @@ func NewApp(db *data.DB, dataDir string) *App {
 		DB:        db,
 		HostSvc:   service.NewHostService(db),
 		SystemSvc: service.NewSystemService(db),
-		Logger:    logger.NewLogger(db, dataDir),
+		Logger:    logger.NewLogger(db, filepath.Join(dataDir, "logs")),
 	}
 	app.NATService = service.NewNATService(db)
 	app.IPAllocSvc = service.NewIPAllocService(db)

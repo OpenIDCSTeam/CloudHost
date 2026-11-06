@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/model"
+	"github.com/OpenIDCSTeam/HostAgent-Go/internal/paths"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/security"
 )
 
@@ -387,7 +388,7 @@ func (d *MemuDriver) CreateBackup(vmUUID string, tips string) (*model.ZMessage, 
 
 	backupDir := strings.TrimSpace(d.Config.BackupPath)
 	if backupDir == "" {
-		backupDir = "./DataSaving/backups"
+		backupDir = filepath.Join(paths.Temp(), "backups")
 	}
 	if err := os.MkdirAll(backupDir, 0755); err != nil {
 		return &model.ZMessage{Success: false, Action: "VMBackup",
@@ -419,7 +420,7 @@ func (d *MemuDriver) CreateBackup(vmUUID string, tips string) (*model.ZMessage, 
 func (d *MemuDriver) RestoreBackup(vmUUID string, backupName string) (*model.ZMessage, error) {
 	backupDir := strings.TrimSpace(d.Config.BackupPath)
 	if backupDir == "" {
-		backupDir = "./DataSaving/backups"
+		backupDir = filepath.Join(paths.Temp(), "backups")
 	}
 	name, err := sanitizeFileName(backupName)
 	if err != nil {

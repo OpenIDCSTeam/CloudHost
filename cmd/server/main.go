@@ -15,20 +15,22 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/api"
+	"github.com/OpenIDCSTeam/HostAgent-Go/internal/appconfig"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/data"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/driver"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/logger"
+	"github.com/OpenIDCSTeam/HostAgent-Go/internal/paths"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/scheduler"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/security"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/service"
 )
 
 var (
-	port        int
-	dataDir     string
-	logLevel    string
+	port         int
+	dataDir      string
+	logLevel     string
 	logFileLevel string
-	logDBLevel  string
+	logDBLevel   string
 )
 
 func main() {
@@ -38,8 +40,8 @@ func main() {
 		RunE:  run,
 	}
 
-	rootCmd.Flags().IntVar(&port, "port", 1881, "HTTP监听端口")
-	rootCmd.Flags().StringVar(&dataDir, "data-dir", "./DataSaving", "数据目录路径")
+	rootCmd.Flags().IntVar(&port, "port", 1881, "HTTP监听端口（优先于 data/data.yaml）")
+	rootCmd.Flags().StringVar(&dataDir, "data-dir", paths.DefaultRoot, "数据目录路径（默认 ./data）")
 	// 分层分级：级别越高落地通道越多。
 	// 终端只输出 info 及以上（debug 需要显式开启），文件默认保留 debug 细节，
 	// 数据库只落 info 及以上，避免无意义的调试噪声污染审计日志。
@@ -54,8 +56,40 @@ func main() {
 }
 
 func run(cmd *cobra.Command, args []string) error {
+	// 运行目录：data/{bins,logs,temp}，并迁移旧版 DataSaving
+	paths.SetRoot(dataDir)
+	if err := paths.Ensure(); err != nil {
+		return err
+	}
+	if migrated, err := paths.MigrateLegacy(); err != nil {
+		log.Printf("[startup] 旧数据迁移失败（继续使用新目录）: %v", err)
+	} else if migrated {
+		fmt.Println("已完成旧数据目录 DataSaving → data 的迁移")
+	}
+
+	// 读取 data/data.yaml（不存在时生成默认配置）
+	cfg, err := appconfig.Load(paths.Config())
+	if err != nil {
+		return fmt.Errorf("加载配置失败: %w", err)
+	}
+	cfg.ApplyEnv()
+	if cmd.Flags().Changed("port") {
+		cfg.Server.Port = port
+	} else {
+		port = cfg.Server.Port
+	}
+	if !cmd.Flags().Changed("log-level") && cfg.Log.Console != "" {
+		logLevel = cfg.Log.Console
+	}
+	if !cmd.Flags().Changed("log-file-level") && cfg.Log.File != "" {
+		logFileLevel = cfg.Log.File
+	}
+	if !cmd.Flags().Changed("log-db-level") && cfg.Log.DB != "" {
+		logDBLevel = cfg.Log.DB
+	}
+
 	// 初始化数据库
-	db, err := data.NewDB(dataDir)
+	db, err := data.Open(cfg.Database, dataDir)
 	if err != nil {
 		return fmt.Errorf("初始化数据库失败: %w", err)
 	}
@@ -108,17 +142,19 @@ func run(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  OpenIDCS HostAgent-Go 已启动\n")
 	fmt.Printf("  监听端口: %d\n", port)
 	fmt.Printf("  数据目录: %s\n", dataDir)
+	fmt.Printf("  配置文件: %s\n", paths.Config())
+	fmt.Printf("  数据库: %s\n", db.Dialect())
 	fmt.Printf("  访问地址: http://localhost:%d\n", port)
 	fmt.Printf("  日志级别: 终端=%s 文件=%s 数据库=%s\n", consoleLevel, fileLevel, dbLevel)
 	fmt.Printf("  Bearer Token: %s\n", token)
 	fmt.Printf("========================================\n\n")
 
-	// 启动VNC代理服务（6080端口）
-	vncProxy := api.NewVNCProxyServer(6080)
+	// 启动VNC代理服务（默认 6080）
+	vncProxy := api.NewVNCProxyServer(cfg.Server.VNCPort)
 	vncProxy.Start()
 
-	// 启动SSH终端服务（7681端口）
-	sshTerminal := api.NewSSHTerminalServer(7681)
+	// 启动SSH终端服务（默认 7681）
+	sshTerminal := api.NewSSHTerminalServer(cfg.Server.SSHPort)
 	// 已知主机密钥持久化在数据库全局配置中，默认 TOFU 策略
 	hostKeyStore := security.NewHostKeyStore(
 		func() (string, error) { return db.GetGlobal("ssh_known_hosts") },

@@ -26,18 +26,18 @@ type TaskType string
 
 // Task 任务模型
 type Task struct {
-	ID          string                 `json:"id"`
-	Name        string                 `json:"name"`
-	Type        string                 `json:"type"`
-	Status      string                 `json:"status"`
-	Progress    int                    `json:"progress"`
-	Message     string                 `json:"message"`
-	Result      map[string]interface{} `json:"result"`
-	Error       string                 `json:"error"`
-	Metadata    map[string]interface{} `json:"metadata"`
-	CreatedBy   string                 `json:"created_by"`
-	HsName      string                 `json:"hs_name"`
-	VmUUID      string                 `json:"vm_uuid"`
+	ID        string                 `json:"id"`
+	Name      string                 `json:"name"`
+	Type      string                 `json:"type"`
+	Status    string                 `json:"status"`
+	Progress  int                    `json:"progress"`
+	Message   string                 `json:"message"`
+	Result    map[string]interface{} `json:"result"`
+	Error     string                 `json:"error"`
+	Metadata  map[string]interface{} `json:"metadata"`
+	CreatedBy string                 `json:"created_by"`
+	HsName    string                 `json:"hs_name"`
+	VmUUID    string                 `json:"vm_uuid"`
 	// Version 乐观锁版本号，每次成功写入自增
 	Version     int        `json:"version"`
 	CreatedAt   time.Time  `json:"created_at"`
@@ -294,11 +294,11 @@ func (d *DB) DeleteTask(taskID string) error {
 // DeleteCompletedTasks 删除已完成的任务（超过指定天数）
 func (d *DB) DeleteCompletedTasks(days int) (int, error) {
 	query := `
-		DELETE FROM async_tasks 
-		WHERE status IN ('completed', 'failed', 'cancelled')
-		AND completed_at < datetime('now', '-' || ? || ' days')
-	`
-	result, err := d.db.Exec(query, days)
+DELETE FROM async_tasks
+WHERE status IN ('completed', 'failed', 'cancelled')
+AND completed_at < ?
+`
+	result, err := d.db.Exec(query, d.daysAgo(days))
 	if err != nil {
 		return 0, err
 	}

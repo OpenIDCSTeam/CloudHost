@@ -9,7 +9,8 @@
 ; 产物: BuildCache\windows\OpenIDCS-HostAgent-<版本>-win-x64-setup.exe
 ;
 ; 安装时以 LocalSystem 注册为 Windows 服务 OpenIDCS-HostAgent，
-; 数据目录固定为 C:\ProgramData\OpenIDCS\HostAgent\DataSaving（升级不丢失）。
+; 数据目录固定为 C:\ProgramData\OpenIDCS\HostAgent\data（升级不丢失），
+; 内部布局：bins/ logs/ temp/ data.db data.yaml。
 ; ============================================================================
 
 #ifndef AppVersion
@@ -62,7 +63,10 @@ Source: "..\..\VNCConsole\*"; DestDir: "{app}\VNCConsole"; Flags: ignoreversion 
 Source: "nssm.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Dirs]
-Name: "{commonappdata}\OpenIDCS\HostAgent\DataSaving"
+Name: "{commonappdata}\OpenIDCS\HostAgent\data"
+Name: "{commonappdata}\OpenIDCS\HostAgent\data\bins"
+Name: "{commonappdata}\OpenIDCS\HostAgent\data\logs"
+Name: "{commonappdata}\OpenIDCS\HostAgent\data\temp"
 
 [Icons]
 Name: "{group}\{#AppName} 管理界面"; Filename: "http://127.0.0.1:{#HttpPort}"
@@ -77,7 +81,7 @@ var
 
 function DataDir: string;
 begin
-  Result := ExpandConstant('{commonappdata}\OpenIDCS\HostAgent\DataSaving');
+  Result := ExpandConstant('{commonappdata}\OpenIDCS\HostAgent\data');
 end;
 
 function RunNssm(const Params: string): Boolean;
@@ -110,14 +114,14 @@ begin
 
     RunNssm('install ' + ServiceName + ' "' + ExpandConstant('{app}\hostagent.exe') + '"');
     RunNssm('set ' + ServiceName + ' AppDirectory "' + ExpandConstant('{app}') + '"');
-    RunNssm('set ' + ServiceName + ' AppParameters --port {#HttpPort} --data-dir "' + DataDir + '"');
+    RunNssm('set ' + ServiceName + ' AppParameters --data-dir "' + DataDir + '"');
     RunNssm('set ' + ServiceName + ' DisplayName "' + '{#ServiceDisplayName}' + '"');
     RunNssm('set ' + ServiceName + ' Description "OpenIDCS HostAgent - virtualization management backend"');
     RunNssm('set ' + ServiceName + ' Start SERVICE_AUTO_START');
     RunNssm('set ' + ServiceName + ' AppExit Default Restart');
     RunNssm('set ' + ServiceName + ' AppRestartDelay 5000');
-    RunNssm('set ' + ServiceName + ' AppStdout "' + DataDir + '\service-stdout.log"');
-    RunNssm('set ' + ServiceName + ' AppStderr "' + DataDir + '\service-stderr.log"');
+    RunNssm('set ' + ServiceName + ' AppStdout "' + DataDir + '\logs\service-stdout.log"');
+    RunNssm('set ' + ServiceName + ' AppStderr "' + DataDir + '\logs\service-stderr.log"');
     RunNssm('set ' + ServiceName + ' AppRotateFiles 1');
     RunNssm('start ' + ServiceName);
 
