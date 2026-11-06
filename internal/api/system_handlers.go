@@ -894,6 +894,76 @@ func toStringSlice(v interface{}) []string {
 	}
 }
 
+// ============================================================
+// 带宽限速驱动管理（Hyper-V）
+// ============================================================
+
+// bandwidthDriverOf 取主机驱动并断言其支持限速驱动管理。
+func (app *App) bandwidthDriverOf(c *gin.Context) (driver.BandwidthDriverProvider, string, bool) {
+	hsName := strings.TrimSpace(c.Query("hs_name"))
+	if hsName == "" {
+		hsName = strings.TrimSpace(c.Param("hs_name"))
+	}
+	if hsName == "" {
+		utils.BadRequest(c, "缺少主机名 hs_name")
+		return nil, "", false
+	}
+	d := app.HostSvc.GetDriver(hsName)
+	if d == nil {
+		utils.NotFound(c, "主机不存在或未启用")
+		return nil, "", false
+	}
+	p, ok := d.(driver.BandwidthDriverProvider)
+	if !ok {
+		utils.Fail(c, 400, "当前主机类型不支持带宽限速驱动（仅 Hyper-V 主机）")
+		return nil, "", false
+	}
+	return p, hsName, true
+}
+
+// handleBandwidthDriverStatus GET /api/system/bandwidth_driver?hs_name=xxx
+func (app *App) handleBandwidthDriverStatus(c *gin.Context) {
+	p, hsName, ok := app.bandwidthDriverOf(c)
+	if !ok {
+		return
+	}
+	data := p.BandwidthDriverStatus()
+	data["hs_name"] = hsName
+	utils.Success(c, data)
+}
+
+// handleBandwidthDriverInstall POST /api/system/bandwidth_driver/install?hs_name=xxx
+func (app *App) handleBandwidthDriverInstall(c *gin.Context) {
+	p, hsName, ok := app.bandwidthDriverOf(c)
+	if !ok {
+		return
+	}
+	if err := p.EnsureBandwidthDriver(); err != nil {
+		app.logEvent(c, "host", "安装带宽限速驱动").Host(hsName).Err(err).
+			Errorf("安装带宽限速驱动失败：%v", err)
+		utils.Fail(c, 500, "安装带宽限速驱动失败: "+err.Error())
+		return
+	}
+	app.logEvent(c, "host", "安装带宽限速驱动").Host(hsName).Info("带宽限速驱动已安装并启动")
+	utils.SuccessMsg(c, "带宽限速驱动已安装并启动", p.BandwidthDriverStatus())
+}
+
+// handleBandwidthDriverUninstall POST /api/system/bandwidth_driver/uninstall?hs_name=xxx
+func (app *App) handleBandwidthDriverUninstall(c *gin.Context) {
+	p, hsName, ok := app.bandwidthDriverOf(c)
+	if !ok {
+		return
+	}
+	if err := p.UninstallBandwidthDriver(); err != nil {
+		app.logEvent(c, "host", "卸载带宽限速驱动").Host(hsName).Err(err).
+			Errorf("卸载带宽限速驱动失败：%v", err)
+		utils.Fail(c, 500, "卸载带宽限速驱动失败: "+err.Error())
+		return
+	}
+	app.logEvent(c, "host", "卸载带宽限速驱动").Host(hsName).Info("带宽限速驱动已卸载，虚拟机限速已解除")
+	utils.SuccessMsg(c, "带宽限速驱动已卸载", p.BandwidthDriverStatus())
+}
+
 // isEmptyConfigValue 判断配置值是否为空（对应 Python 的 (None, ”, {}, [], 0) 判定）
 func isEmptyConfigValue(v interface{}) bool {
 	switch val := v.(type) {

@@ -186,7 +186,7 @@ func (d *VirtualBoxDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey s
 // MountUSB 挂载 / 卸载 USB 存储设备（以宿主块设备形式附加到 SATA 端口 2）
 func (d *VirtualBoxDriver) MountUSB(vmUUID string, usbKey string, mount bool) (*model.ZMessage, error) {
 	if strings.TrimSpace(usbKey) == "" {
-		return &model.ZMessage{Success: false, Action: "USBMount", Message: "USB设备标识不能为空"}, nil
+		return &model.ZMessage{Success: false, Action: "USBMount", Message: "USB 设备标识不能为空"}, nil
 	}
 
 	if !mount {
@@ -201,7 +201,7 @@ func (d *VirtualBoxDriver) MountUSB(vmUUID string, usbKey string, mount bool) (*
 	// usbKey 为宿主机块设备路径（如 /dev/sdb 或 \\.\PhysicalDrive1）
 	if _, err := os.Stat(usbKey); err != nil {
 		return &model.ZMessage{Success: false, Action: "USBMount",
-			Message: "USB设备路径不存在: " + usbKey}, nil
+			Message: "USB 设备路径不存在: " + usbKey}, nil
 	}
 	if out, err := d.execVBox("storageattach", vmUUID, "--storagectl", "SATA",
 		"--port", "2", "--device", "0", "--type", "hdd", "--medium", usbKey); err != nil {

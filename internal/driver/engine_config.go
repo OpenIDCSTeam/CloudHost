@@ -36,8 +36,8 @@ var engineConfigs = []EngineMeta{
 		CPUArch:     []string{"x86_64"},
 		Optional:    map[string]string{},
 		Messages: []string{
-			"1、不支持PCI设备直通，但可分配虚拟显存",
-			"2、支持USB设备直通",
+			"1、不支持PCI 设备直通，但可分配虚拟显存",
+			"2、支持USB 设备直通",
 		},
 		BanInit: []string{"gpu_num"},
 		BanEdit: []string{"gpu_num"},
@@ -54,7 +54,7 @@ var engineConfigs = []EngineMeta{
 		Messages: []string{
 			"1、不支持分配GPU设备，不支持设置显存的大小",
 			"2、不支持挂载ISO镜像、不支持挂载额外的硬盘",
-			"3、不支持PCI和USB设备直通",
+			"3、不支持PCI和USB 设备直通",
 		},
 		BanInit: []string{"gpu_num", "gpu_mem"},
 		BanEdit: []string{"gpu_num", "gpu_mem", "flu_num", "hdd_num", "speed_u", "speed_d"},
@@ -71,7 +71,7 @@ var engineConfigs = []EngineMeta{
 		Messages: []string{
 			"1、不支持分配GPU设备，不支持设置显存的大小",
 			"2、不支持挂载ISO镜像、不支持挂载额外的硬盘",
-			"3、不支持PCI和USB设备直通",
+			"3、不支持PCI和USB 设备直通",
 		},
 		BanInit: []string{"gpu_num", "gpu_mem"},
 		BanEdit: []string{"gpu_num", "gpu_mem", "flu_num", "hdd_num", "speed_u", "speed_d"},
@@ -99,7 +99,7 @@ var engineConfigs = []EngineMeta{
 		CPUArch:     []string{"x86_64"},
 		Optional:    map[string]string{},
 		Messages: []string{
-			"1、无法单独限制上下行带宽，取二者最低值分配",
+			"1、支持按虚拟机分别限制上行/下行带宽（内置 NetLimiter 限速驱动，需管理员权限加载）",
 			"2、不支持USB直通，支持GPU PV和DDA设备直通",
 		},
 		BanInit: []string{},
@@ -129,7 +129,7 @@ var engineConfigs = []EngineMeta{
 		Optional:    map[string]string{},
 		Messages: []string{
 			"1、通过VBoxManage命令行管理虚拟机",
-			"2、支持USB设备直通（需要VirtualBox扩展包）",
+			"2、支持USB 设备直通（需要VirtualBox扩展包）",
 			"3、远程桌面通过VRDE（RDP协议）实现",
 		},
 		BanInit: []string{"gpu_num"},
@@ -146,7 +146,7 @@ var engineConfigs = []EngineMeta{
 		Optional:    map[string]string{},
 		Messages: []string{
 			"1、通过virsh/libvirt管理QEMU/KVM虚拟机",
-			"2、支持PCI/USB设备直通",
+			"2、支持PCI/USB 设备直通",
 			"3、VNC远程桌面（自动分配端口）",
 			"4、修改密码需要虚拟机安装qemu-guest-agent",
 		},
@@ -208,7 +208,7 @@ var engineConfigs = []EngineMeta{
 		CPUArch:     []string{"x86_64", "aarch64"},
 		Optional:    map[string]string{},
 		Messages: []string{
-			"1、云平台不支持PCI/USB设备直通",
+			"1、云平台不支持PCI/USB 设备直通",
 			"2、通过HTTP API远程管理虚拟机",
 		},
 		BanInit: []string{"gpu_num", "gpu_mem"},

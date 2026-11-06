@@ -304,6 +304,10 @@ func (app *App) registerRoutes() {
 		api.GET("/token/current", adminMW, app.handleTokenCurrent)
 		api.POST("/token/set", adminMW, app.handleTokenSet)
 		api.POST("/token/reset", adminMW, app.handleTokenReset)
+		// 带宽限速驱动（Hyper-V，驱动为机器级内核组件，需管理员）
+		api.GET("/system/bandwidth_driver", adminMW, app.handleBandwidthDriverStatus)
+		api.POST("/system/bandwidth_driver/install", adminMW, app.handleBandwidthDriverInstall)
+		api.POST("/system/bandwidth_driver/uninstall", adminMW, app.handleBandwidthDriverUninstall)
 		api.GET("/system/logger/detail", app.handleLoggerDetail)
 		api.GET("/system/logger/stats", app.handleLoggerStats)
 		api.POST("/system/logger/clear", app.handleLoggerClear)

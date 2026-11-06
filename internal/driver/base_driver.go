@@ -522,12 +522,12 @@ func (b *BaseDriver) GetGPUList() (map[string]*model.VFConfig, error) {
 	return make(map[string]*model.VFConfig), nil
 }
 
-// GetPCIList 获取PCI设备列表（默认返回空，子类覆盖）
+// GetPCIList 获取PCI 设备列表（默认返回空，子类覆盖）
 func (b *BaseDriver) GetPCIList() (map[string]*model.VFConfig, error) {
 	return make(map[string]*model.VFConfig), nil
 }
 
-// GetUSBList 获取USB设备列表（默认返回空，子类覆盖）
+// GetUSBList 获取USB 设备列表（默认返回空，子类覆盖）
 func (b *BaseDriver) GetUSBList() (map[string]*model.USBInfos, error) {
 	return make(map[string]*model.USBInfos), nil
 }
@@ -555,12 +555,12 @@ func (b *BaseDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey string,
 
 	if add {
 		if _, exists := vmCfg.PciAll[pciKey]; exists {
-			return &model.ZMessage{Success: false, Action: "PCISetup", Message: "PCI设备已存在"}, nil
+			return &model.ZMessage{Success: false, Action: "PCISetup", Message: "PCI 设备已存在"}, nil
 		}
 		vmCfg.PciAll[pciKey] = *cfg
 	} else {
 		if _, exists := vmCfg.PciAll[pciKey]; !exists {
-			return &model.ZMessage{Success: false, Action: "PCISetup", Message: "PCI设备不存在"}, nil
+			return &model.ZMessage{Success: false, Action: "PCISetup", Message: "PCI 设备不存在"}, nil
 		}
 		delete(vmCfg.PciAll, pciKey)
 	}
@@ -570,7 +570,7 @@ func (b *BaseDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey string,
 		action = "移除"
 	}
 	return &model.ZMessage{Success: true, Action: "PCISetup",
-		Message: "PCI设备" + action + "成功"}, nil
+		Message: "PCI 设备" + action + "成功"}, nil
 }
 
 // SetupUSB USB直通（默认实现：记录到配置，无需关机）
@@ -589,12 +589,12 @@ func (b *BaseDriver) SetupUSB(vmUUID string, info *model.USBInfos, usbKey string
 
 	if add {
 		if _, exists := vmCfg.UsbAll[usbKey]; exists {
-			return &model.ZMessage{Success: false, Action: "USBMount", Message: "USB设备KEY已存在"}, nil
+			return &model.ZMessage{Success: false, Action: "USBMount", Message: "USB 设备KEY已存在"}, nil
 		}
 		vmCfg.UsbAll[usbKey] = *info
 	} else {
 		if _, exists := vmCfg.UsbAll[usbKey]; !exists {
-			return &model.ZMessage{Success: false, Action: "USBMount", Message: "USB设备不存在"}, nil
+			return &model.ZMessage{Success: false, Action: "USBMount", Message: "USB 设备不存在"}, nil
 		}
 		delete(vmCfg.UsbAll, usbKey)
 	}
@@ -604,7 +604,7 @@ func (b *BaseDriver) SetupUSB(vmUUID string, info *model.USBInfos, usbKey string
 		action = "卸载"
 	}
 	return &model.ZMessage{Success: true, Action: "USBMount",
-		Message: "USB设备" + action + "成功"}, nil
+		Message: "USB 设备" + action + "成功"}, nil
 }
 
 // MountHDD 挂载数据盘（默认实现）

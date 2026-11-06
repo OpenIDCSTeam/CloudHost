@@ -300,7 +300,7 @@ func extractVidPid(hw string) (string, string) {
 // MountUSB 挂载 / 卸载 USB 存储（以宿主物理磁盘直通方式附加）
 func (d *HyperVDriver) MountUSB(vmUUID string, usbKey string, mount bool) (*model.ZMessage, error) {
 	if strings.TrimSpace(usbKey) == "" {
-		return &model.ZMessage{Success: false, Action: "USBMount", Message: "USB设备标识不能为空"}, nil
+		return &model.ZMessage{Success: false, Action: "USBMount", Message: "USB 设备标识不能为空"}, nil
 	}
 
 	if !mount {

@@ -531,7 +531,7 @@ func (d *VirtualBoxDriver) SetupUSB(vmUUID string, info *model.USBInfos, usbKey 
 	if !add {
 		text = "移除"
 	}
-	return &model.ZMessage{Success: true, Action: "USBSetup", Message: "USB设备" + text + "成功"}, nil
+	return &model.ZMessage{Success: true, Action: "USBSetup", Message: "USB 设备" + text + "成功"}, nil
 }
 
 // SetPassword 通过 guestcontrol 修改虚拟机密码

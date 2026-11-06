@@ -50,16 +50,16 @@ type HostDriver interface {
 	// GetGPUList 获取GPU设备列表
 	GetGPUList() (map[string]*model.VFConfig, error)
 
-	// GetPCIList 获取PCI设备列表
+	// GetPCIList 获取PCI 设备列表
 	GetPCIList() (map[string]*model.VFConfig, error)
 
-	// GetUSBList 获取USB设备列表
+	// GetUSBList 获取USB 设备列表
 	GetUSBList() (map[string]*model.USBInfos, error)
 
-	// SetupPCI PCI设备直通操作
+	// SetupPCI PCI 设备直通操作
 	SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey string, add bool) (*model.ZMessage, error)
 
-	// SetupUSB USB设备直通操作
+	// SetupUSB USB 设备直通操作
 	SetupUSB(vmUUID string, info *model.USBInfos, usbKey string, add bool) (*model.ZMessage, error)
 
 	// MountHDD 挂载/卸载数据盘
@@ -118,6 +118,20 @@ type HostDriver interface {
 
 	// Crontab 执行定时任务（状态同步）
 	Crontab() bool
+}
+
+// BandwidthDriverProvider 可选接口：由主机驱动管理本机内核限速驱动的安装 / 卸载。
+//
+// 仅 Hyper-V（Windows）实现。主控在主机加载时调用 EnsureBandwidthDriver 预置驱动，
+// 主机被删除且本机已无其它 Hyper-V 主机时调用 UninstallBandwidthDriver 回收，
+// 避免 WFP 过滤器与限速规则长期驻留。
+type BandwidthDriverProvider interface {
+	// EnsureBandwidthDriver 安装并启动限速驱动（幂等），已就绪时立即返回。
+	EnsureBandwidthDriver() error
+	// UninstallBandwidthDriver 停止并删除内核服务与驱动文件。
+	UninstallBandwidthDriver() error
+	// BandwidthDriverStatus 返回驱动状态（installed / running / rules 等）。
+	BandwidthDriverStatus() map[string]interface{}
 }
 
 // NewDriver 根据主机类型创建对应驱动，并回填最外层实例引用

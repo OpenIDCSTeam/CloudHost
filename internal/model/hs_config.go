@@ -50,6 +50,13 @@ type HSConfig struct {
 	IPAddrMaps map[string]map[string]interface{} `json:"ipaddr_maps"` // IP地址映射
 	PublicAddr []string            `json:"public_addr"` // 公共IP列表
 	ExtendData map[string]interface{} `json:"extend_data"` // 扩展数据
+	// 反向代理与 VNC 对外配置
+	// ProxyMode: direct=主控与平台同机，Caddy 直连虚拟机内网 IP；
+	//            relay =主控与平台分离，Caddy 经爱快公网地址中转。
+	ProxyMode string `json:"proxy_mode" db:"proxy_mode"`
+	RelayAddr string `json:"relay_addr" db:"relay_addr"` // 中转地址，留空取 public_addr[0]
+	VncIP     string `json:"vnc_ip" db:"vnc_ip"`         // VNC 连接目标 IP，留空取平台地址
+	VncWan    string `json:"vnc_wan" db:"vnc_wan"`       // VNC 对外地址（如 vnc.example.com:6080）
 	// 套餐划分
 	ServerPlan map[string]*VMConfig `json:"server_plan"` // 套餐配置
 	// 售价配置

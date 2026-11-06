@@ -215,7 +215,7 @@ func (i IMConfig) MarshalJSON() ([]byte, error) {
 	return json.Marshal(a)
 }
 
-// VFConfig PCI设备配置
+// VFConfig PCI 设备配置
 type VFConfig struct {
 	PciKey  string `json:"pci_key"`  // 设备Key
 	GpuUUID string `json:"gpu_uuid"` // GPU UUID
@@ -223,7 +223,7 @@ type VFConfig struct {
 	GpuHint string `json:"gpu_hint"` // 设备描述
 }
 
-// USBInfos USB设备信息
+// USBInfos USB 设备信息
 type USBInfos struct {
 	UsbKey  string `json:"usb_key"`  // 设备Key
 	VidUUID string `json:"vid_uuid"` // VID
@@ -523,8 +523,8 @@ type VMConfig struct {
 	NicAll  map[string]NCConfig `json:"nic_all"` // 网卡配置
 	HddAll  map[string]SDConfig `json:"hdd_all"` // 数据盘配置
 	IsoAll  map[string]IMConfig `json:"iso_all"` // ISO配置
-	PciAll  map[string]VFConfig `json:"pci_all"` // PCI设备
-	UsbAll  map[string]USBInfos `json:"usb_all"` // USB设备
+	PciAll  map[string]VFConfig `json:"pci_all"` // PCI 设备
+	UsbAll  map[string]USBInfos `json:"usb_all"` // USB 设备
 	EfiAll  []BootOpts          `json:"efi_all"` // 启动项
 	NatAll  []PortData          `json:"nat_all"` // NAT端口
 	WebAll  []WebProxy          `json:"web_all"` // 反向代理

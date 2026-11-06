@@ -168,14 +168,14 @@ function idcserver_ConfigOptions()
         // PCIe/USB
         'pci_ids' => [
             'type'        => 'text',
-            'name'        => '分配PCI设备ID',
+            'name'        => '分配PCI 设备ID',
             'description' => '分配设备ID或MDEV',
             'default'     => '',
             'key'         => 'pci_ids',
         ],
         'usb_ids' => [
             'type'        => 'text',
-            'name'        => '分配USB设备ID',
+            'name'        => '分配USB 设备ID',
             'description' => '分配设备 VID:PID',
             'default'     => '',
             'key'         => 'usb_ids',

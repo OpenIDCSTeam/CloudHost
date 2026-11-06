@@ -847,6 +847,23 @@ func (app *App) buildConsoleURL(c *gin.Context, d driver.HostDriver, hsName, vmU
 
 	cfg := d.GetConfig()
 
+	// VNC 对外地址可能经过反向代理：
+	//   vnc_wan 完整对外地址（host[:port]）优先；
+	//   vnc_ip  仅替换主机名（端口仍用本地 6080）。
+	consoleHost, consolePort := consoleHostFromRequest(c, cfg), vncProxyPort
+	if cfg != nil {
+		if v := strings.TrimSpace(cfg.VncWan); v != "" {
+			if h, p := splitHostPortLoose(v); h != "" {
+				consoleHost = h
+				if p > 0 {
+					consolePort = p
+				}
+			}
+		} else if v := strings.TrimSpace(cfg.VncIP); v != "" {
+			consoleHost = v
+		}
+	}
+
 	// Proxmox：走官方 vncwebsocket 通道。
 	// vncproxy 返回的端口只绑在节点本地，且该通道用 ticket 鉴权、
 	// 不需要（也没有）VNC 密码。原实现按裸 TCP 连接这个端口，
@@ -866,7 +883,7 @@ func (app *App) buildConsoleURL(c *gin.Context, d driver.HostDriver, hsName, vmU
 		}
 		token := registerPVEVNCToken(hsName, vmUUID, apiHost, node, vmid, vncPort, ticket, cookie, csrf)
 		// password 是 QEMU 的 VNC 密码（ticket 前 8 位），不带就过不了认证
-		return composeConsoleURL("http", consoleHostFromRequest(c, cfg), vncProxyPort, token, password)
+		return composeConsoleURL("http", consoleHost, consolePort, token, password)
 	}
 
 	host := ""
@@ -894,7 +911,22 @@ func (app *App) buildConsoleURL(c *gin.Context, d driver.HostDriver, hsName, vmU
 
 	// 注册一次性 token，供 6080 的 /websockify 校验
 	token := registerVNCBridgeToken(hsName, vmUUID, host, port)
-	return composeConsoleURL("http", consoleHostFromRequest(c, cfg), vncProxyPort, token, password)
+	return composeConsoleURL("http", consoleHost, consolePort, token, password)
+}
+
+// splitHostPortLoose 解析「host[:port]」，容忍带 scheme 与末尾斜杠的写法。
+func splitHostPortLoose(v string) (string, int) {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(strings.TrimPrefix(v, "http://"), "https://")
+	v = strings.TrimPrefix(strings.TrimPrefix(v, "ws://"), "wss://")
+	v = strings.TrimSuffix(v, "/")
+	if h, p, err := net.SplitHostPort(v); err == nil {
+		if n, convErr := strconv.Atoi(p); convErr == nil {
+			return h, n
+		}
+		return h, 0
+	}
+	return v, 0
 }
 
 // generateVNCPassword 生成 8 位随机 VNC 密码（去掉易混淆字符）。
@@ -1175,12 +1207,25 @@ func (app *App) handleVMStatus(c *gin.Context) {
 		return
 	}
 
+	// 只保留「上报数据」：调度器每轮采集也会写一条
+	// {"vm_state":"running","on_update":...} 到同一张表，
+	// 这类记录没有任何资源指标，混进来会让前端的「最新状态」取到空值，
+	// 看起来像「上报了但后端看不到」。
 	history := make([]interface{}, 0, len(statusList))
 	for _, s := range statusList {
 		var data interface{}
-		if err := json.Unmarshal([]byte(s), &data); err == nil {
-			history = append(history, data)
+		if err := json.Unmarshal([]byte(s), &data); err != nil {
+			continue
 		}
+		if m, ok := data.(map[string]interface{}); ok {
+			_, hasCPU := m["cpu_total"]
+			_, hasMem := m["mem_total"]
+			_, hasAC := m["ac_status"]
+			if !hasCPU && !hasMem && !hasAC {
+				continue
+			}
+		}
+		history = append(history, data)
 	}
 
 	// DB 查询按 on_update DESC 取最近 100 条，但前端与图表都按升序消费：

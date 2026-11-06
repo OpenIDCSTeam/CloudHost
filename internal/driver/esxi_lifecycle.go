@@ -15,7 +15,7 @@ import (
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/model"
 )
 
-// SetupPCI PCI设备直通（需关机）
+// SetupPCI PCI 设备直通（需关机）
 func (d *ESXiDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey string, add bool) (*model.ZMessage, error) {
 	vm, err := d.findVM(vmUUID)
 	if err != nil {
@@ -76,10 +76,10 @@ func (d *ESXiDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey string,
 	d.mu.Unlock()
 
 	return &model.ZMessage{Success: true, Action: "PCISetup",
-		Message: "PCI设备" + actionText + "成功"}, nil
+		Message: "PCI 设备" + actionText + "成功"}, nil
 }
 
-// SetupUSB USB设备直通（无需关机）
+// SetupUSB USB 设备直通（无需关机）
 func (d *ESXiDriver) SetupUSB(vmUUID string, info *model.USBInfos, usbKey string, add bool) (*model.ZMessage, error) {
 	vm, err := d.findVM(vmUUID)
 	if err != nil {
@@ -141,7 +141,7 @@ func (d *ESXiDriver) SetupUSB(vmUUID string, info *model.USBInfos, usbKey string
 	d.mu.Unlock()
 
 	return &model.ZMessage{Success: true, Action: "USBSetup",
-		Message: "USB设备" + actionText + "成功"}, nil
+		Message: "USB 设备" + actionText + "成功"}, nil
 }
 
 // findPCIDevice 查找指定 PCI 直通设备
@@ -159,7 +159,7 @@ func (d *ESXiDriver) findPCIDevice(vm *object.VirtualMachine, pciID string) (typ
 			return dev, nil
 		}
 	}
-	return nil, fmt.Errorf("PCI设备不存在")
+	return nil, fmt.Errorf("PCI 设备不存在")
 }
 
 // findUSBDevice 查找指定 USB 设备
@@ -177,7 +177,7 @@ func (d *ESXiDriver) findUSBDevice(vm *object.VirtualMachine, vendor, product in
 			return dev, nil
 		}
 	}
-	return nil, fmt.Errorf("USB设备不存在")
+	return nil, fmt.Errorf("USB 设备不存在")
 }
 
 // reconfigure 提交设备变更并等待完成

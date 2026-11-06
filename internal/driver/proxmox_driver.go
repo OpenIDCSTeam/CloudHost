@@ -1498,7 +1498,7 @@ func (d *ProxmoxDriver) getVMIDNoLock(vmUUID string) (int64, error) {
 
 // GetGPUList / GetPCIList 已迁移至 proxmox_ext.go（SSH lspci -nn 真实枚举）。
 
-// SetupPCI PCI设备直通操作
+// SetupPCI PCI 设备直通操作
 func (d *ProxmoxDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey string, add bool) (*model.ZMessage, error) {
 	ctx := d.Ctx(vmUUID)
 
@@ -1508,7 +1508,7 @@ func (d *ProxmoxDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey stri
 	}
 
 	if add {
-		// 添加PCI设备
+		// 添加PCI 设备
 		if _, err := vm.Config(ctx, proxmox.VirtualMachineOption{
 			Name:  "hostpci0",
 			Value: pciKey + ",pcie=1",
@@ -1522,7 +1522,7 @@ func (d *ProxmoxDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey stri
 		}
 		d.mu.Unlock()
 	} else {
-		// 移除PCI设备
+		// 移除PCI 设备
 		if _, err := vm.Config(ctx, proxmox.VirtualMachineOption{
 			Name:  "delete",
 			Value: "hostpci0",
@@ -1540,7 +1540,7 @@ func (d *ProxmoxDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey stri
 	if !add {
 		action = "移除"
 	}
-	return &model.ZMessage{Success: true, Action: "PCISetup", Message: "PCI设备" + action + "成功"}, nil
+	return &model.ZMessage{Success: true, Action: "PCISetup", Message: "PCI 设备" + action + "成功"}, nil
 }
 
 // ============================================================
@@ -1549,7 +1549,7 @@ func (d *ProxmoxDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey stri
 
 // GetUSBList 已迁移至 proxmox_ext.go（SSH lsusb 真实枚举）。
 
-// SetupUSB USB设备直通操作
+// SetupUSB USB 设备直通操作
 func (d *ProxmoxDriver) SetupUSB(vmUUID string, info *model.USBInfos, usbKey string, add bool) (*model.ZMessage, error) {
 	ctx := d.Ctx(vmUUID)
 
@@ -1589,7 +1589,7 @@ func (d *ProxmoxDriver) SetupUSB(vmUUID string, info *model.USBInfos, usbKey str
 	if !add {
 		action = "移除"
 	}
-	return &model.ZMessage{Success: true, Action: "USBSetup", Message: "USB设备" + action + "成功"}, nil
+	return &model.ZMessage{Success: true, Action: "USBSetup", Message: "USB 设备" + action + "成功"}, nil
 }
 
 // ============================================================

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -120,6 +121,8 @@ func (s *HostService) DeleteHost(hsName string) error {
 	old := s.drivers[hsName]
 	delete(s.drivers, hsName)
 	s.mu.Unlock()
+	// 主机已移出本机：回收内核限速驱动与残留规则
+	s.releaseBandwidthDriver(old)
 	shutdownDriver(old)
 	return nil
 }
@@ -139,6 +142,9 @@ func (s *HostService) SetHostEnable(hsName string, enable bool) error {
 		old := s.drivers[hsName]
 		delete(s.drivers, hsName)
 		s.mu.Unlock()
+		// 禁用即停止纳管：回收内核限速驱动，避免旧规则继续卡住虚拟机带宽；
+		// 重新启用时 initDriver 会自动装回。
+		s.releaseBandwidthDriver(old)
 		shutdownDriver(old)
 		return nil
 	}
@@ -436,6 +442,13 @@ func (s *HostService) initDriver(cfg *model.HSConfig) {
 	s.drivers[cfg.ServerName] = d
 	s.mu.Unlock()
 
+	// 主机启用/加载时预置内核限速驱动（仅 Hyper-V 实现）。
+	// 驱动就绪但规则表为空时不影响网络；失败（如非管理员）不阻断主机加载，
+	// 后续 Crontab 同步与虚拟机操作会再次尝试。
+	if p, ok := d.(driver.BandwidthDriverProvider); ok {
+		_ = p.EnsureBandwidthDriver()
+	}
+
 	// 配置重载/主机更新会用新驱动替换旧驱动：旧驱动上可能还有在等待
 	// 平台任务的 goroutine（PVE WaitFor 最长 24 小时），必须取消其
 	// 生命周期 context，否则连接与协程会一直残留。
@@ -450,6 +463,34 @@ func shutdownDriver(d driver.HostDriver) {
 	if s, ok := d.(interface{ Shutdown() }); ok {
 		s.Shutdown()
 	}
+}
+
+// releaseBandwidthDriver 主机被删除 / 禁用后回收本机内核限速驱动。
+//
+// 只有本机不再有任何 Hyper-V 主机时才真正卸载：驱动是机器级单例，
+// 多主机配置共用同一套 WFP 过滤器与规则表。
+// 注意：agent 进程退出（ShutdownAll）不卸载，避免重启期间虚拟机限速失效。
+func (s *HostService) releaseBandwidthDriver(old driver.HostDriver) {
+	if old == nil {
+		return
+	}
+	p, ok := old.(driver.BandwidthDriverProvider)
+	if !ok {
+		return
+	}
+	s.mu.Lock()
+	remain := false
+	for _, d := range s.drivers {
+		if _, isHV := d.(driver.BandwidthDriverProvider); isHV {
+			remain = true
+			break
+		}
+	}
+	s.mu.Unlock()
+	if remain {
+		return
+	}
+	_ = p.UninstallBandwidthDriver()
 }
 
 // ShutdownAll 卸载全部驱动并取消其生命周期 context。
@@ -587,6 +628,13 @@ func rowToHSConfig(row *data.HSConfigRow) (*model.HSConfig, error) {
 	cfg.NMemPrice = row.NMemPrice
 	cfg.NHddPrice = row.NHddPrice
 	cfg.NNetPrice = row.NNetPrice
+	// 反向代理 / VNC 对外配置。
+	// 这里不做「空 -> direct」的补默认值：默认语义在使用处处理，
+	// 否则导出/恢复往返时会把空值改成 direct，导致配置对比不一致。
+	cfg.ProxyMode = strings.TrimSpace(row.ProxyMode)
+	cfg.RelayAddr = strings.TrimSpace(row.RelayAddr)
+	cfg.VncIP = strings.TrimSpace(row.VncIP)
+	cfg.VncWan = strings.TrimSpace(row.VncWan)
 
 	// 解析JSON字段
 	if row.SystemMaps != "" && row.SystemMaps != "{}" && row.SystemMaps != "[]" {
@@ -801,6 +849,10 @@ func hsConfigToRow(cfg *model.HSConfig) (*data.HSConfigRow, error) {
 		IPAddrMaps: string(ipAddrMapsJSON),
 		IPAddrDDNS: string(ipAddrDDNSJSON),
 		ServerPlan: string(serverPlanJSON),
+		ProxyMode:  cfg.ProxyMode,
+		RelayAddr:  cfg.RelayAddr,
+		VncIP:      cfg.VncIP,
+		VncWan:     cfg.VncWan,
 	}, nil
 }
 

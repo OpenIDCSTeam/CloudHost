@@ -179,8 +179,9 @@ func (d *QEMUDriver) nextFreeVdLetter(vmUUID string) string {
 // DeleteHDD 删除数据盘：先卸载，再删除平台上的真实卷文件。
 //
 // 与 Python 版 QEMUService.RMMounts 对齐：
-//   virsh detach-disk <vm> <target> --persistent
-//   删除底层 qcow2 文件
+//
+//	virsh detach-disk <vm> <target> --persistent
+//	删除底层 qcow2 文件
 //
 // 这是破坏性操作，任一步失败都必须如实返回，不能只改内存。
 func (d *QEMUDriver) DeleteHDD(vmUUID string, hddName string) (*model.ZMessage, error) {
@@ -380,7 +381,7 @@ func (d *QEMUDriver) GetUSBList() (map[string]*model.USBInfos, error) {
 // SetupPCI PCI/GPU 直通（hostdev 挂载，需关机）
 func (d *QEMUDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey string, add bool) (*model.ZMessage, error) {
 	if cfg == nil {
-		return &model.ZMessage{Success: false, Action: "PCISetup", Message: "PCI设备信息为空"}, nil
+		return &model.ZMessage{Success: false, Action: "PCISetup", Message: "PCI 设备信息为空"}, nil
 	}
 	if d.GetPower(vmUUID) == "运行中" {
 		return &model.ZMessage{Success: false, Action: "PCISetup", Message: "PCI直通需要先关闭虚拟机"}, nil
@@ -423,7 +424,7 @@ func (d *QEMUDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey string,
 	if !add {
 		action = "移除"
 	}
-	return &model.ZMessage{Success: true, Action: "PCISetup", Message: "PCI设备" + action + "成功"}, nil
+	return &model.ZMessage{Success: true, Action: "PCISetup", Message: "PCI 设备" + action + "成功"}, nil
 }
 
 // applyDeviceXML 把设备 XML 写到临时文件后 attach/detach
@@ -455,7 +456,7 @@ func (d *QEMUDriver) applyDeviceXML(vmUUID, kind, xml string, add bool) error {
 // 与 Python 版 QEMUService 一致：以 hostdev usb 形式挂载按 VID/PID 匹配的设备。
 func (d *QEMUDriver) MountUSB(vmUUID string, usbKey string, mount bool) (*model.ZMessage, error) {
 	if strings.TrimSpace(usbKey) == "" {
-		return &model.ZMessage{Success: false, Action: "USBMount", Message: "USB设备标识不能为空"}, nil
+		return &model.ZMessage{Success: false, Action: "USBMount", Message: "USB 设备标识不能为空"}, nil
 	}
 
 	d.mu.RLock()
@@ -469,7 +470,7 @@ func (d *QEMUDriver) MountUSB(vmUUID string, usbKey string, mount bool) (*model.
 	pid := strings.TrimPrefix(info.PidUUID, "0x")
 	if vid == "" || pid == "" {
 		return &model.ZMessage{Success: false, Action: "USBMount",
-			Message: "USB设备缺少 VID/PID，无法挂载"}, nil
+			Message: "USB 设备缺少 VID/PID，无法挂载"}, nil
 	}
 
 	usbXML := fmt.Sprintf(`<hostdev mode='subsystem' type='usb' managed='yes'>

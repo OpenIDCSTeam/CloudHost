@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/model"
@@ -194,7 +195,15 @@ func (d *DockerDriver) GetVMList() (map[string]*model.VMConfig, error) {
 // ============================================================
 
 // HyperVDriver Hyper-V 驱动
-type HyperVDriver struct{ *BaseDriver }
+type HyperVDriver struct {
+	*BaseDriver
+	// hvLimitMu 保护限速驱动的节流时间与开关状态
+	hvLimitMu sync.Mutex
+	// hvLimitAt 上一次全量同步限速规则的时间
+	hvLimitAt time.Time
+	// hvLimitOff 管理员显式卸载驱动后置位，抑制后台自动重装
+	hvLimitOff bool
+}
 
 func NewHyperVDriver(cfg *model.HSConfig) *HyperVDriver {
 	return &HyperVDriver{BaseDriver: NewBaseDriver(cfg)}

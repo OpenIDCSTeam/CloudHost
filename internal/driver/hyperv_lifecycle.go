@@ -181,11 +181,29 @@ func (d *HyperVDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	d.VmSaving[vmName] = cfg
 	d.mu.Unlock()
 
-	return &model.ZMessage{Success: true, Action: "VMCreate", Message: "虚拟机创建成功"}, nil
+	// 按虚拟机网卡 MAC 下发上下行限速（失败不影响创建结果，仅提示原因）
+	limitErr := d.hvApplyVMBandwidth(cfg)
+
+	return &model.ZMessage{Success: true, Action: "VMCreate",
+		Message: "虚拟机创建成功" + hvLimitWarn(limitErr)}, nil
 }
 
 // DeleteVM 删除虚拟机
 func (d *HyperVDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMessage, error) {
+	// 删除前记录网卡 MAC：虚拟机不存在后无法再枚举，限速规则会残留在驱动表里
+	var staleMACs [][6]byte
+	if netLimiterAvailable() {
+		if adapters, err := d.hvNetworkAdapters(); err == nil {
+			d.mu.RLock()
+			cfg := d.VmSaving[vmUUID]
+			d.mu.RUnlock()
+			if cfg == nil {
+				cfg = &model.VMConfig{VmUUID: vmUUID}
+			}
+			staleMACs = hvMACsOf(adapters, cfg)
+		}
+	}
+
 	script := fmt.Sprintf(
 		"Stop-VM -Id '%s' -Force -TurnOff -ErrorAction SilentlyContinue; "+
 			"Remove-VM -Id '%s' -Force -ErrorAction Stop",
@@ -196,6 +214,10 @@ func (d *HyperVDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMessa
 			Message: fmt.Sprintf("删除失败: %v (%s)", err, strings.TrimSpace(out))}, nil
 	}
 
+	for _, mac := range staleMACs {
+		_ = netLimiterClearRule(mac)
+	}
+
 	d.mu.Lock()
 	delete(d.VmSaving, vmUUID)
 	d.mu.Unlock()
@@ -203,19 +225,27 @@ func (d *HyperVDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMessa
 	return &model.ZMessage{Success: true, Action: "VMDelete", Message: "虚拟机删除成功"}, nil
 }
 
-// UpdateVM 更新虚拟机配置（CPU / 内存）
+// UpdateVM 更新虚拟机配置
+//
+// CPU / 内存属于硬件规格，Hyper-V 要求关机后修改；
+// 带宽限速由 WFP 驱动在网卡 MAC 层实时生效，可在线调整、无需关机。
 func (d *HyperVDriver) UpdateVM(cfg *model.VMConfig, oldCfg *model.VMConfig) (*model.ZMessage, error) {
-	if d.GetPower(cfg.VmUUID) == "运行中" {
+	if oldCfg == nil {
+		oldCfg = cfg
+	}
+	cpuChanged := cfg.CpuNum != oldCfg.CpuNum && cfg.CpuNum > 0
+	memChanged := cfg.MemNum != oldCfg.MemNum && cfg.MemNum > 0
+	if (cpuChanged || memChanged) && d.GetPower(cfg.VmUUID) == "运行中" {
 		return &model.ZMessage{Success: false, Action: "VMUpdate",
-			Message: "虚拟机必须关机后才能修改配置"}, nil
+			Message: "虚拟机必须关机后才能修改CPU/内存配置"}, nil
 	}
 
 	var parts []string
-	if cfg.CpuNum != oldCfg.CpuNum && cfg.CpuNum > 0 {
+	if cpuChanged {
 		parts = append(parts, fmt.Sprintf(
 			"Set-VMProcessor -VMName '%s' -Count %d -ErrorAction Stop", psEscape(cfg.VmUUID), cfg.CpuNum))
 	}
-	if cfg.MemNum != oldCfg.MemNum && cfg.MemNum > 0 {
+	if memChanged {
 		parts = append(parts, fmt.Sprintf(
 			"Set-VMMemory -VMName '%s' -StartupBytes %dMB -ErrorAction Stop", psEscape(cfg.VmUUID), cfg.MemNum))
 	}
@@ -226,11 +256,15 @@ func (d *HyperVDriver) UpdateVM(cfg *model.VMConfig, oldCfg *model.VMConfig) (*m
 		}
 	}
 
+	// 上下行带宽热更新
+	limitErr := d.hvApplyVMBandwidth(cfg)
+
 	d.mu.Lock()
 	d.VmSaving[cfg.VmUUID] = cfg
 	d.mu.Unlock()
 
-	return &model.ZMessage{Success: true, Action: "VMUpdate", Message: "虚拟机配置更新成功"}, nil
+	return &model.ZMessage{Success: true, Action: "VMUpdate",
+		Message: "虚拟机配置更新成功" + hvLimitWarn(limitErr)}, nil
 }
 
 // ReinstallVM 重装系统（断开旧盘、创建新盘并启动）
@@ -484,7 +518,7 @@ func (d *HyperVDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey strin
 	if !add {
 		text = "移除"
 	}
-	return &model.ZMessage{Success: true, Action: "PCISetup", Message: "PCI设备" + text + "成功"}, nil
+	return &model.ZMessage{Success: true, Action: "PCISetup", Message: "PCI 设备" + text + "成功"}, nil
 }
 
 // SetPassword 设置虚拟机密码（PowerShell Direct + Set-LocalUser）
@@ -542,5 +576,10 @@ func (d *HyperVDriver) Crontab() bool {
 		}
 		d.mu.Unlock()
 	}
+
+	// 周期同步上下行限速规则：驱动重载 / 主机重启后内核规则表会清空，
+	// 这里按当前配置自动补回（内部有节流，不会每轮都枚举网卡）。
+	_ = d.hvSyncBandwidth()
+
 	return true
 }

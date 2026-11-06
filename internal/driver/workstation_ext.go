@@ -263,7 +263,7 @@ func (d *WorkstationDriver) SetupUSB(vmUUID string, info *model.USBInfos, usbKey
 		action = "移除"
 	}
 	return &model.ZMessage{Success: true, Action: "USBSetup",
-		Message: fmt.Sprintf("USB设备%s成功（需重启虚拟机生效）", action)}, nil
+		Message: fmt.Sprintf("USB 设备%s成功（需重启虚拟机生效）", action)}, nil
 }
 
 // MountUSB Workstation 不支持宿主 USB 存储直挂（与 Python 版一致）

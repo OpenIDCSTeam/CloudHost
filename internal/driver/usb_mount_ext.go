@@ -26,12 +26,12 @@ import (
 func (d *ProxmoxDriver) MountUSB(vmUUID string, usbKey string, mount bool) (*model.ZMessage, error) {
 	key := strings.TrimSpace(usbKey)
 	if key == "" {
-		return &model.ZMessage{Success: false, Action: "USBMount", Message: "USB设备标识不能为空"}, nil
+		return &model.ZMessage{Success: false, Action: "USBMount", Message: "USB 设备标识不能为空"}, nil
 	}
 	parts := strings.SplitN(strings.TrimPrefix(key, "0x"), ":", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return &model.ZMessage{Success: false, Action: "USBMount",
-			Message: "USB设备标识需为 VID:PID 形式，当前为: " + key}, nil
+			Message: "USB 设备标识需为 VID:PID 形式，当前为: " + key}, nil
 	}
 	usbVal := fmt.Sprintf("host=%s:%s", strings.ToLower(parts[0]), strings.ToLower(parts[1]))
 
@@ -84,12 +84,12 @@ func (d *ProxmoxDriver) MountUSB(vmUUID string, usbKey string, mount bool) (*mod
 func (d *ESXiDriver) MountUSB(vmUUID string, usbKey string, mount bool) (*model.ZMessage, error) {
 	key := strings.TrimSpace(usbKey)
 	if key == "" {
-		return &model.ZMessage{Success: false, Action: "USBMount", Message: "USB设备标识不能为空"}, nil
+		return &model.ZMessage{Success: false, Action: "USBMount", Message: "USB 设备标识不能为空"}, nil
 	}
 	parts := strings.SplitN(strings.TrimPrefix(key, "0x"), ":", 2)
 	if len(parts) != 2 {
 		return &model.ZMessage{Success: false, Action: "USBMount",
-			Message: "USB设备标识需为 VID:PID 形式，当前为: " + key}, nil
+			Message: "USB 设备标识需为 VID:PID 形式，当前为: " + key}, nil
 	}
 	vendor, err := strconv.ParseInt(parts[0], 16, 32)
 	if err != nil {

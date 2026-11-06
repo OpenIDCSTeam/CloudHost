@@ -556,7 +556,7 @@ func (d *QEMUDriver) SetupUSB(vmUUID string, info *model.USBInfos, usbKey string
 	if !add {
 		text = "移除"
 	}
-	return &model.ZMessage{Success: true, Action: "USBSetup", Message: "USB设备" + text + "成功"}, nil
+	return &model.ZMessage{Success: true, Action: "USBSetup", Message: "USB 设备" + text + "成功"}, nil
 }
 
 // SetPassword 设置虚拟机密码（通过 qemu-guest-agent）
