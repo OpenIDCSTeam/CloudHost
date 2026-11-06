@@ -447,10 +447,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if gh release view "${{ needs.prepare.outputs.tag }}" >/dev/null 2>&1; then
-            gh release view "${{ needs.prepare.outputs.tag }}" --json assets --jq '.assets[].name' |
+          tag="${{ needs.prepare.outputs.tag }}"
+          repo="${GITHUB_REPOSITORY}"
+          if gh release view "${tag}" -R "${repo}" >/dev/null 2>&1; then
+            gh release view "${tag}" -R "${repo}" --json assets --jq '.assets[].name' |
             while read -r name; do
-              [ -n "${name}" ] && gh release delete-asset "${{ needs.prepare.outputs.tag }}" "${name}" -y || true
+              [ -n "${name}" ] && gh release delete-asset "${tag}" "${name}" -R "${repo}" -y || true
             done
           fi
 
