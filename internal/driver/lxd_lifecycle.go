@@ -137,6 +137,9 @@ func (d *LXDDriver) PowerControl(vmUUID string, action model.VMPowers) (*model.Z
 	return &model.ZMessage{Success: true, Action: "VMPowers", Message: "电源操作已执行"}, nil
 }
 
+// SupportsGracefulShutdown lxc stop 是优雅停止（向容器内进程发信号）。
+func (d *LXDDriver) SupportsGracefulShutdown() bool { return true }
+
 // CreateVM 创建容器
 func (d *LXDDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	image := cfg.OsName

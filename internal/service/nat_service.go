@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 	"sync"
@@ -363,8 +364,10 @@ func (s *NATService) UnbindStatic(hsName, ip, mac string) error {
 // 若这种情况也返回「成功」，调用方会把「什么都没做」记成「绑定成功」，
 // 让真正的配置缺失在日志里彻底消失。
 type StaticBindResult struct {
-	// Bound 实际下发成功的网卡数
+	// Bound 实际下发成功的 IPv4 绑定数
 	Bound int
+	// BoundV6 实际下发成功的 IPv6 静态分配数
+	BoundV6 int
 	// Skipped 因缺少 IP 或 MAC 而跳过的网卡描述
 	Skipped []string
 	// NoNIC 表示虚拟机没有任何网卡配置
@@ -375,6 +378,9 @@ type StaticBindResult struct {
 	NotConfigured bool
 }
 
+// Total 返回实际下发的绑定条数（IPv4 + IPv6）
+func (r StaticBindResult) Total() int { return r.Bound + r.BoundV6 }
+
 // Summary 返回便于打日志的一句话摘要
 func (r StaticBindResult) Summary() string {
 	switch {
@@ -382,11 +388,11 @@ func (r StaticBindResult) Summary() string {
 		return "主机未配置爱快路由器"
 	case r.NoNIC:
 		return "虚拟机没有网卡配置"
-	case r.Bound == 0 && len(r.Skipped) == 0:
+	case r.Total() == 0 && len(r.Skipped) == 0:
 		return "没有需要绑定的网卡"
 	default:
-		return fmt.Sprintf("成功 %d 张网卡，跳过 %d 张（%s）",
-			r.Bound, len(r.Skipped), strings.Join(r.Skipped, ", "))
+		return fmt.Sprintf("成功 IPv4 %d 条 / IPv6 %d 条，跳过 %d 张（%s）",
+			r.Bound, r.BoundV6, len(r.Skipped), strings.Join(r.Skipped, ", "))
 	}
 }
 
@@ -417,17 +423,35 @@ func (s *NATService) BindStaticForVM(hsName, vmUUID string, vm *model.VMConfig) 
 	var errs []string
 	for _, item := range sortedNics(vm.NicAll) {
 		nic := item.Nic
-		if strings.TrimSpace(nic.IP4Addr) == "" || strings.TrimSpace(nic.MacAddr) == "" {
-			res.Skipped = append(res.Skipped, fmt.Sprintf("%s(ip=%q mac=%q)",
-				item.Name, nic.IP4Addr, nic.MacAddr))
+		mac := strings.TrimSpace(nic.MacAddr)
+		ip4 := strings.TrimSpace(nic.IP4Addr)
+		ip6 := strings.TrimSpace(nic.IP6Addr)
+
+		// 没有 IP 或没有 MAC 时无法定位终端，两张表都下发不了
+		if mac == "" || (ip4 == "" && ip6 == "") {
+			res.Skipped = append(res.Skipped, fmt.Sprintf("%s(ip4=%q ip6=%q mac=%q)",
+				item.Name, nic.IP4Addr, nic.IP6Addr, nic.MacAddr))
 			continue
 		}
-		dns1, dns2 := firstDNS(nic.DNSAddr)
-		if err := s.BindStatic(hsName, vmUUID, nic.IP4Addr, nic.MacAddr, dns1, dns2); err != nil {
-			errs = append(errs, fmt.Sprintf("%s(%s): %v", nic.IP4Addr, nic.MacAddr, err))
-			continue
+
+		if ip4 != "" {
+			dns1, dns2 := firstDNS(nic.DNSAddr)
+			if err := s.BindStatic(hsName, vmUUID, ip4, mac, dns1, dns2); err != nil {
+				errs = append(errs, fmt.Sprintf("%s(%s): %v", ip4, mac, err))
+			} else {
+				res.Bound++
+			}
 		}
-		res.Bound++
+
+		// IPv6 走 DHCPv6 静态分配：MAC + 接口标识后缀，
+		// 与 IPv4 的 DHCP 静态地址是两张表，必须分别下发。
+		if ip6 != "" {
+			if err := s.BindStaticV6(hsName, vmUUID, ip6, mac); err != nil {
+				errs = append(errs, fmt.Sprintf("%s(%s): %v", ip6, mac, err))
+			} else {
+				res.BoundV6++
+			}
+		}
 	}
 	if len(errs) > 0 {
 		return res, errors.New(strings.Join(errs, "; "))
@@ -443,15 +467,71 @@ func (s *NATService) UnbindStaticForVM(hsName string, vm *model.VMConfig) error 
 	var errs []string
 	for _, item := range sortedNics(vm.NicAll) {
 		nic := item.Nic
-		if strings.TrimSpace(nic.IP4Addr) == "" {
-			continue
+		ip4 := strings.TrimSpace(nic.IP4Addr)
+		ip6 := strings.TrimSpace(nic.IP6Addr)
+
+		if ip4 != "" {
+			if err := s.UnbindStatic(hsName, ip4, nic.MacAddr); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", ip4, err))
+			}
 		}
-		if err := s.UnbindStatic(hsName, nic.IP4Addr, nic.MacAddr); err != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", nic.IP4Addr, err))
+		if ip6 != "" {
+			if err := s.UnbindStaticV6(hsName, ip6, nic.MacAddr); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", ip6, err))
+			}
 		}
 	}
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// BindStaticV6 为单个 IPv6/MAC 下发 DHCPv6 静态分配。
+//
+// 下发的是「MAC + 后缀」而不是完整地址：运营商前缀会变，
+// 只有接口标识稳定。suffix 由 NCConfig.IPv6Suffix 从实际地址推导，
+// 保证路由器绑定的后缀与网卡真实地址一致。
+func (s *NATService) BindStaticV6(hsName, vmUUID, ip6, mac string) error {
+	ip6 = strings.TrimSpace(ip6)
+	mac = strings.TrimSpace(mac)
+	if ip6 == "" || mac == "" {
+		return fmt.Errorf("IPv6 静态绑定参数不完整: ip6=%q mac=%q", ip6, mac)
+	}
+
+	nic := model.NCConfig{IP6Addr: ip6, MacAddr: mac}
+	suffix := nic.IPv6Suffix()
+	if suffix == "" {
+		return fmt.Errorf("无法从 IPv6 地址 %q 解析出接口标识后缀", ip6)
+	}
+
+	c, _, err := s.ikuaiClientFor(hsName)
+	if err != nil || c == nil {
+		return err
+	}
+	return c.addDHCPv6Static(mac, suffix, vmUUID)
+}
+
+// UnbindStaticV6 解除单个 IPv6/MAC 的静态分配；不存在时视为已解绑。
+func (s *NATService) UnbindStaticV6(hsName, ip6, mac string) error {
+	ip6 = strings.TrimSpace(ip6)
+	mac = strings.TrimSpace(mac)
+	if ip6 == "" && mac == "" {
+		return fmt.Errorf("解绑 IPv6 静态分配需要 ip6 或 mac")
+	}
+
+	suffix := ""
+	if ip6 != "" {
+		nic := model.NCConfig{IP6Addr: ip6}
+		suffix = nic.IPv6Suffix()
+	}
+
+	c, _, err := s.ikuaiClientFor(hsName)
+	if err != nil || c == nil {
+		return err
+	}
+	if err := c.deleteDHCPv6Static(mac, suffix); err != nil && !errors.Is(err, errIKuaiNotFound) {
+		return err
 	}
 	return nil
 }
@@ -506,4 +586,285 @@ func firstDNS(list []string) (string, string) {
 		d2 = strings.TrimSpace(list[1])
 	}
 	return d1, d2
+}
+
+// ============================================================
+// 公网 IPv4 分配（爱快地址转换 / 1:1 NAT）
+// ============================================================
+
+// publicAddrs 解析主机 public_addr 配置（JSON 字符串数组）。
+func publicAddrs(host *data.HSConfigRow) []string {
+	if host == nil || strings.TrimSpace(host.PublicAddr) == "" {
+		return nil
+	}
+	var list []string
+	if err := json.Unmarshal([]byte(host.PublicAddr), &list); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(list))
+	for _, item := range list {
+		if s := strings.TrimSpace(item); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// PublicIPPool 返回主机配置的可用公网地址列表。
+func (s *NATService) PublicIPPool(hsName string) ([]string, error) {
+	host, err := s.db.GetHost(hsName)
+	if err != nil {
+		return nil, fmt.Errorf("读取主机配置失败: %w", err)
+	}
+	if host == nil {
+		return nil, fmt.Errorf("主机 %s 不存在", hsName)
+	}
+	return publicAddrs(host), nil
+}
+
+// ListPublicIPs 返回主机下全部公网地址绑定关系。
+func (s *NATService) ListPublicIPs(hsName string) ([]model.PublicIPBinding, error) {
+	rules, err := s.db.ListPublicIPRules(hsName)
+	if err != nil {
+		return nil, fmt.Errorf("读取公网地址记录失败: %w", err)
+	}
+	return toPublicIPBindings(rules), nil
+}
+
+// ListVMPublicIPs 返回指定虚拟机的公网地址绑定关系。
+func (s *NATService) ListVMPublicIPs(hsName, vmUUID string) ([]model.PublicIPBinding, error) {
+	rules, err := s.db.ListVMPublicIPRules(hsName, vmUUID)
+	if err != nil {
+		return nil, fmt.Errorf("读取公网地址记录失败: %w", err)
+	}
+	return toPublicIPBindings(rules), nil
+}
+
+func toPublicIPBindings(rules []data.PublicIPRule) []model.PublicIPBinding {
+	out := make([]model.PublicIPBinding, 0, len(rules))
+	for _, r := range rules {
+		out = append(out, model.PublicIPBinding{
+			VMUUID:     r.VMUUID,
+			PublicAddr: r.PublicAddr,
+			LanAddr:    r.LanAddr,
+			MacAddr:    r.MacAddr,
+			Comment:    r.Comment,
+			CreatedAt:  r.CreatedAt,
+		})
+	}
+	return out
+}
+
+// AllocatePublicIP 为虚拟机分配一个公网 IPv4，并在爱快上下发地址转换规则。
+//
+// 参数：
+//   - publicAddr 为空时从主机 public_addr 池中挑第一个未占用的地址；
+//   - lanAddr 为空时取虚拟机第一块已分配 IPv4 的网卡。
+//
+// 虚拟机的网卡地址仍然保持内网 IP：公网地址由爱快做 1:1 转换，
+// 直接把公网地址配到网卡上会和路由器的 WAN 网段冲突。
+func (s *NATService) AllocatePublicIP(hsName, vmUUID, publicAddr, lanAddr, comment string) (*model.PublicIPBinding, error) {
+	host, err := s.db.GetHost(hsName)
+	if err != nil {
+		return nil, fmt.Errorf("读取主机配置失败: %w", err)
+	}
+	if host == nil {
+		return nil, fmt.Errorf("主机 %s 不存在", hsName)
+	}
+	if strings.TrimSpace(host.IKuaiAddr) == "" {
+		return nil, fmt.Errorf("主机 %s 未配置爱快路由器：公网地址分配依赖爱快的地址转换功能", hsName)
+	}
+	if _, ok := s.provider(hsName); ok {
+		return nil, fmt.Errorf("主机 %s 使用平台自有网络通道，不支持爱快地址转换", hsName)
+	}
+
+	pool := publicAddrs(host)
+	if len(pool) == 0 {
+		return nil, fmt.Errorf("主机 %s 未配置公网地址池（public_addr）", hsName)
+	}
+
+	lanAddr = strings.TrimSpace(lanAddr)
+	if lanAddr == "" {
+		lanAddr = s.vmPrimaryIP(hsName, vmUUID)
+	}
+	if lanAddr == "" {
+		return nil, fmt.Errorf("缺少内网地址：请先为虚拟机网卡分配 IPv4 地址")
+	}
+	if ip := net.ParseIP(lanAddr); ip == nil || ip.To4() == nil {
+		return nil, fmt.Errorf("内网地址 %q 不是合法的 IPv4 地址", lanAddr)
+	}
+
+	existing, err := s.db.ListPublicIPRules(hsName)
+	if err != nil {
+		return nil, fmt.Errorf("读取公网地址占用失败: %w", err)
+	}
+	// used: 公网地址 → 归属虚拟机；lanOwner: 内网地址 → 已绑定的公网地址
+	used := make(map[string]string, len(existing))
+	lanOwner := make(map[string]string, len(existing))
+	for _, r := range existing {
+		used[r.PublicAddr] = r.VMUUID
+		lanOwner[r.LanAddr] = r.PublicAddr
+	}
+
+	publicAddr = strings.TrimSpace(publicAddr)
+	if publicAddr == "" {
+		for _, addr := range pool {
+			if _, taken := used[addr]; !taken {
+				publicAddr = addr
+				break
+			}
+		}
+		if publicAddr == "" {
+			return nil, fmt.Errorf("主机 %s 的公网地址池已全部占用", hsName)
+		}
+	} else {
+		if !containsString(pool, publicAddr) {
+			return nil, fmt.Errorf("公网地址 %s 不在主机 %s 的地址池中", publicAddr, hsName)
+		}
+		if owner, taken := used[publicAddr]; taken && owner != vmUUID {
+			return nil, fmt.Errorf("公网地址 %s 已被虚拟机 %s 占用", publicAddr, owner)
+		}
+	}
+
+	// 1:1 转换要求内网地址唯一：同一个内网 IP 只能对应一个公网 IP。
+	// 同一对「公网 ↔ 内网」重复提交属于幂等更新，允许通过。
+	if bound, taken := lanOwner[lanAddr]; taken && bound != publicAddr {
+		return nil, fmt.Errorf("内网地址 %s 已绑定公网地址 %s，1:1 转换不允许一个内网地址对应多个公网地址", lanAddr, bound)
+	}
+
+	// 已经完全相同的绑定直接返回，避免在路由器上重复插入同名规则
+	for _, r := range existing {
+		if r.PublicAddr == publicAddr && r.LanAddr == lanAddr && r.VMUUID == vmUUID {
+			return &model.PublicIPBinding{
+				VMUUID:     r.VMUUID,
+				PublicAddr: r.PublicAddr,
+				LanAddr:    r.LanAddr,
+				MacAddr:    r.MacAddr,
+				Comment:    r.Comment,
+				CreatedAt:  r.CreatedAt,
+			}, nil
+		}
+	}
+
+	mac := s.vmNicMACByIP(hsName, vmUUID, lanAddr)
+	if strings.TrimSpace(comment) == "" {
+		comment = vmUUID
+	}
+
+	c := s.client(host.IKuaiAddr, host.IKuaiUser, host.IKuaiPass, host.IKuaiToken)
+	if c == nil {
+		return nil, fmt.Errorf("爱快路由器配置无效")
+	}
+	if err := c.addAddrTrans(publicAddr, lanAddr, comment); err != nil {
+		return nil, err
+	}
+
+	if err := s.db.UpsertPublicIPRule(hsName, vmUUID, publicAddr, lanAddr, mac, comment); err != nil {
+		// 落库失败必须把刚下发的规则撤掉，否则路由器上会留下本地无从追踪的孤儿规则
+		_ = c.deleteAddrTrans(publicAddr, lanAddr)
+		return nil, fmt.Errorf("保存公网地址记录失败: %w", err)
+	}
+
+	binding := &model.PublicIPBinding{
+		VMUUID:     vmUUID,
+		PublicAddr: publicAddr,
+		LanAddr:    lanAddr,
+		MacAddr:    mac,
+		Comment:    comment,
+	}
+	if rules, err := s.db.ListVMPublicIPRules(hsName, vmUUID); err == nil {
+		for _, r := range rules {
+			if r.PublicAddr == publicAddr {
+				binding.CreatedAt = r.CreatedAt
+				break
+			}
+		}
+	}
+	return binding, nil
+}
+
+// ReleasePublicIP 释放公网地址：先撤销爱快地址转换，再删除本地记录。
+//
+// publicAddr 为空时删除该虚拟机的全部公网地址。
+// 路由器上找不到规则视为已释放（幂等），不会阻断本地清理。
+func (s *NATService) ReleasePublicIP(hsName, vmUUID, publicAddr string) error {
+	publicAddr = strings.TrimSpace(publicAddr)
+
+	var targets []data.PublicIPRule
+	rules, err := s.db.ListPublicIPRules(hsName)
+	if err != nil {
+		return fmt.Errorf("读取公网地址记录失败: %w", err)
+	}
+	for _, r := range rules {
+		if publicAddr != "" && r.PublicAddr != publicAddr {
+			continue
+		}
+		if vmUUID != "" && r.VMUUID != vmUUID {
+			continue
+		}
+		targets = append(targets, r)
+	}
+
+	var c *ikuaiClient
+	if host, err := s.db.GetHost(hsName); err == nil && host != nil && strings.TrimSpace(host.IKuaiAddr) != "" {
+		c = s.client(host.IKuaiAddr, host.IKuaiUser, host.IKuaiPass, host.IKuaiToken)
+	}
+
+	var errs []string
+	for _, r := range targets {
+		if c != nil {
+			if delErr := c.deleteAddrTrans(r.PublicAddr, r.LanAddr); delErr != nil && !errors.Is(delErr, errIKuaiNotFound) {
+				errs = append(errs, fmt.Sprintf("%s: %v", r.PublicAddr, delErr))
+				// 下发失败时不删本地记录，保留下次重试的依据
+				continue
+			}
+		}
+		if delErr := s.db.DeletePublicIPRule(hsName, r.PublicAddr); delErr != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", r.PublicAddr, delErr))
+		}
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// ReleasePublicIPsForVM 释放虚拟机全部公网地址（删除虚拟机时调用）。
+func (s *NATService) ReleasePublicIPsForVM(hsName, vmUUID string) error {
+	rules, err := s.db.ListVMPublicIPRules(hsName, vmUUID)
+	if err != nil {
+		return fmt.Errorf("读取公网地址记录失败: %w", err)
+	}
+	if len(rules) == 0 {
+		return nil
+	}
+	return s.ReleasePublicIP(hsName, vmUUID, "")
+}
+
+// vmNicMACByIP 返回虚拟机上使用指定 IPv4 的网卡 MAC（找不到时为空）。
+func (s *NATService) vmNicMACByIP(hsName, vmUUID, ip string) string {
+	raw, err := s.db.GetVMConfig(hsName, vmUUID)
+	if err != nil || raw == "" {
+		return ""
+	}
+	vm, err := DecodeVMConfig(raw)
+	if err != nil || vm == nil {
+		return ""
+	}
+	for _, item := range sortedNics(vm.NicAll) {
+		if strings.TrimSpace(item.Nic.IP4Addr) == ip {
+			return strings.TrimSpace(item.Nic.MacAddr)
+		}
+	}
+	return ""
+}
+
+// containsString 判断字符串切片是否包含目标值（忽略首尾空白）
+func containsString(list []string, want string) bool {
+	for _, item := range list {
+		if strings.TrimSpace(item) == want {
+			return true
+		}
+	}
+	return false
 }

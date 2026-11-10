@@ -124,6 +124,12 @@ func (w *DeleteVMWorkflow) Run(hsName, vmUUID, quotaUser string) error {
 					_ = w.DB.SetTombstoneError(hsName, vmUUID, "解除静态绑定失败: "+unbindErr.Error())
 				}
 			}
+			// 公网地址转换（1:1 NAT）同样占用路由器侧资源：
+			// 不撤销会让已删除虚拟机的公网 IP 永远无法再分配出去。
+			// 失败时本地记录保留，删除流程继续（可重复执行）。
+			if relErr := w.NATSvc.ReleasePublicIPsForVM(hsName, vmUUID); relErr != nil {
+				_ = w.DB.SetTombstoneError(hsName, vmUUID, "释放公网地址失败: "+relErr.Error())
+			}
 		}
 		if err := w.DB.MarkTombstoneStep(hsName, vmUUID, data.TombstoneStepStatic, ""); err != nil {
 			return fail("记录静态绑定步骤", err)

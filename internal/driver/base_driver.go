@@ -850,6 +850,11 @@ func (b *BaseDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMessage
 	return &model.ZMessage{Success: true, Action: "VMDelete", Message: "虚拟机已删除"}, nil
 }
 
+// SupportsGracefulShutdown 平台默认不具备软关机能力：
+// 关机只能依赖 guest 内的 CloudInit 代理读取 vm_flag=ON_STOP 后自行执行。
+// 平台自带软关机接口的驱动需要覆盖此方法并返回 true。
+func (b *BaseDriver) SupportsGracefulShutdown() bool { return false }
+
 // PowerControl 电源控制（默认实现，子类覆盖）
 func (b *BaseDriver) PowerControl(vmUUID string, action model.VMPowers) (*model.ZMessage, error) {
 	b.mu.Lock()

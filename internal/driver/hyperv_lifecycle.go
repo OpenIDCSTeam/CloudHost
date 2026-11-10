@@ -144,6 +144,9 @@ func (d *HyperVDriver) PowerControl(vmUUID string, action model.VMPowers) (*mode
 	return &model.ZMessage{Success: true, Action: "VMPowers", Message: "电源操作已执行"}, nil
 }
 
+// SupportsGracefulShutdown Stop-VM（不带 -TurnOff）通过集成服务优雅关机。
+func (d *HyperVDriver) SupportsGracefulShutdown() bool { return true }
+
 // CreateVM 创建虚拟机
 func (d *HyperVDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	vmName := cfg.VmUUID

@@ -719,6 +719,9 @@ func (d *SmolVMDriver) PowerControl(vmUUID string, action model.VMPowers) (*mode
 		Message: "电源操作已执行"}, nil
 }
 
+// SupportsGracefulShutdown 软关机通过 Firecracker 的 SendCtrlAltDel 触发。
+func (d *SmolVMDriver) SupportsGracefulShutdown() bool { return true }
+
 // ScanVMs 扫描 extern_path 下的 microVM 目录
 func (d *SmolVMDriver) ScanVMs() (*model.ZMessage, error) {
 	base := d.Config.ExternPath

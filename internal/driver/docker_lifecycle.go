@@ -78,6 +78,9 @@ func (d *DockerDriver) PowerControl(vmUUID string, action model.VMPowers) (*mode
 	return &model.ZMessage{Success: true, Action: "VMPowers", Message: "电源操作已执行"}, nil
 }
 
+// SupportsGracefulShutdown docker stop 先发 SIGTERM，超时才 kill。
+func (d *DockerDriver) SupportsGracefulShutdown() bool { return true }
+
 // CreateVM 创建容器
 func (d *DockerDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	image := cfg.OsName

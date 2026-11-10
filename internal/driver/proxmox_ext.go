@@ -159,19 +159,28 @@ func (d *ProxmoxDriver) DeleteHDD(vmUUID string, hddName string) (*model.ZMessag
 	ctx := d.Ctx(vmUUID)
 	wasRunning := vm.IsRunning()
 	if wasRunning {
-		if task, err := vm.Stop(ctx); err == nil && task != nil {
+		// 优先 PVE 软关机（ACPI），让 guest 有机会落盘，超时才强制断电
+		if err := d.StopGracefully(vmUUID, gracefulStopWait); err != nil {
+			return &model.ZMessage{Success: false, Action: "RMMounts",
+				Message: "删除数据盘前关机失败: " + err.Error()}, nil
+		}
+		d.SetVMPowerState(vmUUID, model.VMPowerStopped)
+	}
+	restorePower := func() {
+		if !wasRunning {
+			return
+		}
+		if task, err := vm.Start(ctx); err == nil && task != nil {
 			_ = task.WaitFor(ctx, 120)
 		}
-		time.Sleep(2 * time.Second)
+		d.SetVMPowerState(vmUUID, model.VMPowerStarted)
 	}
 
 	// 1) 卸载设备（若非 unused 状态）
 	if !strings.HasPrefix(key, "unused") {
 		task, err := vm.Config(ctx, proxmox.VirtualMachineOption{Name: "delete", Value: key})
 		if err != nil {
-			if wasRunning {
-				_, _ = vm.Start(ctx)
-			}
+			restorePower()
 			return &model.ZMessage{Success: false, Action: "RMMounts",
 				Message: "卸载数据盘失败: " + err.Error()}, nil
 		}
@@ -211,9 +220,7 @@ func (d *ProxmoxDriver) DeleteHDD(vmUUID string, hddName string) (*model.ZMessag
 			if node, err := d.getNode(); err == nil {
 				if st, err := node.Storage(ctx, storageName); err == nil {
 					if task, err := st.DeleteContent(ctx, volid); err != nil {
-						if wasRunning {
-							_, _ = vm.Start(ctx)
-						}
+						restorePower()
 						return &model.ZMessage{Success: false, Action: "RMMounts",
 							Message: "删除存储卷失败: " + err.Error()}, nil
 					} else if task != nil {
@@ -224,11 +231,7 @@ func (d *ProxmoxDriver) DeleteHDD(vmUUID string, hddName string) (*model.ZMessag
 		}
 	}
 
-	if wasRunning {
-		if task, err := vm.Start(ctx); err == nil && task != nil {
-			_ = task.WaitFor(ctx, 120)
-		}
-	}
+	restorePower()
 
 	d.mu.Lock()
 	if cfg, ok := d.VmSaving[vmUUID]; ok {
@@ -274,32 +277,43 @@ func (d *ProxmoxDriver) TransferHDD(vmUUID string, hdd *model.SDConfig, targetVM
 
 	ctx := d.Ctx(vmUUID)
 
-	// 移交前两侧都必须关机
+	// 移交前两侧都必须关机：优先平台软关机（ACPI），超时才强制断电
 	srcWasRunning := srcVM.IsRunning()
 	dstWasRunning := dstVM.IsRunning()
-	if srcWasRunning {
-		if task, err := srcVM.Stop(ctx); err == nil && task != nil {
-			_ = task.WaitFor(ctx, 120)
-		}
-	}
-	if dstWasRunning {
-		if task, err := dstVM.Stop(ctx); err == nil && task != nil {
-			_ = task.WaitFor(ctx, 120)
-		}
-	}
-	time.Sleep(2 * time.Second)
-
 	restorePower := func() {
 		if srcWasRunning {
 			if task, err := srcVM.Start(ctx); err == nil && task != nil {
 				_ = task.WaitFor(ctx, 120)
 			}
+			d.SetVMPowerState(vmUUID, model.VMPowerStarted)
 		}
 		if dstWasRunning {
 			if task, err := dstVM.Start(ctx); err == nil && task != nil {
 				_ = task.WaitFor(ctx, 120)
 			}
+			d.SetVMPowerState(targetVM, model.VMPowerStarted)
 		}
+	}
+	if srcWasRunning {
+		if err := d.StopGracefully(vmUUID, gracefulStopWait); err != nil {
+			return &model.ZMessage{Success: false, Action: "HDDTrans",
+				Message: "源虚拟机关机失败: " + err.Error()}, nil
+		}
+		d.SetVMPowerState(vmUUID, model.VMPowerStopped)
+	}
+	if dstWasRunning {
+		if err := d.StopGracefully(targetVM, gracefulStopWait); err != nil {
+			// 目标机关不掉时源机已关机，先恢复源的电源再返回
+			if srcWasRunning {
+				if task, err := srcVM.Start(ctx); err == nil && task != nil {
+					_ = task.WaitFor(ctx, 120)
+				}
+				d.SetVMPowerState(vmUUID, model.VMPowerStarted)
+			}
+			return &model.ZMessage{Success: false, Action: "HDDTrans",
+				Message: "目标虚拟机关机失败: " + err.Error()}, nil
+		}
+		d.SetVMPowerState(targetVM, model.VMPowerStopped)
 	}
 
 	// 1) 定位源磁盘（优先 unused，其次已挂载总线位）
@@ -548,17 +562,26 @@ func (d *ProxmoxDriver) RestoreBackup(vmUUID string, backupName string) (*model.
 
 	wasRunning := vm.IsRunning()
 	if wasRunning {
-		if task, err := vm.Stop(ctx); err == nil && task != nil {
+		// 还原会覆盖系统盘：优先 PVE 软关机，让 guest 落盘，超时才强制断电
+		if err := d.StopGracefully(vmUUID, gracefulStopWait); err != nil {
+			return &model.ZMessage{Success: false, Action: "Restores",
+				Message: "还原前关机失败: " + err.Error()}, nil
+		}
+		d.SetVMPowerState(vmUUID, model.VMPowerStopped)
+	}
+	restorePower := func() {
+		if !wasRunning {
+			return
+		}
+		if task, err := vm.Start(ctx); err == nil && task != nil {
 			_ = task.WaitFor(ctx, 180)
 		}
-		time.Sleep(3 * time.Second)
+		d.SetVMPowerState(vmUUID, model.VMPowerStarted)
 	}
 
 	client, err := d.apiConn()
 	if err != nil {
-		if wasRunning {
-			_, _ = vm.Start(ctx)
-		}
+		restorePower()
 		return &model.ZMessage{Success: false, Action: "Restores", Message: err.Error()}, nil
 	}
 
@@ -569,9 +592,7 @@ func (d *ProxmoxDriver) RestoreBackup(vmUUID string, backupName string) (*model.
 	}
 	var taskID string
 	if err := client.Post(ctx, fmt.Sprintf("/nodes/%s/qemu", d.nodeName()), body, &taskID); err != nil {
-		if wasRunning {
-			_, _ = vm.Start(ctx)
-		}
+		restorePower()
 		return &model.ZMessage{Success: false, Action: "Restores",
 			Message: "恢复任务创建失败: " + err.Error()}, nil
 	}
@@ -582,11 +603,7 @@ func (d *ProxmoxDriver) RestoreBackup(vmUUID string, backupName string) (*model.
 			Message: "恢复失败: " + err.Error()}, nil
 	}
 
-	if wasRunning {
-		if task, err := vm.Start(ctx); err == nil && task != nil {
-			_ = task.WaitFor(ctx, 180)
-		}
-	}
+	restorePower()
 
 	return &model.ZMessage{Success: true, Action: "Restores", Message: "虚拟机恢复成功: " + vmUUID}, nil
 }

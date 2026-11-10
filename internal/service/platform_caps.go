@@ -1,5 +1,7 @@
 package service
 
+import "github.com/OpenIDCSTeam/HostAgent-Go/internal/driver"
+
 // PlatformCaps 描述平台支持哪些「免重启」操作。
 //
 // 前端据此决定两件事：
@@ -14,6 +16,16 @@ type PlatformCaps struct {
 	HotNIC bool `json:"hot_nic"`
 	// OfflineOnly 数据盘 / PCI / USB 变更是否必须关机
 	OfflineOnly bool `json:"offline_only"`
+	// Firewall 平台是否支持虚拟机级防火墙。
+	//
+	// 前端据此决定是否展示「防火墙」页签：不支持的平台（ESXi、QEMU、
+	// Workstation、VirtualBox、Docker、LXD 等）连入口都不出现，
+	// 而不是展示一个点进去只会报错的空页面。
+	Firewall bool `json:"firewall"`
+	// Snapshot 平台是否支持虚拟机快照。
+	//
+	// 前端据此决定是否展示「快照」页签：Docker、MEmu、SmolVM 不展示。
+	Snapshot bool `json:"snapshot"`
 }
 
 // PlatformCapabilities 按平台类型返回能力矩阵。
@@ -22,10 +34,15 @@ type PlatformCaps struct {
 // 但来宾系统是否识别取决于 guest（Windows 常见需要重启），
 // 按需重启处理更安全。
 func PlatformCapabilities(serverType string) PlatformCaps {
+	caps := PlatformCaps{
+		OfflineOnly: true,
+		// 与驱动能力共用同一判断，避免「后端说支持、驱动没实现」的错位
+		Firewall: driver.SupportsFirewallPlatform(serverType),
+		Snapshot: driver.SupportsSnapshotPlatform(serverType),
+	}
 	switch serverType {
 	case "PromoxSetup", "vSphereESXi", "VMWareSetup", "VirtualBoxs", "HyperVSetup":
-		return PlatformCaps{HotISO: true, HotNIC: false, OfflineOnly: true}
-	default:
-		return PlatformCaps{HotISO: false, HotNIC: false, OfflineOnly: true}
+		caps.HotISO = true
 	}
+	return caps
 }

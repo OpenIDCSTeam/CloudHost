@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -880,15 +881,16 @@ func (d *ProxmoxDriver) ReinstallVM(cfg *model.VMConfig) (*model.ZMessage, error
 	}
 	ctx := d.Ctx(cfg.VmUUID)
 
-	// 1. 停止虚拟机
+	// 1. 停止虚拟机：优先 PVE 软关机（ACPI），超时才强制断电
 	if vm.IsRunning() {
-		if _, err := vm.Stop(ctx); err != nil {
+		if err := d.StopGracefully(cfg.VmUUID, gracefulStopWait); err != nil {
 			return &model.ZMessage{
 				Success: false, Action: "VMReinstall",
 				Message: "停止虚拟机失败: " + err.Error(),
 			}, nil
 		}
-		time.Sleep(3 * time.Second)
+		// StopGracefully 内部会写中间态 ON_STOP，这里已确认断电，落为稳定态
+		d.SetVMPowerState(cfg.VmUUID, model.VMPowerStopped)
 	}
 
 	// 2. 卸载并删除旧系统盘（ide0）；旧盘不存在时忽略错误
@@ -923,6 +925,7 @@ func (d *ProxmoxDriver) ReinstallVM(cfg *model.VMConfig) (*model.ZMessage, error
 			Message: "系统已重装但启动失败: " + err.Error(),
 		}, nil
 	}
+	d.SetVMPowerState(cfg.VmUUID, model.VMPowerStarted)
 
 	return &model.ZMessage{Success: true, Action: "VMReinstall", Message: "系统重装成功"}, nil
 }
@@ -1039,11 +1042,12 @@ func (d *ProxmoxDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMess
 		return &model.ZMessage{Success: false, Action: "VMDelete", Message: err.Error()}, nil
 	}
 
-	// 先关机
+	// 先关机：优先 PVE 软关机（ACPI），让 guest 有机会落盘，超时才强制断电。
+	// 仍关不掉就放弃删除，避免把运行中的虚拟机直接抹掉。
 	if vm.Status == "running" {
-		task, err := vm.Stop(ctx)
-		if err == nil {
-			_ = task.WaitFor(ctx, 30)
+		if err := d.StopGracefully(vmUUID, gracefulStopWait); err != nil {
+			return &model.ZMessage{Success: false, Action: "VMDelete",
+				Message: "删除前关机失败: " + err.Error()}, nil
 		}
 	}
 
@@ -1063,6 +1067,10 @@ func (d *ProxmoxDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMess
 	return &model.ZMessage{Success: true, Action: "VMDelete", Message: "虚拟机已删除"}, nil
 }
 
+// SupportsGracefulShutdown PVE 自带软关机：/status/shutdown 由平台向 guest
+// 下发 ACPI 关机请求，不依赖 guest 内的 CloudInit 代理。
+func (d *ProxmoxDriver) SupportsGracefulShutdown() bool { return true }
+
 // PowerControl 电源控制
 func (d *ProxmoxDriver) PowerControl(vmUUID string, action model.VMPowers) (*model.ZMessage, error) {
 	ctx := d.Ctx(vmUUID)
@@ -1079,6 +1087,9 @@ func (d *ProxmoxDriver) PowerControl(vmUUID string, action model.VMPowers) (*mod
 	case model.VMPowerSStart:
 		task, taskErr = vm.Start(ctx)
 	case model.VMPowerSClose:
+		// 走 PVE 的 POST /status/shutdown（qm shutdown）：由平台向 guest
+		// 下发 ACPI 关机，这是 PVE 的软关机通道。CloudInit 代理只是兜底，
+		// 不再是发起关机的前提。
 		task, taskErr = vm.Shutdown(ctx)
 	case model.VMPowerHClose:
 		task, taskErr = vm.Stop(ctx)
@@ -1097,8 +1108,19 @@ func (d *ProxmoxDriver) PowerControl(vmUUID string, action model.VMPowers) (*mod
 	}
 
 	if task != nil {
-		if err := task.WaitFor(ctx, 30); err != nil {
-			return &model.ZMessage{Success: false, Action: "VMPowers", Message: "等待电源操作超时"}, nil
+		// 软关机是「请求」而不是「结果」：PVE 的 shutdown 任务要等 guest
+		// 真正断电才结束（qm shutdown 默认 60s），同步等待会把正常关机
+		// 误报成失败。这里只做 5 秒的即时错误探测，任务超时视为平台已受理，
+		// 最终状态交给 SoftPowerMonitor 收敛。
+		waitSeconds := 30
+		if action == model.VMPowerSClose {
+			waitSeconds = 5
+		}
+		if err := task.WaitFor(ctx, waitSeconds); err != nil {
+			if action != model.VMPowerSClose || !errors.Is(err, proxmox.ErrTimeout) {
+				return &model.ZMessage{Success: false, Action: "VMPowers", Message: "等待电源操作失败: " + err.Error()}, nil
+			}
+			log.Printf("[proxmox] %s 软关机已受理，等待 guest 完成关机", vmUUID)
 		}
 	}
 

@@ -308,7 +308,8 @@ func (e *vmTaskExecutor) bindStatic(t *task.Task, cfg *model.VMConfig) {
 	}
 	// 绑定成功属于过程细节：Debug 级别只落文件，失败与跳过才升级为 WARNING
 	e.taskLog(t, "静态IP绑定").VM(cfg.VmUUID, cfg.OsName).
-		Detail("bound", res.Bound).
+		Detail("bound_v4", res.Bound).
+		Detail("bound_v6", res.BoundV6).
 		Debug("虚拟机 %s 静态地址绑定完成：%s", cfg.VmUUID, res.Summary())
 }
 

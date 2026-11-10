@@ -270,6 +270,9 @@ func (d *WorkstationDriver) PowerControl(vmUUID string, action model.VMPowers) (
 	return &model.ZMessage{Success: true, Action: "VMPowers", Message: "电源操作已执行"}, nil
 }
 
+// SupportsGracefulShutdown vmrest 的 shutdown 走 VMware Tools 优雅关机。
+func (d *WorkstationDriver) SupportsGracefulShutdown() bool { return true }
+
 // CreateVM 创建虚拟机（生成 VMX → 注册到 vmrest）
 func (d *WorkstationDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	dir := d.Config.SystemPath

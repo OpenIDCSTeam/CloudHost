@@ -329,6 +329,9 @@ func (d *QEMUDriver) PowerControl(vmUUID string, action model.VMPowers) (*model.
 	return d.BaseDriver.PowerControl(vmUUID, action)
 }
 
+// SupportsGracefulShutdown virsh shutdown 由 libvirt 向 guest 下发 ACPI 软关机。
+func (d *QEMUDriver) SupportsGracefulShutdown() bool { return true }
+
 // GetScreenshot 截取虚拟机屏幕。
 //
 // 与 Python 版 QEMUService.VMScreen 一致：virsh screenshot 输出 PPM，

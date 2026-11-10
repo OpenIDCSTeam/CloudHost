@@ -137,6 +137,21 @@ type BandwidthDriverProvider interface {
 	BandwidthDriverStatus() map[string]interface{}
 }
 
+// GracefulShutdownDriver 可选接口：平台自身支持「软关机」。
+//
+// 返回 true 的驱动收到 model.VMPowerSClose 时必须由平台侧发起优雅关机
+// （PVE 的 /status/shutdown、vSphere 的 ShutdownGuest、Hyper-V 的 Stop-VM、
+// virsh shutdown、acpipowerbutton 等），即由平台向 guest 下发 ACPI / Tools
+// 关机请求，而不是只写一个 vm_flag=ON_STOP 让 guest 内的 CloudInit 代理
+// 自己关机。CloudInit 代理在这些平台上只作为兜底，不是关机的前置条件。
+//
+// 未实现该接口或返回 false 的驱动（如模拟器只有 stop 命令），关机仍沿用
+// guest 代理路径。
+type GracefulShutdownDriver interface {
+	// SupportsGracefulShutdown 平台是否支持由平台侧发起软关机
+	SupportsGracefulShutdown() bool
+}
+
 // NewDriver 根据主机类型创建对应驱动，并回填最外层实例引用
 func NewDriver(cfg *model.HSConfig) HostDriver {
 	d := createDriver(cfg)

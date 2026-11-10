@@ -31,14 +31,19 @@ func NewIPAllocService(db *data.DB) *IPAllocService {
 }
 
 // ipPool 单个地址池配置（对应 ipaddr_maps 中的一项）
+//
+// IPv4 池：from + nums + gate + mask（点分十进制）。
+// IPv6 池：from + nums + gate + prefix（前缀长度，如 64）。
+// 为兼容旧配置，IPv6 池也允许把前缀长度写进 mask 字段（"64"）。
 type ipPool struct {
-	Name string
-	Vers string // ipv4 / ipv6
-	Type string // nat / pub
-	From string
-	Nums int
-	Gate string
-	Mask string
+	Name   string
+	Vers   string // ipv4 / ipv6
+	Type   string // nat / pub
+	From   string
+	Nums   int
+	Gate   string
+	Mask   string
+	Prefix int // IPv6 前缀长度
 }
 
 // NetCheck 检查并自动分配虚拟机网卡 IP（对应 Python BasicServer.NetCheck）
@@ -75,6 +80,12 @@ func (s *IPAllocService) NetCheck(hsName string, vm *model.VMConfig) error {
 	}
 	sort.Strings(names)
 
+	// 主机是否配置了对应协议的地址池。
+	// 纯 IPv6 主机（只配 ipv6 池）不应因为「没有 IPv4 池」而无法创建虚拟机，
+	// 但配了 IPv4 池却分配失败时仍需报错，否则会留下没有地址的网卡。
+	hasV4Pool := hasPoolVers(pools, "ipv4")
+	hasV6Pool := hasPoolVers(pools, "ipv6")
+
 	for _, name := range names {
 		nic := vm.NicAll[name]
 		needV4 := strings.TrimSpace(nic.IP4Addr) == ""
@@ -88,8 +99,9 @@ func (s *IPAllocService) NetCheck(hsName string, vm *model.VMConfig) error {
 
 		nicType := nic.EffectiveNicType()
 
-		// 分配 IPv4：失败即返回错误（与 Python 一致）
-		if needV4 {
+		// 分配 IPv4：失败即返回错误（与 Python 一致）。
+		// 例外：主机只配置了 IPv6 池时属于纯 IPv6 网络，跳过 IPv4 分配。
+		if needV4 && (hasV4Pool || !hasV6Pool) {
 			ip, gate, mask, ok := allocateIP(pools, "ipv4", nicType, allocated)
 			if !ok {
 				return fmt.Errorf(
@@ -111,8 +123,13 @@ func (s *IPAllocService) NetCheck(hsName string, vm *model.VMConfig) error {
 
 		// 分配 IPv6：失败不报错（与 Python 一致）
 		if needV6 {
-			if ip, _, _, ok := allocateIP(pools, "ipv6", nicType, allocated); ok {
+			if ip, _, prefix, ok := allocateIP(pools, "ipv6", nicType, allocated); ok {
 				nic.IP6Addr = ip
+				// 前缀长度供爱快下发 DHCPv6 静态绑定与前端展示；
+				// 解析不出数字时保持 0，由 NCConfig.IPv6PrefixLen 按 /64 兜底。
+				if n, err := strconv.Atoi(strings.TrimSpace(prefix)); err == nil && n > 0 && n <= 128 {
+					nic.IP6Prefix = n
+				}
 				allocated[ip] = true
 			}
 		}
@@ -144,17 +161,51 @@ func parseIPPools(raw interface{}) []ipPool {
 		if len(item) == 0 {
 			continue
 		}
+		from := strings.TrimSpace(strValue(item["from"]))
+
+		vers := strings.ToLower(strings.TrimSpace(strValue(item["vers"])))
+		if vers == "" {
+			// 未填 vers 时按起始地址推断，避免 IPv6 池被当成 IPv4 池跳过
+			if ip := net.ParseIP(from); ip != nil && ip.To4() == nil {
+				vers = "ipv6"
+			} else {
+				vers = "ipv4"
+			}
+		}
+
+		nicType := strings.ToLower(strings.TrimSpace(strValue(item["type"])))
+		if nicType == "" {
+			// 未填 type 时按默认的 NAT 池处理
+			nicType = "nat"
+		}
+
 		pools = append(pools, ipPool{
-			Name: name,
-			Vers: strings.ToLower(strings.TrimSpace(strValue(item["vers"]))),
-			Type: strings.ToLower(strings.TrimSpace(strValue(item["type"]))),
-			From: strings.TrimSpace(strValue(item["from"])),
-			Nums: intValue(item["nums"]),
-			Gate: strValue(item["gate"]),
-			Mask: strValue(item["mask"]),
+			Name:   name,
+			Vers:   vers,
+			Type:   nicType,
+			From:   from,
+			Nums:   intValue(item["nums"]),
+			Gate:   strValue(item["gate"]),
+			Mask:   strValue(item["mask"]),
+			Prefix: poolPrefix(item),
 		})
 	}
 	return pools
+}
+
+// poolPrefix 解析 IPv6 池的前缀长度。
+//
+// 优先取专用字段 prefix；旧配置常把前缀写进 mask（"64"），
+// 因此再回退到 mask 的数字形态。点分十进制掩码（255.255.255.0）
+// 属于 IPv4，解析失败即返回 0，由调用方按 /64 兜底。
+func poolPrefix(item map[string]interface{}) int {
+	if v := intValue(item["prefix"]); v > 0 && v <= 128 {
+		return v
+	}
+	if v, err := strconv.Atoi(strings.TrimSpace(strValue(item["mask"]))); err == nil && v > 0 && v <= 128 {
+		return v
+	}
+	return 0
 }
 
 // parseIPDNS 解析主机 ipaddr_ddns
@@ -183,6 +234,16 @@ func parseIPDNS(raw interface{}) []string {
 	return nil
 }
 
+// hasPoolVers 判断地址池中是否存在指定协议（ipv4 / ipv6）的池
+func hasPoolVers(pools []ipPool, vers string) bool {
+	for _, pool := range pools {
+		if pool.Vers == vers && pool.From != "" && pool.Nums > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // allocateIP 从地址池中分配一个未占用的 IP（对应 Python IPConfig.allocate_ip）
 func allocateIP(pools []ipPool, vers, nicType string, allocated map[string]bool) (ip, gate, mask string, ok bool) {
 	for _, pool := range pools {
@@ -207,6 +268,13 @@ func allocateIP(pools []ipPool, vers, nicType string, allocated map[string]bool)
 			continue
 		}
 
+		// IPv6 的掩码是前缀长度，与 IPv4 的点分十进制掩码不是一回事；
+		// 统一在这里转换成数字字符串，调用方无需再区分协议。
+		mask := pool.Mask
+		if vers == "ipv6" && pool.Prefix > 0 {
+			mask = strconv.Itoa(pool.Prefix)
+		}
+
 		for i := 0; i < pool.Nums; i++ {
 			candidate := addIP(base, i)
 			if candidate == nil {
@@ -214,7 +282,7 @@ func allocateIP(pools []ipPool, vers, nicType string, allocated map[string]bool)
 			}
 			ipStr := candidate.String()
 			if !allocated[ipStr] {
-				return ipStr, pool.Gate, pool.Mask, true
+				return ipStr, pool.Gate, mask, true
 			}
 		}
 	}

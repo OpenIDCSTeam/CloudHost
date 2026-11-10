@@ -382,6 +382,19 @@ func (app *App) registerRoutes() {
 		api.POST("/client/natadd/:hs_name/:vm_uuid", app.handleNATAdd)
 		api.DELETE("/client/natdel/:hs_name/:vm_uuid/:rule_index", app.handleNATDelete)
 
+		// 虚拟机快照（仅支持快照能力的平台可用，其余平台返回不支持）
+		api.GET("/client/snapshot/:hs_name/:vm_uuid", app.handleSnapshotList)
+		api.POST("/client/snapshot/:hs_name/:vm_uuid", app.handleSnapshotCreate)
+		api.POST("/client/snapshot/:hs_name/:vm_uuid/restore", app.handleSnapshotRestore)
+		api.DELETE("/client/snapshot/:hs_name/:vm_uuid", app.handleSnapshotDelete)
+
+		// 虚拟机防火墙（仅 PVE / Hyper-V 等支持该能力的平台可用，其余平台返回不支持）
+		api.GET("/client/firewall/:hs_name/:vm_uuid", app.handleFirewallGet)
+		api.PUT("/client/firewall/:hs_name/:vm_uuid/options", app.handleFirewallOptions)
+		api.POST("/client/firewall/:hs_name/:vm_uuid/rules", app.handleFirewallRuleCreate)
+		api.PUT("/client/firewall/:hs_name/:vm_uuid/rules/:pos", app.handleFirewallRuleUpdate)
+		api.DELETE("/client/firewall/:hs_name/:vm_uuid/rules/:pos", app.handleFirewallRuleDelete)
+
 		// IP地址管理（旧风格）
 		api.GET("/client/ipaddr/detail/:hs_name/:vm_uuid", app.handleIPList)
 		api.POST("/client/ipaddr/create/:hs_name/:vm_uuid", app.handleIPCreate)
@@ -392,10 +405,16 @@ func (app *App) registerRoutes() {
 		api.POST("/hosts/:hs_name/vms/:vm_uuid/ip_addresses", app.handleIPCreate)
 		api.PUT("/hosts/:hs_name/vms/:vm_uuid/ip_addresses/:nic_name", app.handleIPUpdate)
 
-		// 网络静态绑定（爱快 DHCP静态地址 + ARP，对应 Python 版 NetiKuai）
+		// 网络静态绑定（爱快 DHCP静态地址 + ARP + DHCPv6 静态分配）
 		api.POST("/client/ipaddr/bind/:hs_name/:vm_uuid", app.handleIPBind)
 		api.DELETE("/client/ipaddr/bind/:hs_name/:vm_uuid", app.handleIPUnbind)
 		api.DELETE("/hosts/:hs_name/vms/:vm_uuid/ip_addresses/:nic_name", app.handleIPDeleteByName)
+
+		// 公网IPv4地址分配（爱快地址转换 / 1:1 NAT）
+		api.GET("/hosts/:hs_name/public_ips", app.handlePublicIPPool)
+		api.GET("/hosts/:hs_name/vms/:vm_uuid/public_ips", app.handlePublicIPList)
+		api.POST("/hosts/:hs_name/vms/:vm_uuid/public_ips", app.handlePublicIPAllocate)
+		api.DELETE("/hosts/:hs_name/vms/:vm_uuid/public_ips/:public_addr", app.handlePublicIPRelease)
 
 		// 反向代理（用户级）
 		api.GET("/client/proxys/list", app.handleProxyUserList)

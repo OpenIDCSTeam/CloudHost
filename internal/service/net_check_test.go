@@ -111,6 +111,84 @@ func TestNetCheckKeepsExistingIP(t *testing.T) {
 	}
 }
 
+// 双栈池：同一张网卡同时拿到 IPv4 与 IPv6，IPv6 前缀长度写入 ip6_prefix。
+func TestNetCheckAllocatesDualStack(t *testing.T) {
+	const pools = `{"nat":{"from":"10.2.20.100","nums":5,"type":"nat","vers":"ipv4",` +
+		`"gate":"10.2.20.1","mask":"255.255.255.0"},` +
+		`"v6":{"from":"2408:8207:1234:5600::100","nums":10,"type":"nat","vers":"ipv6",` +
+		`"gate":"fe80::1","prefix":64}}`
+	svc := newTestIPAllocService(t, pools)
+
+	vm := &model.VMConfig{
+		VmUUID: "vm-1",
+		NicAll: map[string]model.NCConfig{
+			"ethernet0": {NicName: "ethernet0", NicType: "nat"},
+		},
+	}
+	if err := svc.NetCheck("h1", vm); err != nil {
+		t.Fatalf("分配失败: %v", err)
+	}
+
+	nic := vm.NicAll["ethernet0"]
+	if nic.IP4Addr != "10.2.20.100" {
+		t.Errorf("IPv4 应为池首地址，实际 %q", nic.IP4Addr)
+	}
+	if nic.IP6Addr != "2408:8207:1234:5600::100" {
+		t.Errorf("IPv6 应为池首地址，实际 %q", nic.IP6Addr)
+	}
+	if nic.IP6Prefix != 64 {
+		t.Errorf("IPv6 前缀长度应为 64，实际 %d", nic.IP6Prefix)
+	}
+	// 爱快的 DHCPv6 静态绑定只认后缀，必须与分配到的地址一致
+	if got := nic.IPv6Suffix(); got != "::100" {
+		t.Errorf("IPv6 后缀应为 ::100，实际 %q", got)
+	}
+	if nic.MacAddr == "" {
+		t.Error("应按地址推导 MAC")
+	}
+}
+
+// 纯 IPv6 主机（只有 ipv6 池）不应因为缺少 IPv4 池而无法创建虚拟机。
+func TestNetCheckIPv6Only(t *testing.T) {
+	const pools = `{"v6":{"from":"2408:8207:1234:5600::100","nums":10,"type":"nat","vers":"ipv6",` +
+		`"mask":"64"}}`
+	svc := newTestIPAllocService(t, pools)
+
+	vm := &model.VMConfig{
+		VmUUID: "vm-1",
+		NicAll: map[string]model.NCConfig{
+			"ethernet0": {NicName: "ethernet0", NicType: "nat"},
+		},
+	}
+	if err := svc.NetCheck("h1", vm); err != nil {
+		t.Fatalf("纯 IPv6 主机不应报错: %v", err)
+	}
+
+	nic := vm.NicAll["ethernet0"]
+	if nic.IP4Addr != "" {
+		t.Errorf("没有 IPv4 池时不应分配 IPv4，实际 %q", nic.IP4Addr)
+	}
+	if nic.IP6Addr != "2408:8207:1234:5600::100" {
+		t.Errorf("IPv6 应为池首地址，实际 %q", nic.IP6Addr)
+	}
+	// mask 写前缀长度时必须能识别
+	if nic.IP6Prefix != 64 {
+		t.Errorf("mask=64 应解析为前缀长度 64，实际 %d", nic.IP6Prefix)
+	}
+	if nic.MacAddr == "" {
+		t.Fatal("只有 IPv6 时也必须推导出 MAC")
+	}
+
+	// 再次执行不能因为「已有地址」而改写 MAC（爱快绑定依赖稳定的 MAC）
+	first := nic.MacAddr
+	if err := svc.NetCheck("h1", vm); err != nil {
+		t.Fatalf("二次检查失败: %v", err)
+	}
+	if got := vm.NicAll["ethernet0"].MacAddr; got != first {
+		t.Errorf("MAC 应保持稳定：%q → %q", first, got)
+	}
+}
+
 // 地址池耗尽时必须报错（而不是静默留空，让用户以为分配成功）。
 func TestNetCheckPoolExhausted(t *testing.T) {
 	svc := newTestIPAllocService(t,

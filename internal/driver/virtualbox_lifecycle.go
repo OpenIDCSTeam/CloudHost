@@ -129,6 +129,9 @@ func (d *VirtualBoxDriver) PowerControl(vmUUID string, action model.VMPowers) (*
 	return &model.ZMessage{Success: true, Action: "VMPowers", Message: "电源操作已执行"}, nil
 }
 
+// SupportsGracefulShutdown acpipowerbutton 向 guest 发送 ACPI 电源键事件。
+func (d *VirtualBoxDriver) SupportsGracefulShutdown() bool { return true }
+
 // CreateVM 创建虚拟机
 func (d *VirtualBoxDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	vmName := cfg.VmUUID

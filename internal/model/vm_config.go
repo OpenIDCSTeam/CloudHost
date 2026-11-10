@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -41,13 +42,19 @@ type NCConfig struct {
 	NicName string `json:"nic_name"` // 网卡名称
 	// NicType 网卡类型：nat / pub，决定使用哪张网桥与哪个IP池
 	// 对应 Python 版 NCConfig.nic_type（PVE 的 net_conf 用它查 hs_config.network_<type>）
-	NicType string   `json:"nic_type"`
-	MacAddr string   `json:"mac_addr"` // MAC地址
-	IP4Addr string   `json:"ip4_addr"` // IPv4地址
-	IP6Addr string   `json:"ip6_addr"` // IPv6地址
-	NicGate string   `json:"nic_gate"` // 网关地址
-	NicMask string   `json:"nic_mask"` // 子网掩码，默认 255.255.255.0
+	NicType string `json:"nic_type"`
+	MacAddr string `json:"mac_addr"` // MAC地址
+	IP4Addr string `json:"ip4_addr"` // IPv4地址
+	IP6Addr string `json:"ip6_addr"` // IPv6地址
+	NicGate string `json:"nic_gate"` // 网关地址
+	// NicMask 子网掩码：IPv4 为点分十进制（默认 255.255.255.0），
+	// IPv6 允许填前缀长度（如 "64"），两者不能混用。
+	NicMask string   `json:"nic_mask"`
 	DNSAddr []string `json:"dns_addr"` // DNS服务器列表
+	// IP6Prefix IPv6 前缀长度（如 64）。
+	// NicMask 的点分十进制形态无法表达 IPv6 前缀，因此单独保存；
+	// 为 0 时取 NicMask 的数字形态，仍为 0 则按 64 处理。
+	IP6Prefix int `json:"ip6_prefix"`
 }
 
 // EffectiveNicType 返回生效的网卡类型，缺省为 nat（与 Python 版一致）
@@ -64,6 +71,46 @@ func (n NCConfig) EffectiveMask() string {
 		return "255.255.255.0"
 	}
 	return n.NicMask
+}
+
+// IPv6PrefixLen 返回生效的 IPv6 前缀长度，缺省 64。
+//
+// 优先取 ip6_prefix；历史配置可能把前缀写进 nic_mask（如 "64"），
+// 因此再回退到 nic_mask 的数字形态，仍取不到时按 /64 处理。
+func (n NCConfig) IPv6PrefixLen() int {
+	if n.IP6Prefix > 0 && n.IP6Prefix <= 128 {
+		return n.IP6Prefix
+	}
+	if v, err := strconv.Atoi(strings.TrimSpace(n.NicMask)); err == nil && v > 0 && v <= 128 {
+		return v
+	}
+	return 64
+}
+
+// IPv6Suffix 返回 IPv6 地址的接口标识后缀，形如 "::a1b2:c3d4:e5f6:7890"。
+//
+// 爱快的 DHCPv6 静态绑定以「MAC + 后缀」的形式固定地址：前缀由运营商动态下发，
+// 只有后缀稳定，因此下发时必须使用与网卡实际地址一致的后缀。
+// 地址非法或属于 IPv4 时返回空串（调用方据此跳过绑定）。
+func (n NCConfig) IPv6Suffix() string {
+	ip6 := strings.TrimSpace(n.IP6Addr)
+	if ip6 == "" {
+		return ""
+	}
+	ip := net.ParseIP(ip6)
+	if ip == nil {
+		return ""
+	}
+	v6 := ip.To16()
+	// To4() != nil 说明是 IPv4（或 IPv4 映射地址），没有 IPv6 后缀
+	if v6 == nil || ip.To4() != nil {
+		return ""
+	}
+	// 只保留后 64 位，并按标准压缩形式输出（::100 而不是 ::0:0:0:100），
+	// 与爱快界面上填写后缀的习惯保持一致。
+	suffix := make(net.IP, net.IPv6len)
+	copy(suffix[8:], v6[8:])
+	return suffix.String()
 }
 
 // SendMAC 按 IPv4/IPv6 推导 MAC 地址（与 Python 版 NCConfig.send_mac 完全一致）。
@@ -102,8 +149,24 @@ func (n *NCConfig) SendMAC() string {
 		}
 	}
 
-	// 回退到 IPv6：取后 48 位（12 个十六进制字符）
+	// 回退到 IPv6：用最后 32 位作为设备标识，前缀固定为 02:1c。
+	//
+	// 前缀取 02 而不是直接截取后 48 位：IPv6 池的地址（如 ::100）
+	// 后 48 位的前三个字节常常是 0，拼出来的 MAC（00:00:00:xx:xx:xx）
+	// 属于非法/保留 OUI，部分网卡会拒绝使用。02 是本地管理单播地址位，
+	// 虚拟机网卡可以正常使用；同一 IP 推导出的 MAC 依然稳定，
+	// 爱快的 DHCPv6 静态绑定才能与网卡实际地址对上。
+	//
+	// 必须先展开压缩地址：2001:db8::1 直接去掉冒号只有 "2001db81"，
+	// 长度不足会被误判为「没有 IP」并生成随机 MAC。
 	if ip6 := strings.TrimSpace(n.IP6Addr); ip6 != "" {
+		if parsed := net.ParseIP(ip6); parsed != nil && parsed.To4() == nil {
+			if v6 := parsed.To16(); v6 != nil {
+				return fmt.Sprintf("02:1c:%02x:%02x:%02x:%02x",
+					v6[12], v6[13], v6[14], v6[15])
+			}
+		}
+		// 解析失败时保持旧的字符串截断逻辑，兼容历史脏配置
 		clean := strings.ToLower(strings.ReplaceAll(ip6, ":", ""))
 		if len(clean) >= 12 {
 			hex := clean[len(clean)-12:]
@@ -237,6 +300,19 @@ type PortData struct {
 	LanPort int    `json:"lan_port"` // 内网端口
 	LanAddr string `json:"lan_addr"` // 内网地址
 	NatTips string `json:"nat_tips"` // 端口说明
+}
+
+// PublicIPBinding 公网 IPv4 地址转换（1:1 NAT）绑定关系。
+//
+// 虚拟机网卡仍然使用内网地址，由爱快把公网地址整体转换到该内网地址；
+// 这样对外暴露的是公网 IP，无需在网卡上直接配置公网地址。
+type PublicIPBinding struct {
+	VMUUID     string `json:"vm_uuid"`     // 归属虚拟机
+	PublicAddr string `json:"public_addr"` // 公网IPv4
+	LanAddr    string `json:"lan_addr"`    // 虚拟机内网IPv4
+	MacAddr    string `json:"mac_addr"`    // 网卡MAC（仅展示）
+	Comment    string `json:"comment"`     // 备注（虚拟机名称等）
+	CreatedAt  string `json:"created_at"`  // 分配时间
 }
 
 // WebProxy 反向代理配置

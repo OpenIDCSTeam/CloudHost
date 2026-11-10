@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -60,6 +61,11 @@ const (
 	ikuaiV4DNATPath       = "/network/dnat/rules"
 	ikuaiV4DHCPStaticPath = "/network/dhcp/static"
 
+	// ikuaiV4PathDHCPv6 / ikuaiV4PathAddrTrans 是「逻辑资源键」，
+	// 具体路径由 ikuaiV4DHCPv6Paths / ikuaiV4AddrTransPaths 探测后缓存。
+	ikuaiV4PathDHCPv6    = "dhcpv6_static"
+	ikuaiV4PathAddrTrans = "addr_trans"
+
 	// ikuaiRequestTimeout 单次 HTTP 请求超时
 	ikuaiRequestTimeout = 15 * time.Second
 
@@ -86,6 +92,27 @@ var errIKuaiV4APIMissing = errors.New("目标设备未提供爱快 4.0 OpenAPI")
 var errIKuaiTokenRejected = errors.New("爱快 API Token 无效或权限不足")
 
 // ============================================================
+// IPv6 静态绑定 / 地址转换 的接口候选
+// ============================================================
+
+// 爱快不同固件对这两张表的命名不一致，按顺序探测：
+//   - dhcpv6_static：IPv6 DHCP 静态分配（MAC + 后缀）
+//   - dhcpv6      ：部分 3.x 固件把静态分配与 DHCPv6 服务放在同一张表
+//   - nat         ：地址转换（1:1 NAT，公网地址整体转换到内网地址）
+//   - nat_link    ：个别 4.x 固件对地址转换的命名
+//
+// 探测只在「函数本身不存在」时继续，参数错误会直接返回，
+// 避免把「字段填错」误判成「固件不支持」而反复试错。
+var (
+	ikuaiDHCPv6Funcs    = []string{"dhcpv6_static", "dhcpv6"}
+	ikuaiAddrTransFuncs = []string{"nat", "nat_link"}
+
+	// 4.0 OpenAPI 的资源路径候选（探测成功后按客户端缓存）
+	ikuaiV4DHCPv6Paths    = []string{"/network/dhcpv6/static", "/network/dhcpv6/static_rules"}
+	ikuaiV4AddrTransPaths = []string{"/network/nat/rules", "/network/nat/addr_trans"}
+)
+
+// ============================================================
 // 客户端
 // ============================================================
 
@@ -107,6 +134,13 @@ type ikuaiClient struct {
 	blockedTill time.Time
 	lastErr     error
 
+	// v4Paths 已探测成功的 4.0 OpenAPI 资源路径（逻辑键 → 实际路径）。
+	// 不同固件的资源路径不完全一致，探测一次后固定下来，避免每次下发都试错。
+	v4Paths map[string]string
+	// dhcpv6Func / addrTransFunc 已探测成功的旧协议 func_name
+	dhcpv6Func    string
+	addrTransFunc string
+
 	http *http.Client
 	mu   sync.Mutex
 }
@@ -122,6 +156,7 @@ func newIKuaiClient(addr, username, password, token string) *ikuaiClient {
 		token:          strings.TrimSpace(token),
 		ver:            ikuaiVerUnknown,
 		explicitScheme: explicit,
+		v4Paths:        make(map[string]string),
 		http: &http.Client{
 			Timeout: ikuaiRequestTimeout,
 			Transport: &http.Transport{
@@ -1079,6 +1114,579 @@ func arpParam(ver int, action, ip, mac, comment string) map[string]interface{} {
 		"comment":     comment,
 		"old_ip_addr": "",
 	}
+}
+
+// ============================================================
+// IPv6 静态分配（dhcpv6_static：MAC + 后缀）
+// ============================================================
+
+// addDHCPv6Static 添加 IPv6 静态分配。
+//
+// 与 IPv4 的 DHCP 静态地址不同，IPv6 的前缀由运营商动态下发，
+// 能固定的只有接口标识（后缀），因此爱快要求提交「MAC + 后缀」，
+// 而不是完整地址；下发的 suffix 必须与网卡实际地址的后 64 位一致，
+// 否则终端仍会拿到另一个地址。
+func (c *ikuaiClient) addDHCPv6Static(mac, suffix, comment string) error {
+	mac = strings.TrimSpace(mac)
+	suffix = normalizeIPv6Suffix(suffix)
+	if mac == "" || suffix == "" {
+		return fmt.Errorf("IPv6 静态绑定参数不完整: mac=%q suffix=%q", mac, suffix)
+	}
+	if err := c.login(); err != nil {
+		return err
+	}
+
+	if c.apiVersion() == ikuaiVer4API {
+		tag := ikuaiTag(entryTag(comment, suffix))
+		return c.v4AddRow(ikuaiV4PathDHCPv6, ikuaiV4DHCPv6Paths, map[string]interface{}{
+			"tagname":   tag,
+			"enabled":   "yes",
+			"mac":       mac,
+			"suffix":    suffix,
+			"interface": "auto",
+			"comment":   comment,
+			"hostname":  "",
+		})
+	}
+
+	// 已探测出可用的 func_name 时直接复用，避免每次下发都先试错一遍
+	funcs := ikuaiDHCPv6Funcs
+	c.mu.Lock()
+	if c.dhcpv6Func != "" {
+		funcs = []string{c.dhcpv6Func}
+	}
+	c.mu.Unlock()
+
+	_, _, err := c.callWithFuncs(funcs, "add", func(ver int) map[string]interface{} {
+		return dhcpv6StaticParam(ver, mac, suffix, comment)
+	})
+	return err
+}
+
+// deleteDHCPv6Static 删除匹配 MAC / 后缀的 IPv6 静态分配；不存在时返回 errIKuaiNotFound。
+func (c *ikuaiClient) deleteDHCPv6Static(mac, suffix string) error {
+	mac = strings.TrimSpace(mac)
+	suffix = normalizeIPv6Suffix(suffix)
+	if mac == "" && suffix == "" {
+		return fmt.Errorf("解绑 IPv6 静态分配需要 mac 或后缀")
+	}
+	if err := c.login(); err != nil {
+		return err
+	}
+
+	if c.apiVersion() == ikuaiVer4API {
+		rows, err := c.v4ListRows(ikuaiV4PathDHCPv6, ikuaiV4DHCPv6Paths, 500)
+		if err != nil {
+			return err
+		}
+		id := findDHCPv6ID(rows, mac, suffix)
+		if id == "" {
+			return errIKuaiNotFound
+		}
+		return c.v4DeleteRow(ikuaiV4PathDHCPv6, ikuaiV4DHCPv6Paths, id)
+	}
+
+	rows, fn, err := c.dhcpv6Rows()
+	if err != nil {
+		return err
+	}
+	id := findDHCPv6ID(rows, mac, suffix)
+	if id == "" {
+		return errIKuaiNotFound
+	}
+	result, err := c.call(fn, "del", func(ver int) map[string]interface{} {
+		return map[string]interface{}{"id": id}
+	})
+	if err != nil {
+		return err
+	}
+	if !ikuaiSuccess(result) {
+		return fmt.Errorf("删除IPv6静态分配失败: %s", ikuaiErrMsg(result))
+	}
+	return nil
+}
+
+// dhcpv6Rows 返回 IPv6 静态分配列表，同时返回命中的 func_name。
+//
+// 不同固件对该表的命名不一致，探测成功后缓存，
+// 后续查询/删除都复用同一个函数名，避免每次都试错。
+func (c *ikuaiClient) dhcpv6Rows() ([]interface{}, string, error) {
+	c.mu.Lock()
+	cached := c.dhcpv6Func
+	c.mu.Unlock()
+
+	funcs := ikuaiDHCPv6Funcs
+	if cached != "" {
+		funcs = []string{cached}
+	}
+
+	var lastErr error
+	for _, fn := range funcs {
+		result, err := c.call(fn, "show", func(ver int) map[string]interface{} {
+			// IPv6 静态分配与 DHCP 静态地址一样使用 total/data 容器；
+			// 部分固件改用 static_total/static_data，ikuaiRows 已兼容两种形态。
+			return map[string]interface{}{"TYPE": "total,data", "ORDER_BY": "", "ORDER": ""}
+		})
+		if err != nil {
+			return nil, "", err
+		}
+		if ikuaiSuccess(result) {
+			c.mu.Lock()
+			c.dhcpv6Func = fn
+			c.mu.Unlock()
+			return ikuaiRows(result), fn, nil
+		}
+		if !ikuaiFuncUnsupported(result) {
+			return nil, "", fmt.Errorf("获取IPv6静态分配列表失败: %s", ikuaiErrMsg(result))
+		}
+		lastErr = fmt.Errorf("爱快固件不支持 %s 接口", fn)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("爱快固件未提供IPv6静态分配接口")
+	}
+	return nil, "", lastErr
+}
+
+// dhcpv6StaticParam 构造旧协议 dhcpv6_static 的请求参数。
+func dhcpv6StaticParam(ver int, mac, suffix, comment string) map[string]interface{} {
+	param := map[string]interface{}{
+		"mac":       mac,
+		"suffix":    suffix,
+		"interface": "auto",
+		"comment":   comment,
+		"enabled":   "yes",
+		"hostname":  "",
+	}
+	if ver == ikuaiVer4 {
+		tag := ikuaiTag(entryTag(comment, suffix))
+		param["tagname"] = tag
+		param["termname"] = tag
+	}
+	return param
+}
+
+// ============================================================
+// 地址转换（1:1 NAT：公网地址 → 内网地址）
+// ============================================================
+
+// addAddrTrans 添加地址转换规则，把整个公网地址映射到虚拟机内网地址。
+//
+// 与端口映射（dnat）的区别：地址转换不需要端口，公网 IP 的所有端口
+// 都直达内网主机，因此同一内网地址只能占用一个公网地址。
+func (c *ikuaiClient) addAddrTrans(wanAddr, lanAddr, comment string) error {
+	wanAddr = strings.TrimSpace(wanAddr)
+	lanAddr = strings.TrimSpace(lanAddr)
+	if wanAddr == "" || lanAddr == "" {
+		return fmt.Errorf("地址转换参数不完整: wan_addr=%q lan_addr=%q", wanAddr, lanAddr)
+	}
+	if err := c.login(); err != nil {
+		return err
+	}
+
+	if c.apiVersion() == ikuaiVer4API {
+		tag := ikuaiTag(entryTag(comment, wanAddr))
+		return c.v4AddRow(ikuaiV4PathAddrTrans, ikuaiV4AddrTransPaths, map[string]interface{}{
+			"tagname":   tag,
+			"enabled":   "yes",
+			"comment":   comment,
+			"interface": "wan1",
+			"wan_addr":  wanAddr,
+			"lan_addr":  lanAddr,
+		})
+	}
+
+	funcs := ikuaiAddrTransFuncs
+	c.mu.Lock()
+	if c.addrTransFunc != "" {
+		funcs = []string{c.addrTransFunc}
+	}
+	c.mu.Unlock()
+
+	_, _, err := c.callWithFuncs(funcs, "add", func(ver int) map[string]interface{} {
+		return addrTransParam(ver, wanAddr, lanAddr, comment)
+	})
+	return err
+}
+
+// deleteAddrTrans 删除匹配公网/内网地址的地址转换规则；不存在时返回 errIKuaiNotFound。
+func (c *ikuaiClient) deleteAddrTrans(wanAddr, lanAddr string) error {
+	wanAddr = strings.TrimSpace(wanAddr)
+	lanAddr = strings.TrimSpace(lanAddr)
+	if wanAddr == "" && lanAddr == "" {
+		return fmt.Errorf("删除地址转换需要 wan_addr 或 lan_addr")
+	}
+	if err := c.login(); err != nil {
+		return err
+	}
+
+	if c.apiVersion() == ikuaiVer4API {
+		rows, err := c.v4ListRows(ikuaiV4PathAddrTrans, ikuaiV4AddrTransPaths, 1000)
+		if err != nil {
+			return err
+		}
+		id := findAddrTransID(rows, wanAddr, lanAddr)
+		if id == "" {
+			return errIKuaiNotFound
+		}
+		return c.v4DeleteRow(ikuaiV4PathAddrTrans, ikuaiV4AddrTransPaths, id)
+	}
+
+	rows, fn, err := c.addrTransRows()
+	if err != nil {
+		return err
+	}
+	id := findAddrTransID(rows, wanAddr, lanAddr)
+	if id == "" {
+		return errIKuaiNotFound
+	}
+	result, err := c.call(fn, "del", func(ver int) map[string]interface{} {
+		return map[string]interface{}{"id": id}
+	})
+	if err != nil {
+		return err
+	}
+	if !ikuaiSuccess(result) {
+		return fmt.Errorf("删除地址转换失败: %s", ikuaiErrMsg(result))
+	}
+	return nil
+}
+
+// addrTransRows 返回地址转换列表，同时返回命中的 func_name。
+func (c *ikuaiClient) addrTransRows() ([]interface{}, string, error) {
+	c.mu.Lock()
+	cached := c.addrTransFunc
+	c.mu.Unlock()
+
+	funcs := ikuaiAddrTransFuncs
+	if cached != "" {
+		funcs = []string{cached}
+	}
+
+	var lastErr error
+	for _, fn := range funcs {
+		result, err := c.call(fn, "show", func(ver int) map[string]interface{} {
+			return map[string]interface{}{"TYPE": "total,data", "ORDER_BY": "", "ORDER": ""}
+		})
+		if err != nil {
+			return nil, "", err
+		}
+		if ikuaiSuccess(result) {
+			c.mu.Lock()
+			c.addrTransFunc = fn
+			c.mu.Unlock()
+			return ikuaiRows(result), fn, nil
+		}
+		if !ikuaiFuncUnsupported(result) {
+			return nil, "", fmt.Errorf("获取地址转换列表失败: %s", ikuaiErrMsg(result))
+		}
+		lastErr = fmt.Errorf("爱快固件不支持 %s 接口", fn)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("爱快固件未提供地址转换接口")
+	}
+	return nil, "", lastErr
+}
+
+// addrTransParam 构造旧协议地址转换的请求参数。
+func addrTransParam(ver int, wanAddr, lanAddr, comment string) map[string]interface{} {
+	param := map[string]interface{}{
+		"enabled":   "yes",
+		"comment":   comment,
+		"interface": "wan1",
+		"wan_addr":  wanAddr,
+		"lan_addr":  lanAddr,
+	}
+	if ver == ikuaiVer4 {
+		tag := ikuaiTag(entryTag(comment, wanAddr))
+		param["tagname"] = tag
+		param["termname"] = tag
+	}
+	return param
+}
+
+// ============================================================
+// 4.0 OpenAPI 资源路径探测
+// ============================================================
+
+// v4ResourcePath 返回并缓存指定逻辑资源在当前固件上的 OpenAPI 路径。
+//
+// 爱快 4.0 不同小版本的资源路径不完全一致（例如 dhcpv6 静态分配有
+// /network/dhcpv6/static 与 /network/dhcpv6/static_rules 两种写法），
+// 逐个探测一次后缓存，后续调用不再重复试错。
+func (c *ikuaiClient) v4ResourcePath(key string, candidates []string) (string, error) {
+	c.mu.Lock()
+	if p := c.v4Paths[key]; p != "" {
+		c.mu.Unlock()
+		return p, nil
+	}
+	c.mu.Unlock()
+
+	var lastErr error
+	for _, p := range candidates {
+		resp, err := c.restDo(http.MethodGet, p+"?page=1&limit=1", nil)
+		if err != nil {
+			if errors.Is(err, errIKuaiV4APIMissing) {
+				lastErr = fmt.Errorf("爱快固件未提供 %s 接口（%s）", key, p)
+				continue
+			}
+			return "", err
+		}
+		if !ikuaiRESTSuccess(resp) {
+			lastErr = fmt.Errorf("探测爱快 %s 接口失败: %s", p, ikuaiErrMsg(resp))
+			continue
+		}
+		c.mu.Lock()
+		c.v4Paths[key] = p
+		c.mu.Unlock()
+		return p, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("爱快固件未提供 %s 接口", key)
+	}
+	return "", lastErr
+}
+
+// v4ListRows 按逻辑资源列出表格行。
+func (c *ikuaiClient) v4ListRows(key string, candidates []string, limit int) ([]interface{}, error) {
+	path, err := c.v4ResourcePath(key, candidates)
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 500
+	}
+	resp, err := c.restDo(http.MethodGet, fmt.Sprintf("%s?page=1&limit=%d", path, limit), nil)
+	if err != nil {
+		return nil, err
+	}
+	if !ikuaiRESTSuccess(resp) {
+		return nil, fmt.Errorf("获取爱快 %s 列表失败: %s", path, ikuaiErrMsg(resp))
+	}
+	return ikuaiRows(resp), nil
+}
+
+// v4AddRow 向逻辑资源新增一行。
+func (c *ikuaiClient) v4AddRow(key string, candidates []string, body map[string]interface{}) error {
+	path, err := c.v4ResourcePath(key, candidates)
+	if err != nil {
+		return err
+	}
+	resp, err := c.restDo(http.MethodPost, path, body)
+	if err != nil {
+		return err
+	}
+	if !ikuaiRESTSuccess(resp) {
+		return fmt.Errorf("爱快 %s 下发失败: %s", path, ikuaiErrMsg(resp))
+	}
+	return nil
+}
+
+// v4DeleteRow 按 rowid 删除逻辑资源的一行。
+func (c *ikuaiClient) v4DeleteRow(key string, candidates []string, id string) error {
+	path, err := c.v4ResourcePath(key, candidates)
+	if err != nil {
+		return err
+	}
+	resp, err := c.restDo(http.MethodDelete, path+"/"+url.PathEscape(id), nil)
+	if err != nil {
+		return err
+	}
+	if !ikuaiRESTSuccess(resp) {
+		return fmt.Errorf("爱快 %s 删除失败: %s", path, ikuaiErrMsg(resp))
+	}
+	return nil
+}
+
+// callWithFuncs 依次尝试多个 func_name，返回成功结果与命中的函数名。
+//
+// 只在「函数本身不存在」时继续尝试下一个：参数错误必须立即返回，
+// 否则真正的配置错误会被掩盖成「固件不支持」。
+func (c *ikuaiClient) callWithFuncs(funcs []string, action string, build func(ver int) map[string]interface{}) (map[string]interface{}, string, error) {
+	var lastErr error
+	for _, fn := range funcs {
+		result, err := c.call(fn, action, build)
+		if err != nil {
+			return nil, "", err
+		}
+		if ikuaiSuccess(result) {
+			return result, fn, nil
+		}
+		if ikuaiFuncUnsupported(result) {
+			lastErr = fmt.Errorf("爱快固件不支持 %s 接口", fn)
+			continue
+		}
+		return nil, "", fmt.Errorf("调用爱快 %s 失败: %s", fn, ikuaiErrMsg(result))
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("爱快固件未提供该接口")
+	}
+	return nil, "", lastErr
+}
+
+// ikuaiFuncUnsupported 判断响应是否表示「func_name 在当前固件上不存在」。
+//
+// 爱快对未知函数的报错文案不统一：3.x 常见 "不存在的函数"，
+// 4.x 会把原因写进 errors（如 "参数错误: func_name"）。
+func ikuaiFuncUnsupported(resp map[string]interface{}) bool {
+	if resp == nil || ikuaiSuccess(resp) {
+		return false
+	}
+	msg := strings.ToLower(ikuaiErrMsg(resp))
+	for _, kw := range []string{
+		"func_name", "不存在的函数", "函数不存在", "未知函数", "未知的函数",
+		"接口不存在", "not found", "unknown function",
+	} {
+		if strings.Contains(msg, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// entryTag 生成表格行的标识：优先用备注，缺省回退到地址/后缀。
+func entryTag(comment, fallback string) string {
+	if tag := strings.TrimSpace(comment); tag != "" {
+		return tag
+	}
+	return fallback
+}
+
+// ============================================================
+// IPv6 后缀解析
+// ============================================================
+
+// normalizeIPv6Suffix 把各种写法的后缀归一化为标准的压缩形式（如 "::1000"）。
+//
+// 接受三类输入：
+//   - 纯十六进制（"1000"、"a1b2c3d4e5f60789"）
+//   - 后缀写法（"::1000"、"0:0:0:0:0:0:10:00"）
+//   - 完整地址（"2408:8207:1234:5678::1000"，取后 64 位）
+func normalizeIPv6Suffix(s string) string {
+	raw := parseIPv6Suffix(s)
+	if raw == nil {
+		return ""
+	}
+	ip := make(net.IP, net.IPv6len)
+	copy(ip[8:], raw)
+	return ip.String()
+}
+
+// parseIPv6Suffix 解析后缀为 8 字节（后 64 位）表示。
+func parseIPv6Suffix(s string) []byte {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return nil
+	}
+
+	// 完整地址（含压缩形式）直接取后 64 位
+	if ip := net.ParseIP(s); ip != nil && ip.To4() == nil {
+		if v6 := ip.To16(); v6 != nil {
+			return v6[8:]
+		}
+	}
+
+	// 含点号的是 IPv4（或 IPv4 映射地址），没有 IPv6 后缀
+	if strings.Contains(s, ".") {
+		return nil
+	}
+
+	// 不含冒号：按纯十六进制处理，右对齐到 64 位
+	if !strings.Contains(s, ":") {
+		var b strings.Builder
+		for _, r := range s {
+			if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') {
+				b.WriteRune(r)
+			}
+		}
+		h := b.String()
+		if h == "" {
+			return nil
+		}
+		if len(h) > 16 {
+			h = h[len(h)-16:]
+		}
+		for len(h) < 16 {
+			h = "0" + h
+		}
+		out, err := hex.DecodeString(h)
+		if err != nil || len(out) != 8 {
+			return nil
+		}
+		return out
+	}
+
+	// 省略 :: 的纯后缀（如 "a1b2:c3d4:e5f6:7890"）：补前导 :: 再解析
+	if ip := net.ParseIP("::" + strings.TrimPrefix(s, ":")); ip != nil && ip.To4() == nil {
+		if v6 := ip.To16(); v6 != nil {
+			return v6[8:]
+		}
+	}
+	return nil
+}
+
+// sameIPv6Suffix 比较两个后缀是否指向同一接口标识（兼容不同书写格式）。
+func sameIPv6Suffix(a, b string) bool {
+	left, right := parseIPv6Suffix(a), parseIPv6Suffix(b)
+	if left == nil || right == nil {
+		return false
+	}
+	for i := 0; i < len(left) && i < len(right); i++ {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// findDHCPv6ID 在 IPv6 静态分配列表中按 MAC / 后缀查找行 id。
+// 与 IPv4 的 findRow 一致：全字段匹配优先，部分命中兜底。
+func findDHCPv6ID(rows []interface{}, mac, suffix string) string {
+	if mac == "" && suffix == "" {
+		return ""
+	}
+	var loose string
+	for _, it := range rows {
+		row, ok := it.(map[string]interface{})
+		if !ok || ikuaiRowID(row) == "" {
+			continue
+		}
+		macMatch := mac != "" && strings.EqualFold(strVal(row["mac"]), mac)
+		suffixMatch := false
+		if suffix != "" {
+			suffixMatch = sameIPv6Suffix(strVal(row["suffix"]), suffix) ||
+				sameIPv6Suffix(strVal(row["ipv6_addr"]), suffix)
+		}
+		if (mac == "" || macMatch) && (suffix == "" || suffixMatch) {
+			return ikuaiRowID(row)
+		}
+		if loose == "" && (macMatch || suffixMatch) {
+			loose = ikuaiRowID(row)
+		}
+	}
+	return loose
+}
+
+// findAddrTransID 在地址转换列表中按公网 / 内网地址查找行 id。
+func findAddrTransID(rows []interface{}, wanAddr, lanAddr string) string {
+	if wanAddr == "" && lanAddr == "" {
+		return ""
+	}
+	var loose string
+	for _, it := range rows {
+		row, ok := it.(map[string]interface{})
+		if !ok || ikuaiRowID(row) == "" {
+			continue
+		}
+		wanMatch := wanAddr != "" && strVal(row["wan_addr"]) == wanAddr
+		lanMatch := lanAddr != "" && strVal(row["lan_addr"]) == lanAddr
+		if (wanAddr == "" || wanMatch) && (lanAddr == "" || lanMatch) {
+			return ikuaiRowID(row)
+		}
+		if loose == "" && (wanMatch || lanMatch) {
+			loose = ikuaiRowID(row)
+		}
+	}
+	return loose
 }
 
 // ============================================================

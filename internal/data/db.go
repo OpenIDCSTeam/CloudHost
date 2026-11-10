@@ -381,7 +381,12 @@ CREATE INDEX IF NOT EXISTS idx_nat_rules_user ON nat_rules (user_id);
 CREATE INDEX IF NOT EXISTS idx_web_proxies_name ON web_proxies (hs_name);
 CREATE INDEX IF NOT EXISTS idx_web_proxies_user ON web_proxies (user_id);
 `
-	return d.execStatements(SplitStatements(schema))
+	if err := d.execStatements(SplitStatements(schema)); err != nil {
+		return err
+	}
+	// 公网地址转换规则表：DDL 由 public_ip.go 统一维护，
+	// 避免建表语句与迁移逻辑两处各写一份而漏掉方言转换。
+	return d.execStatements([]string{publicIPRuleDDL, publicIPRuleIndexDDL})
 }
 
 // execStatements 逐条执行 DDL，按方言转换并容忍幂等错误。

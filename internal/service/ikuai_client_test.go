@@ -570,6 +570,8 @@ type fakeAPIRouter struct {
 	token  string
 	dnat   []map[string]interface{}
 	dhcp   []map[string]interface{}
+	v6     []map[string]interface{}
+	nat    []map[string]interface{}
 	nextID int
 
 	mu   sync.Mutex
@@ -633,9 +635,51 @@ func (f *fakeAPIRouter) handleAPI(w http.ResponseWriter, r *http.Request) {
 	case path == ikuaiV4DHCPStaticPath:
 		writeFakeJSON(w, map[string]interface{}{"code": 0, "message": "Success",
 			"results": map[string]interface{}{"static_total": 0, "static_data": []interface{}{}}})
+	case path == ikuaiV4DHCPv6Paths[0] || strings.HasPrefix(path, ikuaiV4DHCPv6Paths[0]+"/"):
+		f.handleTable(w, r, path, ikuaiV4DHCPv6Paths[0], &f.v6, body)
+	case path == ikuaiV4AddrTransPaths[0] || strings.HasPrefix(path, ikuaiV4AddrTransPaths[0]+"/"):
+		f.handleTable(w, r, path, ikuaiV4AddrTransPaths[0], &f.nat, body)
 	default:
 		w.WriteHeader(http.StatusNotFound)
 		writeFakeJSON(w, map[string]interface{}{"code": 404, "message": "not found"})
+	}
+}
+
+// handleTable 模拟 OpenAPI 中「标准表格资源」的增删查：
+// GET 列表 / POST 新增（回填 rowid）/ DELETE 按 rowid 删除。
+func (f *fakeAPIRouter) handleTable(w http.ResponseWriter, r *http.Request, path, base string, rows *[]map[string]interface{}, body map[string]interface{}) {
+	switch r.Method {
+	case http.MethodGet:
+		f.mu.Lock()
+		out := append([]map[string]interface{}{}, (*rows)...)
+		f.mu.Unlock()
+		writeFakeJSON(w, map[string]interface{}{"code": 0, "message": "Success",
+			"results": map[string]interface{}{"total": len(out), "data": out}})
+	case http.MethodPost:
+		f.mu.Lock()
+		f.nextID++
+		id := f.nextID
+		row := map[string]interface{}{"id": id}
+		for k, v := range body {
+			row[k] = v
+		}
+		*rows = append(*rows, row)
+		f.mu.Unlock()
+		writeFakeJSON(w, map[string]interface{}{"code": 0, "message": "Success", "rowid": id})
+	case http.MethodDelete:
+		id := strings.TrimPrefix(path, base+"/")
+		f.mu.Lock()
+		kept := make([]map[string]interface{}, 0, len(*rows))
+		for _, row := range *rows {
+			if strVal(row["id"]) != id {
+				kept = append(kept, row)
+			}
+		}
+		*rows = kept
+		f.mu.Unlock()
+		writeFakeJSON(w, map[string]interface{}{"code": 0, "message": "Success"})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
@@ -791,6 +835,173 @@ func TestIKuaiV4APIDHCPStatic(t *testing.T) {
 	// 列表为空 → 删除时按幂等语义返回 errIKuaiNotFound
 	if err := c.deleteDHCPStatic("10.2.1.9", "aa:bb:cc:dd:ee:ff"); !errors.Is(err, errIKuaiNotFound) {
 		t.Errorf("不存在的静态绑定应返回 errIKuaiNotFound，实际 %v", err)
+	}
+}
+
+// ============================================================
+// IPv6 静态分配 / 地址转换
+// ============================================================
+
+// IPv6 后缀必须统一成压缩形式再下发，否则同一个地址在不同书写方式下
+// 会在路由器上被当成两条不同的绑定。
+func TestNormalizeIPv6Suffix(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"::1000", "::1000"},
+		{"0:0:0:0:0:0:0:1000", "::1000"},
+		{"1000", "::1000"},
+		{"0000000000001000", "::1000"},
+		// 完整地址：只取后 64 位
+		{"2408:8207:1234:5600::1000", "::1000"},
+		// 非法输入
+		{"", ""},
+		{"zzzz", ""},
+		{"10.2.20.100", ""},
+	}
+	for _, c := range cases {
+		if got := normalizeIPv6Suffix(c.in); got != c.want {
+			t.Errorf("normalizeIPv6Suffix(%q) = %q，期望 %q", c.in, got, c.want)
+		}
+	}
+
+	if !sameIPv6Suffix("::1000", "0:0:0:0:0:0:0:1000") {
+		t.Error("同一后缀的不同写法应判为相同")
+	}
+	if sameIPv6Suffix("::1000", "::2000") {
+		t.Error("不同后缀不应判为相同")
+	}
+}
+
+// 爱快对「函数不存在」的报错必须被识别出来，否则无法回退到备用 func_name，
+// 同时参数错误不能被误判成「固件不支持」。
+func TestIKuaiFuncUnsupported(t *testing.T) {
+	if !ikuaiFuncUnsupported(map[string]interface{}{"code": 3001, "errors": "参数错误: func_name"}) {
+		t.Error("func_name 参数错误应判为函数不存在")
+	}
+	if !ikuaiFuncUnsupported(map[string]interface{}{"ErrMsg": "不存在的函数"}) {
+		t.Error("不存在的函数应判为函数不存在")
+	}
+	if ikuaiFuncUnsupported(map[string]interface{}{"code": 3001, "errors": "参数错误: mac"}) {
+		t.Error("普通参数错误不应判为函数不存在")
+	}
+	if ikuaiFuncUnsupported(map[string]interface{}{"code": 0}) {
+		t.Error("成功响应不应判为函数不存在")
+	}
+}
+
+// 爱快 3.x：IPv6 静态分配下发 MAC + 后缀，不得带 tagname。
+func TestIKuaiV3DHCPv6Static(t *testing.T) {
+	f := &fakeRouter{ver: ikuaiVer3, sessKey: "k3"}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+
+	c := newIKuaiClient(srv.URL, "admin", "pwd", "")
+	if err := c.addDHCPv6Static("11:22:33:44:55:66", "::1000", "vm-1"); err != nil {
+		t.Fatalf("添加IPv6静态分配失败: %v", err)
+	}
+	p := f.lastCallParam(t)
+	if got := strVal(p["mac"]); got != "11:22:33:44:55:66" {
+		t.Errorf("mac = %q，期望 11:22:33:44:55:66", got)
+	}
+	if got := strVal(p["suffix"]); got != "::1000" {
+		t.Errorf("suffix = %q，期望 ::1000", got)
+	}
+	if _, has := p["tagname"]; has {
+		t.Errorf("爱快3 不应带 tagname 字段: %v", p)
+	}
+	if got := strVal(p["enabled"]); got != "yes" {
+		t.Errorf("enabled = %q，期望 yes", got)
+	}
+}
+
+// 爱快 3.x：地址转换下发公网/内网地址，默认走 wan1。
+func TestIKuaiV3AddrTrans(t *testing.T) {
+	f := &fakeRouter{ver: ikuaiVer3, sessKey: "k3"}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+
+	c := newIKuaiClient(srv.URL, "admin", "pwd", "")
+	if err := c.addAddrTrans("203.0.113.10", "10.2.20.100", "vm-1"); err != nil {
+		t.Fatalf("添加地址转换失败: %v", err)
+	}
+	p := f.lastCallParam(t)
+	for key, want := range map[string]string{
+		"wan_addr": "203.0.113.10", "lan_addr": "10.2.20.100",
+		"interface": "wan1", "enabled": "yes", "comment": "vm-1",
+	} {
+		if got := strVal(p[key]); got != want {
+			t.Errorf("%s = %q，期望 %q", key, got, want)
+		}
+	}
+}
+
+// 爱快 4.0 OpenAPI：IPv6 静态分配走 /network/dhcpv6/static，删除按 rowid。
+func TestIKuaiV4APIDHCPv6Static(t *testing.T) {
+	const token = "tok"
+	f := &fakeAPIRouter{token: token}
+	srv := httptest.NewTLSServer(f.handler())
+	defer srv.Close()
+
+	c := newIKuaiClient(srv.URL, "admin", "pwd", token)
+	if err := c.addDHCPv6Static("aa:bb:cc:dd:ee:ff", "::1000", "vm-1"); err != nil {
+		t.Fatalf("添加IPv6静态分配失败: %v", err)
+	}
+	req := f.last()
+	if req.method != http.MethodPost || req.path != ikuaiV4APIPrefix+ikuaiV4DHCPv6Paths[0] {
+		t.Fatalf("应 POST %s，实际 %s %s", ikuaiV4DHCPv6Paths[0], req.method, req.path)
+	}
+	for key, want := range map[string]string{
+		"mac": "aa:bb:cc:dd:ee:ff", "suffix": "::1000", "enabled": "yes", "tagname": "vm-1",
+	} {
+		if got := strVal(req.body[key]); got != want {
+			t.Errorf("%s = %q，期望 %q", key, got, want)
+		}
+	}
+
+	// 首次删除按 rowid 下发 DELETE
+	if err := c.deleteDHCPv6Static("aa:bb:cc:dd:ee:ff", "::1000"); err != nil {
+		t.Fatalf("删除IPv6静态分配失败: %v", err)
+	}
+	req = f.last()
+	if req.method != http.MethodDelete || !strings.HasPrefix(req.path, ikuaiV4APIPrefix+ikuaiV4DHCPv6Paths[0]+"/") {
+		t.Errorf("应按 rowid 删除，实际 %s %s", req.method, req.path)
+	}
+
+	// 列表已空 → 再删返回幂等标记
+	if err := c.deleteDHCPv6Static("aa:bb:cc:dd:ee:ff", "::1000"); !errors.Is(err, errIKuaiNotFound) {
+		t.Errorf("不存在的记录应返回 errIKuaiNotFound，实际 %v", err)
+	}
+}
+
+// 爱快 4.0 OpenAPI：地址转换走 /network/nat/rules。
+func TestIKuaiV4APIAddrTrans(t *testing.T) {
+	const token = "tok"
+	f := &fakeAPIRouter{token: token}
+	srv := httptest.NewTLSServer(f.handler())
+	defer srv.Close()
+
+	c := newIKuaiClient(srv.URL, "admin", "pwd", token)
+	if err := c.addAddrTrans("203.0.113.10", "10.2.20.100", "vm-1"); err != nil {
+		t.Fatalf("添加地址转换失败: %v", err)
+	}
+	req := f.last()
+	if req.method != http.MethodPost || req.path != ikuaiV4APIPrefix+ikuaiV4AddrTransPaths[0] {
+		t.Fatalf("应 POST %s，实际 %s %s", ikuaiV4AddrTransPaths[0], req.method, req.path)
+	}
+	for key, want := range map[string]string{
+		"wan_addr": "203.0.113.10", "lan_addr": "10.2.20.100",
+		"interface": "wan1", "enabled": "yes", "tagname": "vm-1",
+	} {
+		if got := strVal(req.body[key]); got != want {
+			t.Errorf("%s = %q，期望 %q", key, got, want)
+		}
+	}
+
+	if err := c.deleteAddrTrans("203.0.113.10", "10.2.20.100"); err != nil {
+		t.Fatalf("删除地址转换失败: %v", err)
+	}
+	req = f.last()
+	if req.method != http.MethodDelete || !strings.HasPrefix(req.path, ikuaiV4APIPrefix+ikuaiV4AddrTransPaths[0]+"/") {
+		t.Errorf("应按 rowid 删除，实际 %s %s", req.method, req.path)
 	}
 }
 

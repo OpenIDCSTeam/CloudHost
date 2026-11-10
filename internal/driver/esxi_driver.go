@@ -351,6 +351,9 @@ func (d *ESXiDriver) PowerControl(vmUUID string, action model.VMPowers) (*model.
 	}, nil
 }
 
+// SupportsGracefulShutdown vSphere 通过 VMware Tools 下发软关机。
+func (d *ESXiDriver) SupportsGracefulShutdown() bool { return true }
+
 // GetStatus 获取主机状态
 func (d *ESXiDriver) GetStatus() (*model.HWStatus, error) {
 	if err := d.apiConn(); err != nil {

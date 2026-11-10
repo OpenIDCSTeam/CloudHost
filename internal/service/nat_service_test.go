@@ -191,3 +191,160 @@ func TestIKuaiListWanPorts(t *testing.T) {
 		"TYPE": "total,data", "ORDER_BY": "", "ORDER": "",
 	})
 }
+
+// ============================================================
+// 公网 IPv4 分配（爱快地址转换 / 1:1 NAT）
+// ============================================================
+
+// newPublicIPTestService 构造带公网地址池与爱快 mock 的 NAT 服务。
+func newPublicIPTestService(t *testing.T, poolJSON string) (*NATService, *fakeRouter) {
+	t.Helper()
+
+	f := &fakeRouter{ver: ikuaiVer3, sessKey: "k3"}
+	srv := httptest.NewServer(f.handler())
+	t.Cleanup(srv.Close)
+
+	db, err := data.NewDB(t.TempDir())
+	if err != nil {
+		t.Fatalf("创建临时数据库失败: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	if err := db.CreateHost(&data.HSConfigRow{
+		HsName:     "h1",
+		ServerType: "PromoxSetup",
+		IKuaiAddr:  srv.URL,
+		IKuaiUser:  "admin",
+		IKuaiPass:  "pwd",
+		PublicAddr: poolJSON,
+	}); err != nil {
+		t.Fatalf("写入主机配置失败: %v", err)
+	}
+	return NewNATService(db), f
+}
+
+// 公网地址必须从池中挑选、下发爱快的地址转换规则，并落库记录归属。
+func TestAllocatePublicIP(t *testing.T) {
+	s, f := newPublicIPTestService(t, `["203.0.113.10","203.0.113.11"]`)
+
+	vm := &model.VMConfig{VmUUID: "vm-1", NicAll: map[string]model.NCConfig{
+		"ethernet0": {NicName: "ethernet0", IP4Addr: "10.2.20.100", MacAddr: "aa:bb:cc:dd:ee:ff"},
+	}}
+	if err := s.db.UpsertVMConfig("h1", "vm-1", vm); err != nil {
+		t.Fatalf("写入虚拟机配置失败: %v", err)
+	}
+
+	binding, err := s.AllocatePublicIP("h1", "vm-1", "", "", "")
+	if err != nil {
+		t.Fatalf("分配公网地址失败: %v", err)
+	}
+	if binding.PublicAddr != "203.0.113.10" {
+		t.Errorf("应分配池首地址 203.0.113.10，实际 %q", binding.PublicAddr)
+	}
+	if binding.LanAddr != "10.2.20.100" {
+		t.Errorf("内网地址应取网卡地址，实际 %q", binding.LanAddr)
+	}
+	if binding.MacAddr != "aa:bb:cc:dd:ee:ff" {
+		t.Errorf("应记录网卡 MAC，实际 %q", binding.MacAddr)
+	}
+
+	// 路由器侧必须收到「公网 → 内网」的地址转换
+	p := f.lastCallParam(t)
+	if strVal(p["wan_addr"]) != "203.0.113.10" || strVal(p["lan_addr"]) != "10.2.20.100" {
+		t.Errorf("地址转换参数不匹配: %v", p)
+	}
+
+	// 1:1 转换：同一内网地址不允许再绑定第二个公网地址
+	if _, err := s.AllocatePublicIP("h1", "vm-1", "", "", ""); err == nil {
+		t.Fatal("同一内网地址不应能绑定第二个公网地址")
+	}
+
+	// 另一块网卡可以拿到下一个公网地址
+	vm.NicAll["ethernet1"] = model.NCConfig{
+		NicName: "ethernet1", IP4Addr: "10.2.20.101", MacAddr: "aa:bb:cc:dd:ee:01",
+	}
+	if err := s.db.UpsertVMConfig("h1", "vm-1", vm); err != nil {
+		t.Fatalf("更新虚拟机配置失败: %v", err)
+	}
+	second, err := s.AllocatePublicIP("h1", "vm-1", "", "10.2.20.101", "")
+	if err != nil {
+		t.Fatalf("为第二块网卡分配失败: %v", err)
+	}
+	if second.PublicAddr != "203.0.113.11" {
+		t.Errorf("应跳过已占用的 .10 分配 .11，实际 %q", second.PublicAddr)
+	}
+
+	// 释放后记录消失
+	if err := s.ReleasePublicIP("h1", "vm-1", binding.PublicAddr); err != nil {
+		t.Fatalf("释放公网地址失败: %v", err)
+	}
+	rules, err := s.db.ListPublicIPRules("h1")
+	if err != nil {
+		t.Fatalf("读取公网地址记录失败: %v", err)
+	}
+	if len(rules) != 1 || rules[0].PublicAddr != "203.0.113.11" {
+		t.Errorf("释放后应只剩 .11，实际 %+v", rules)
+	}
+}
+
+// 池外地址、未配置爱快都必须明确报错，不能静默成功。
+func TestAllocatePublicIPRejects(t *testing.T) {
+	s, _ := newPublicIPTestService(t, `["203.0.113.10"]`)
+	vm := &model.VMConfig{VmUUID: "vm-1", NicAll: map[string]model.NCConfig{
+		"ethernet0": {NicName: "ethernet0", IP4Addr: "10.2.20.100"},
+	}}
+	if err := s.db.UpsertVMConfig("h1", "vm-1", vm); err != nil {
+		t.Fatalf("写入虚拟机配置失败: %v", err)
+	}
+
+	if _, err := s.AllocatePublicIP("h1", "vm-1", "198.51.100.7", "", ""); err == nil ||
+		!strings.Contains(err.Error(), "地址池") {
+		t.Errorf("池外地址应被拒绝，实际 %v", err)
+	}
+
+	// 未配置爱快：地址转换无处下发
+	if err := s.db.CreateHost(&data.HSConfigRow{
+		HsName: "h2", ServerType: "PromoxSetup", PublicAddr: `["203.0.113.20"]`,
+	}); err != nil {
+		t.Fatalf("写入第二台主机失败: %v", err)
+	}
+	if err := s.db.UpsertVMConfig("h2", "vm-2", vm); err != nil {
+		t.Fatalf("写入虚拟机配置失败: %v", err)
+	}
+	if _, err := s.AllocatePublicIP("h2", "vm-2", "", "", ""); err == nil ||
+		!strings.Contains(err.Error(), "未配置爱快") {
+		t.Errorf("未配置爱快应报错，实际 %v", err)
+	}
+
+	// 地址池为空
+	if err := s.db.CreateHost(&data.HSConfigRow{
+		HsName: "h3", ServerType: "PromoxSetup", IKuaiAddr: "http://127.0.0.1:1", PublicAddr: "[]",
+	}); err != nil {
+		t.Fatalf("写入第三台主机失败: %v", err)
+	}
+	if err := s.db.UpsertVMConfig("h3", "vm-3", vm); err != nil {
+		t.Fatalf("写入虚拟机配置失败: %v", err)
+	}
+	if _, err := s.AllocatePublicIP("h3", "vm-3", "", "", ""); err == nil ||
+		!strings.Contains(err.Error(), "公网地址池") {
+		t.Errorf("空地址池应报错，实际 %v", err)
+	}
+}
+
+// IPv6 静态分配必须提交 MAC + 后缀（而不是完整地址）。
+func TestBindStaticV6(t *testing.T) {
+	s, f := newPublicIPTestService(t, `[]`)
+	if err := s.BindStaticV6("h1", "vm-1", "2408:8207:1234:5600::1000", "aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("下发 IPv6 静态分配失败: %v", err)
+	}
+	p := f.lastCallParam(t)
+	if strVal(p["mac"]) != "aa:bb:cc:dd:ee:ff" {
+		t.Errorf("mac 不匹配: %v", p)
+	}
+	if strVal(p["suffix"]) != "::1000" {
+		t.Errorf("suffix 应只保留接口标识，实际 %q", strVal(p["suffix"]))
+	}
+	if err := s.UnbindStaticV6("h1", "2408:8207:1234:5600::1000", "aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Errorf("解绑 IPv6 静态分配失败: %v", err)
+	}
+}

@@ -2205,6 +2205,201 @@ func (app *App) handleNATDelete(c *gin.Context) {
 }
 
 // ============================================================
+// 虚拟机防火墙 API（仅平台支持时可用）
+// ============================================================
+
+// firewallDriver 取出支持防火墙能力的驱动。
+//
+// 防火墙是可选能力：所有驱动都通过 BaseDriver 继承了方法集，
+// 因此必须同时检查 SupportsFirewall，不能只看类型断言是否成功。
+func (app *App) firewallDriver(hsName string) (driver.FirewallDriver, bool) {
+	d := app.HostSvc.GetDriver(hsName)
+	if d == nil {
+		return nil, false
+	}
+	fw, ok := d.(driver.FirewallDriver)
+	if !ok || !fw.SupportsFirewall() {
+		return nil, false
+	}
+	return fw, true
+}
+
+// handleFirewallGet GET /api/client/firewall/:hs_name/:vm_uuid
+// 返回虚拟机防火墙开关、默认策略与规则列表。
+func (app *App) handleFirewallGet(c *gin.Context) {
+	hsName := c.Param("hs_name")
+	vmUUID := c.Param("vm_uuid")
+
+	fw, ok := app.firewallDriver(hsName)
+	if !ok {
+		utils.BadRequest(c, "当前虚拟化平台不支持虚拟机防火墙")
+		return
+	}
+	if _, err := app.loadVMConfig(hsName, vmUUID); err != nil {
+		utils.NotFound(c, "虚拟机不存在")
+		return
+	}
+
+	state, err := fw.GetFirewallState(vmUUID)
+	if err != nil {
+		app.Logger.Log(hsName, "ERROR", "防火墙", "读取状态失败: "+err.Error(), false)
+		utils.Fail(c, 502, "获取防火墙状态失败: "+err.Error())
+		return
+	}
+	rules, err := fw.GetFirewallRules(vmUUID)
+	if err != nil {
+		app.Logger.Log(hsName, "ERROR", "防火墙", "读取规则失败: "+err.Error(), false)
+		utils.Fail(c, 502, "获取防火墙规则失败: "+err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"state": state, "rules": rules})
+}
+
+// firewallOptionsRequest 防火墙开关与默认策略请求体
+type firewallOptionsRequest struct {
+	Enable    *bool  `json:"enable"`
+	PolicyIn  string `json:"policy_in"`
+	PolicyOut string `json:"policy_out"`
+}
+
+// handleFirewallOptions PUT /api/client/firewall/:hs_name/:vm_uuid/options
+func (app *App) handleFirewallOptions(c *gin.Context) {
+	hsName := c.Param("hs_name")
+	vmUUID := c.Param("vm_uuid")
+
+	fw, ok := app.firewallDriver(hsName)
+	if !ok {
+		utils.BadRequest(c, "当前虚拟化平台不支持虚拟机防火墙")
+		return
+	}
+	var req firewallOptionsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, "请求参数错误: "+err.Error())
+		return
+	}
+	if req.Enable == nil {
+		utils.BadRequest(c, "缺少 enable 参数")
+		return
+	}
+	if err := fw.SetFirewallOptions(vmUUID, *req.Enable, req.PolicyIn, req.PolicyOut); err != nil {
+		app.Logger.Log(hsName, "ERROR", "防火墙", "保存开关失败: "+err.Error(), false)
+		utils.Fail(c, 502, "保存防火墙配置失败: "+err.Error())
+		return
+	}
+	utils.SuccessMsg(c, "防火墙配置已保存", nil)
+}
+
+// firewallRuleRequest 规则新增 / 更新请求体
+type firewallRuleRequest struct {
+	Type    string `json:"type"`
+	Action  string `json:"action"`
+	Enable  *bool  `json:"enable"`
+	Proto   string `json:"proto"`
+	Source  string `json:"source"`
+	Dest    string `json:"dest"`
+	Sport   string `json:"sport"`
+	Dport   string `json:"dport"`
+	Comment string `json:"comment"`
+	Macro   string `json:"macro"`
+	Iface   string `json:"iface"`
+}
+
+// toRule 转成驱动规则；未显式提供 enable 时默认启用
+func (r firewallRuleRequest) toRule() driver.FirewallRule {
+	enable := true
+	if r.Enable != nil {
+		enable = *r.Enable
+	}
+	return driver.FirewallRule{
+		Type:    r.Type,
+		Action:  r.Action,
+		Enable:  enable,
+		Proto:   r.Proto,
+		Source:  r.Source,
+		Dest:    r.Dest,
+		Sport:   r.Sport,
+		Dport:   r.Dport,
+		Comment: r.Comment,
+		Macro:   r.Macro,
+		Iface:   r.Iface,
+	}
+}
+
+// handleFirewallRuleCreate POST /api/client/firewall/:hs_name/:vm_uuid/rules
+func (app *App) handleFirewallRuleCreate(c *gin.Context) {
+	hsName := c.Param("hs_name")
+	vmUUID := c.Param("vm_uuid")
+
+	fw, ok := app.firewallDriver(hsName)
+	if !ok {
+		utils.BadRequest(c, "当前虚拟化平台不支持虚拟机防火墙")
+		return
+	}
+	var req firewallRuleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, "请求参数错误: "+err.Error())
+		return
+	}
+	if err := fw.AddFirewallRule(vmUUID, req.toRule()); err != nil {
+		app.Logger.Log(hsName, "ERROR", "防火墙", "新增规则失败: "+err.Error(), false)
+		utils.Fail(c, 502, "新增防火墙规则失败: "+err.Error())
+		return
+	}
+	utils.SuccessMsg(c, "防火墙规则已添加", nil)
+}
+
+// handleFirewallRuleUpdate PUT /api/client/firewall/:hs_name/:vm_uuid/rules/:pos
+func (app *App) handleFirewallRuleUpdate(c *gin.Context) {
+	hsName := c.Param("hs_name")
+	vmUUID := c.Param("vm_uuid")
+	pos, err := strconv.Atoi(c.Param("pos"))
+	if err != nil || pos < 0 {
+		utils.BadRequest(c, "规则位置无效")
+		return
+	}
+
+	fw, ok := app.firewallDriver(hsName)
+	if !ok {
+		utils.BadRequest(c, "当前虚拟化平台不支持虚拟机防火墙")
+		return
+	}
+	var req firewallRuleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, "请求参数错误: "+err.Error())
+		return
+	}
+	if err := fw.UpdateFirewallRule(vmUUID, pos, req.toRule()); err != nil {
+		app.Logger.Log(hsName, "ERROR", "防火墙", "保存规则失败: "+err.Error(), false)
+		utils.Fail(c, 502, "保存防火墙规则失败: "+err.Error())
+		return
+	}
+	utils.SuccessMsg(c, "防火墙规则已保存", nil)
+}
+
+// handleFirewallRuleDelete DELETE /api/client/firewall/:hs_name/:vm_uuid/rules/:pos
+func (app *App) handleFirewallRuleDelete(c *gin.Context) {
+	hsName := c.Param("hs_name")
+	vmUUID := c.Param("vm_uuid")
+	pos, err := strconv.Atoi(c.Param("pos"))
+	if err != nil || pos < 0 {
+		utils.BadRequest(c, "规则位置无效")
+		return
+	}
+
+	fw, ok := app.firewallDriver(hsName)
+	if !ok {
+		utils.BadRequest(c, "当前虚拟化平台不支持虚拟机防火墙")
+		return
+	}
+	if err := fw.DeleteFirewallRule(vmUUID, pos); err != nil {
+		app.Logger.Log(hsName, "ERROR", "防火墙", "删除规则失败: "+err.Error(), false)
+		utils.Fail(c, 502, "删除防火墙规则失败: "+err.Error())
+		return
+	}
+	utils.SuccessMsg(c, "防火墙规则已删除", nil)
+}
+
+// ============================================================
 // IP地址管理 API
 // ============================================================
 
@@ -2396,8 +2591,12 @@ func (app *App) handleIPDeleteByName(c *gin.Context) {
 }
 
 // staticBindRequest 静态绑定请求体（字段名与 Python 版 NCConfig 对齐）
+//
+// IPv4 与 IPv6 是两套独立的绑定：IPv4 下发 DHCP 静态地址 + ARP，
+// IPv6 下发 DHCPv6 静态分配（MAC + 接口标识后缀），因此可以只给其中之一。
 type staticBindRequest struct {
 	IP4Addr string `json:"ip4_addr"`
+	IP6Addr string `json:"ip6_addr"`
 	MacAddr string `json:"mac_addr"`
 	DNS1    string `json:"dns1"`
 	DNS2    string `json:"dns2"`
@@ -2438,6 +2637,21 @@ func (app *App) handleIPBind(c *gin.Context) {
 		return
 	}
 
+	// 单条 IPv6 静态分配：爱快侧只认「MAC + 后缀」，不接受完整地址
+	if strings.TrimSpace(req.IP6Addr) != "" && strings.TrimSpace(req.MacAddr) != "" {
+		if !app.NATService.StaticBindConfigured(hsName) {
+			utils.Fail(c, 400, "主机 "+hsName+" 未配置爱快路由器，无法下发 IPv6 静态绑定")
+			return
+		}
+		if err := app.NATService.BindStaticV6(hsName, vmUUID, req.IP6Addr, req.MacAddr); err != nil {
+			app.Logger.Log(hsName, "ERROR", "静态IP绑定", "IPv6 下发失败: "+err.Error(), false)
+			utils.Fail(c, 502, "IPv6 静态绑定下发失败: "+err.Error())
+			return
+		}
+		utils.SuccessMsg(c, "IPv6 静态绑定成功", nil)
+		return
+	}
+
 	vm := app.HostSvc.MustGetVMConfig(hsName, vmUUID)
 	if vm == nil {
 		utils.NotFound(c, "虚拟机不存在")
@@ -2453,8 +2667,10 @@ func (app *App) handleIPBind(c *gin.Context) {
 		utils.Fail(c, 400, "主机 "+hsName+" 未配置爱快路由器，无法下发静态绑定")
 		return
 	}
-	if res.Bound == 0 {
-		// 网卡缺少 IP/MAC 时无法下发，必须明确报错而不是返回「成功」
+	if res.Total() == 0 {
+		// 网卡缺少 IP/MAC 时无法下发，必须明确报错而不是返回「成功」。
+		// 这里必须用 IPv4+IPv6 的总数：只看 IPv4 会把「只分配了 IPv6」
+		// 误判成「一条都没绑定」。
 		app.Logger.Log(hsName, "WARNING", "静态IP绑定", "无可绑定的网卡: "+res.Summary(), false)
 		utils.Fail(c, 400, "没有可绑定的网卡（请先为网卡配置 IP 与 MAC）: "+res.Summary())
 		return
@@ -2477,12 +2693,26 @@ func (app *App) handleIPUnbind(c *gin.Context) {
 	if strings.TrimSpace(req.IP4Addr) == "" {
 		req.IP4Addr = c.Query("ip4_addr")
 	}
+	if strings.TrimSpace(req.IP6Addr) == "" {
+		req.IP6Addr = c.Query("ip6_addr")
+	}
 	if strings.TrimSpace(req.MacAddr) == "" {
 		req.MacAddr = c.Query("mac_addr")
 	}
 
 	if app.NATService == nil {
 		utils.InternalError(c, "NAT服务未初始化")
+		return
+	}
+
+	// IPv6 静态分配与 IPv4 是两张表，指定 ip6_addr 时只解除 IPv6
+	if strings.TrimSpace(req.IP6Addr) != "" {
+		if err := app.NATService.UnbindStaticV6(hsName, req.IP6Addr, req.MacAddr); err != nil {
+			app.Logger.Log(hsName, "ERROR", "静态IP绑定", "IPv6 解绑失败: "+err.Error(), false)
+			utils.Fail(c, 502, "IPv6 静态绑定解绑失败: "+err.Error())
+			return
+		}
+		utils.SuccessMsg(c, "IPv6 静态绑定已解绑", nil)
 		return
 	}
 
