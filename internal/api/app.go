@@ -347,6 +347,8 @@ func (app *App) registerRoutes() {
 		api.DELETE("/server/images/:hs_name", adminMW, app.handleHostImageDelete)
 		api.POST("/server/images/:hs_name/bind", adminMW, app.handleHostImageBind)
 		api.DELETE("/server/images/:hs_name/bind", adminMW, app.handleHostImageUnbind)
+		// 按平台展示的配置项目（虚拟交换机 / 存储池等）
+		api.GET("/server/platform/:hs_name", adminMW, app.handleHostPlatformInfo)
 
 		// 虚拟机管理
 		api.GET("/client/detail/:hs_name", app.handleVMList)

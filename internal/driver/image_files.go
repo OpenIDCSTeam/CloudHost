@@ -133,8 +133,32 @@ func (b *BaseDriver) imageHostIsRemote() bool {
 	return newHostCommandRunner(b.Config).isRemote()
 }
 
-// ListImageFiles 列出主机镜像目录内的文件
+// imageFileExtAllowed 判断文件名是否属于该镜像类型。
+//
+// 系统模板与 ISO 可能配置成同一个目录（dvdrom_path 未配置时会回退 images_path），
+// 因此必须按后缀区分，否则两个页签会列出完全相同的文件。
+func imageFileExtAllowed(kind, name string) bool {
+	isISO := strings.EqualFold(filepath.Ext(name), ".iso")
+	if NormalizeImageKind(kind) == ImageKindISO {
+		return isISO
+	}
+	return !isISO
+}
+
+// filterImageFilesByKind 按镜像类型过滤文件列表
+func filterImageFilesByKind(kind string, files []HostImageFile) []HostImageFile {
+	out := make([]HostImageFile, 0, len(files))
+	for _, f := range files {
+		if imageFileExtAllowed(kind, f.Name) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// ListImageFiles 列出主机镜像目录内的文件（按镜像类型过滤后缀）
 func (b *BaseDriver) ListImageFiles(kind string) ([]HostImageFile, error) {
+	kind = NormalizeImageKind(kind)
 	dir, err := b.resolvedImageDir(kind)
 	if err != nil {
 		return nil, err
@@ -149,7 +173,7 @@ func (b *BaseDriver) ListImageFiles(kind string) ([]HostImageFile, error) {
 		if err != nil {
 			return nil, fmt.Errorf("读取主机目录失败: %w", err)
 		}
-		return parseFindOutput(out), nil
+		return filterImageFilesByKind(kind, parseFindOutput(out)), nil
 	}
 
 	entries, err := os.ReadDir(dir)
@@ -159,6 +183,9 @@ func (b *BaseDriver) ListImageFiles(kind string) ([]HostImageFile, error) {
 	files := make([]HostImageFile, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() {
+			continue
+		}
+		if !imageFileExtAllowed(kind, entry.Name()) {
 			continue
 		}
 		info, infoErr := entry.Info()
@@ -210,6 +237,14 @@ func (b *BaseDriver) UploadImageFile(kind, name string, r io.Reader) (int64, err
 	name = strings.TrimSpace(name)
 	if err := validateImageFileName(name); err != nil {
 		return 0, err
+	}
+	kind = NormalizeImageKind(kind)
+	// 目录可能是同一个，上传前就按后缀拒绝放错页签的文件
+	if !imageFileExtAllowed(kind, name) {
+		if kind == ImageKindISO {
+			return 0, fmt.Errorf("ISO 页签只接受 .iso 文件")
+		}
+		return 0, fmt.Errorf("该文件是 ISO，请切换到 ISO 页签上传")
 	}
 	dir, err := b.resolvedImageDir(kind)
 	if err != nil {

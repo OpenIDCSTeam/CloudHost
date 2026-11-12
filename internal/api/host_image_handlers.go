@@ -382,6 +382,41 @@ func (app *App) handleHostImageBind(c *gin.Context) {
 	utils.SuccessMsg(c, "绑定成功", entry)
 }
 
+// handleHostPlatformInfo GET /api/server/platform/:hs_name
+//
+// 按主机平台返回可查看的配置项目（PVE 网络与存储、QEMU 网桥与 libvirt 网络、
+// Hyper-V 虚拟交换机等）。未实现 PlatformInfoProvider 的平台返回空列表，
+// 前端据此隐藏「平台配置」页签。
+func (app *App) handleHostPlatformInfo(c *gin.Context) {
+	hsName := c.Param("hs_name")
+	cfg, err := app.HostSvc.GetHost(hsName)
+	if err != nil || cfg == nil {
+		utils.BadRequest(c, "主机不存在")
+		return
+	}
+	payload := gin.H{
+		"host_name":   hsName,
+		"server_type": cfg.ServerType,
+		"sections":    []driver.HostPlatformSection{},
+	}
+	if !cfg.EnableHost {
+		utils.Success(c, payload)
+		return
+	}
+	d := app.HostSvc.GetDriver(hsName)
+	if d == nil {
+		utils.Success(c, payload)
+		return
+	}
+	provider, ok := d.(driver.PlatformInfoProvider)
+	if !ok {
+		utils.Success(c, payload)
+		return
+	}
+	payload["sections"] = provider.PlatformSections()
+	utils.Success(c, payload)
+}
+
 // handleHostImageUnbind DELETE /api/server/images/:hs_name/bind?kind=&name=
 func (app *App) handleHostImageUnbind(c *gin.Context) {
 	hsName := c.Param("hs_name")

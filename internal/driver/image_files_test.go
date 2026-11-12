@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -59,6 +60,54 @@ func TestImageFileLocalLifecycle(t *testing.T) {
 	isoFiles, _ = d.ListImageFiles(ImageKindISO)
 	if len(isoFiles) != 0 {
 		t.Fatalf("删除后 ISO 目录应为空: %+v", isoFiles)
+	}
+}
+
+// 系统模板与 ISO 指向同一目录时，必须按后缀区分，不能两边都列出全部文件
+func TestImageFilesSplitByExtensionInSameDir(t *testing.T) {
+	home := t.TempDir()
+	cfg := model.NewHSConfig()
+	cfg.ImagesPath = home
+	cfg.DvdromPath = home
+	d := NewBaseDriver(cfg)
+
+	if err := os.WriteFile(filepath.Join(home, "base.qcow2"), []byte("disk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "netinst.iso"), []byte("iso"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "readme.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	systemFiles, err := d.ListImageFiles(ImageKindSystem)
+	if err != nil {
+		t.Fatalf("列出系统模板失败: %v", err)
+	}
+	// .txt 不属于 ISO，按「排除 .iso」规则仍会出现在系统模板里
+	if len(systemFiles) != 2 {
+		t.Fatalf("系统模板应只排除 ISO: %+v", systemFiles)
+	}
+	for _, f := range systemFiles {
+		if strings.EqualFold(filepath.Ext(f.Name), ".iso") {
+			t.Fatalf("系统模板列表不应包含 ISO: %+v", f)
+		}
+	}
+
+	isoFiles, err := d.ListImageFiles(ImageKindISO)
+	if err != nil {
+		t.Fatalf("列出 ISO 失败: %v", err)
+	}
+	if len(isoFiles) != 1 || isoFiles[0].Name != "netinst.iso" {
+		t.Fatalf("ISO 列表应只包含 .iso: %+v", isoFiles)
+	}
+
+	if _, err := d.UploadImageFile(ImageKindSystem, "wrong.iso", strings.NewReader("x")); err == nil {
+		t.Fatal("系统模板页签应拒绝 .iso 上传")
+	}
+	if _, err := d.UploadImageFile(ImageKindISO, "wrong.qcow2", strings.NewReader("x")); err == nil {
+		t.Fatal("ISO 页签应拒绝非 .iso 上传")
 	}
 }
 
