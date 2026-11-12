@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
@@ -127,6 +128,14 @@ func run(cmd *cobra.Command, args []string) error {
 	if err := db.InitDefaultAdmin(token); err != nil {
 		app.Logger.Event("server", "初始化管理员").Err(err).Warn("初始化默认管理员失败: %v", err)
 	}
+
+	// 诊断端点：只监听回环地址，用于抓取 goroutine 栈定位接口卡死。
+	// 与业务端口分离，不参与鉴权，也不对外网暴露（端口被占用时静默跳过）。
+	go func() {
+		if err := http.ListenAndServe("127.0.0.1:6060", nil); err != nil {
+			app.Logger.Event("server", "诊断端点").Detail("addr", "127.0.0.1:6060").Debug("pprof 诊断端点未启用：%v", err)
+		}
+	}()
 
 	// 加载所有已启用主机的驱动（对应 Python 启动时构建 host engine 表），
 	// 并从中恢复各主机的虚拟机配置：否则重启后必须等待调度器扫描或手动调用

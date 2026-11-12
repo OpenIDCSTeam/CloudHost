@@ -234,20 +234,26 @@ func (d *MemuDriver) captureMemuScreenshot(vmIndex string) (string, error) {
 // 返回 RGB565 像素（低字节序），需要手动还原为 PNG。
 func (d *HyperVDriver) captureHyperVScreenshot(vmUUID string) (string, error) {
 	const width, height = 640, 480
+
+	// Msvm_ComputerSystem 的 Name 是虚拟机 GUID，虚拟机名在 ElementName。
+	// 旧实现按 Name='hpv-xxx' 过滤，永远匹配不到对象，
+	// 于是只能报「未返回缩略图（虚拟机可能未运行）」，与实际状态无关。
 	script := fmt.Sprintf(`$ErrorActionPreference='Stop';
 $ns='root\virtualization\v2';
-$cs=Get-CimInstance -Namespace $ns -ClassName Msvm_ComputerSystem -Filter "Name='%s'";
-if(-not $cs){ exit 0 }
-$svc=Get-CimInstance -Namespace $ns -ClassName Msvm_VirtualSystemManagementService;
+$cs=Get-CimInstance -Namespace $ns -ClassName Msvm_ComputerSystem -ErrorAction SilentlyContinue |
+    Where-Object { $_.ElementName -eq '%s' -or $_.Name -eq '%s' } | Select-Object -First 1;
+if(-not $cs){ throw '未找到虚拟机: %s' }
+$svc=Get-CimInstance -Namespace $ns -ClassName Msvm_VirtualSystemManagementService -ErrorAction Stop | Select-Object -First 1;
 $r=$svc | Invoke-CimMethod -MethodName GetVirtualSystemThumbnailImage -Arguments @{ TargetSystem=$cs; WidthPixels=%d; HeightPixels=%d };
-if($r.ImageData){ [Convert]::ToBase64String($r.ImageData) }`,
-		psEscape(vmUUID), width, height)
+if($r.ReturnValue -ne 0){ throw "GetVirtualSystemThumbnailImage 失败，ReturnValue=$($r.ReturnValue)" }
+[Convert]::ToBase64String($r.ImageData)`,
+		psEscape(vmUUID), psEscape(vmUUID), psEscape(vmUUID), width, height)
 
 	out, _, err := security.SafeExecWithTimeout(
-		[]string{"powershell", "-NoProfile", "-NonInteractive", "-Command", script},
+		[]string{"powershell", "-NoProfile", "-NonInteractive", "-Command", psUTF8Prelude + script},
 		40*time.Second)
 	if err != nil {
-		return "", fmt.Errorf("Hyper-V 缩略图获取失败: %w", err)
+		return "", fmt.Errorf("Hyper-V 缩略图获取失败: %w (%s)", err, strings.TrimSpace(out))
 	}
 
 	b64 := strings.TrimSpace(out)
@@ -257,6 +263,17 @@ if($r.ImageData){ [Convert]::ToBase64String($r.ImageData) }`,
 	pix, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
 		return "", fmt.Errorf("缩略图数据解码失败: %w", err)
+	}
+
+	// 实测 ImageData = 4 字节长度前缀 + 640x480 的 RGB565 像素，
+	// 前缀为大端总长度（如 0x00096004）。像素总在尾部，
+	// 按所需长度从后截取即可同时兼容带前缀与不带前缀两种返回。
+	need := width * height * 2
+	if len(pix) < need {
+		return "", fmt.Errorf("缩略图像素不足: 期望 %d，实际 %d", need, len(pix))
+	}
+	if len(pix) > need {
+		pix = pix[len(pix)-need:]
 	}
 	return rgb565ToDataURL(pix, width, height)
 }

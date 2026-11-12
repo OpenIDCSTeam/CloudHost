@@ -24,10 +24,10 @@ func (d *HyperVDriver) SupportsSnapshot() bool { return true }
 // 统一用 `Get-VM -Id <guid> | ...` 走对象管道。
 func (d *HyperVDriver) ListSnapshots(vmUUID string) ([]SnapshotInfo, error) {
 	script := fmt.Sprintf(
-		"$vm = Get-VM -Id '%s' -ErrorAction Stop; "+
+		"$vm = %s; if (-not $vm) { throw '虚拟机不存在: %s' }; "+
 			"@($vm | Get-VMSnapshot | Select-Object Name,Description,ParentSnapshotName,SnapshotType,"+
 			"@{n='CreatedAt';e={[int64]([DateTimeOffset]$_.CreationTime).ToUnixTimeSeconds()}}) | ConvertTo-Json -Compress",
-		psEscape(vmUUID))
+		hvVMExpr(vmUUID), psEscape(vmUUID))
 
 	out, err := d.execPS(script)
 	if err != nil {
@@ -69,8 +69,9 @@ func (d *HyperVDriver) ListSnapshots(vmUUID string) ([]SnapshotInfo, error) {
 func (d *HyperVDriver) CreateSnapshot(vmUUID, name, description string) error {
 	// Hyper-V 检查点没有描述字段，描述仅用于前端提示，无法写入平台
 	script := fmt.Sprintf(
-		"Get-VM -Id '%s' -ErrorAction Stop | Checkpoint-VM -SnapshotName '%s' -ErrorAction Stop",
-		psEscape(vmUUID), psEscape(name))
+		"$vm = %s; if (-not $vm) { throw '虚拟机不存在: %s' }; "+
+			"$vm | Checkpoint-VM -SnapshotName '%s' -ErrorAction Stop",
+		hvVMExpr(vmUUID), psEscape(vmUUID), psEscape(name))
 	if out, err := d.execPS(script); err != nil {
 		return fmt.Errorf("创建检查点失败: %v (%s)", err, strings.TrimSpace(out))
 	}
@@ -80,9 +81,10 @@ func (d *HyperVDriver) CreateSnapshot(vmUUID, name, description string) error {
 // RestoreSnapshot 应用 Hyper-V 检查点。
 func (d *HyperVDriver) RestoreSnapshot(vmUUID, name string) error {
 	script := fmt.Sprintf(
-		"Get-VM -Id '%s' -ErrorAction Stop | Get-VMSnapshot -Name '%s' -ErrorAction Stop | "+
+		"$vm = %s; if (-not $vm) { throw '虚拟机不存在: %s' }; "+
+			"$vm | Get-VMSnapshot -Name '%s' -ErrorAction Stop | "+
 			"Restore-VMSnapshot -Confirm:$false -ErrorAction Stop",
-		psEscape(vmUUID), psEscape(name))
+		hvVMExpr(vmUUID), psEscape(vmUUID), psEscape(name))
 	if out, err := d.execPS(script); err != nil {
 		return fmt.Errorf("应用检查点失败: %v (%s)", err, strings.TrimSpace(out))
 	}
@@ -92,9 +94,10 @@ func (d *HyperVDriver) RestoreSnapshot(vmUUID, name string) error {
 // DeleteSnapshot 删除 Hyper-V 检查点。
 func (d *HyperVDriver) DeleteSnapshot(vmUUID, name string) error {
 	script := fmt.Sprintf(
-		"Get-VM -Id '%s' -ErrorAction Stop | Get-VMSnapshot -Name '%s' -ErrorAction Stop | "+
+		"$vm = %s; if (-not $vm) { throw '虚拟机不存在: %s' }; "+
+			"$vm | Get-VMSnapshot -Name '%s' -ErrorAction Stop | "+
 			"Remove-VMSnapshot -Confirm:$false -ErrorAction Stop",
-		psEscape(vmUUID), psEscape(name))
+		hvVMExpr(vmUUID), psEscape(vmUUID), psEscape(name))
 	if out, err := d.execPS(script); err != nil {
 		return fmt.Errorf("删除检查点失败: %v (%s)", err, strings.TrimSpace(out))
 	}

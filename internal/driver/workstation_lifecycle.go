@@ -22,21 +22,14 @@ import (
 
 const vmrestContentType = "application/vnd.vmware.vmw.rest-v1+json"
 
-// wsBaseURL 返回 vmrest 服务基地址
-func (d *WorkstationDriver) wsBaseURL() string {
-	addr := d.Config.ServerAddr
-	port := d.Config.ServerPort
-	if port <= 0 {
-		port = 8697 // vmrest 默认端口
-	}
-	if strings.Contains(addr, ":") {
-		return "http://" + addr
-	}
-	return fmt.Sprintf("http://%s:%d", addr, port)
-}
-
 // wsRequest 发送 vmrest 请求（返回响应体与状态码）
+//
+// 请求前确保 vmrest 服务可用：未启动时自动拉起本地进程（见 wsEnsureRunning）。
 func (d *WorkstationDriver) wsRequest(method, path string, body interface{}) ([]byte, int, error) {
+	if err := d.wsEnsureRunning(); err != nil {
+		return nil, 0, err
+	}
+
 	var reader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -74,16 +67,14 @@ type wsVM struct {
 
 // selectVid 根据虚拟机名反查 vmrest 内部 id（对应 Python select_vid）
 func (d *WorkstationDriver) selectVid(vmName string) string {
-	// 优先使用缓存
-	d.mu.RLock()
-	if cfg, ok := d.VmSaving[vmName]; ok && cfg.ExtData != nil {
-		if v, exists := cfg.ExtData["vmid"]; exists {
-			if id := strVal(v); id != "" {
-				return id
-			}
-		}
+	// 优先使用缓存。
+	// 注意：缓存读取必须收敛到独立函数里用 defer 解锁 ——
+	// 原实现在命中缓存时直接 return，漏掉了 RUnlock，
+	// 每调用一次就泄漏一个读锁，最终写者（调度器 SetVMPowerState）
+	// 永远拿不到锁，GetVMSaving 等读接口全部卡死。
+	if id := d.cachedVid(vmName); id != "" {
+		return id
 	}
-	d.mu.RUnlock()
 
 	out, code, err := d.wsRequest(http.MethodGet, "/api/vms", nil)
 	if err != nil || code != http.StatusOK {
@@ -93,16 +84,85 @@ func (d *WorkstationDriver) selectVid(vmName string) string {
 	if err := json.Unmarshal(out, &list); err != nil {
 		return ""
 	}
+	// 精确匹配优先：否则 vmName 为 "vmw-1" 时会先命中 "vmw-110JgYXJ"
 	for _, vm := range list {
-		if vm.Path != "" && strings.Contains(vm.Path, vmName) {
-			return vm.ID
-		}
 		base := strings.TrimSuffix(filepath.Base(vm.Path), filepath.Ext(vm.Path))
 		if base == vmName {
 			return vm.ID
 		}
 	}
+	for _, vm := range list {
+		if vm.Path != "" && strings.Contains(vm.Path, vmName) {
+			return vm.ID
+		}
+	}
 	return ""
+}
+
+// vmrestIDByPath 按 VMX 绝对路径反查 vmrest 内部 id
+func (d *WorkstationDriver) vmrestIDByPath(vmxPath string) string {
+	if strings.TrimSpace(vmxPath) == "" {
+		return ""
+	}
+	out, code, err := d.wsRequest(http.MethodGet, "/api/vms", nil)
+	if err != nil || code != http.StatusOK {
+		return ""
+	}
+	var list []wsVM
+	if err := json.Unmarshal(out, &list); err != nil {
+		return ""
+	}
+	target := filepath.Clean(vmxPath)
+	for _, vm := range list {
+		if vm.Path != "" && strings.EqualFold(filepath.Clean(vm.Path), target) {
+			return vm.ID
+		}
+	}
+	return ""
+}
+
+// wsVMXPath 通过 vmrest 列表反查虚拟机真实 VMX 路径。
+//
+// 不能直接用 system_path/<name>.vmx 猜测：vmrest 纳管的虚拟机可能位于任意目录
+// （例如在 Workstation GUI 里创建的 E:\VBoxs\<name>\<name>.vmx），
+// 猜测路径会导致截图等功能报「配置文件不存在」。
+func (d *WorkstationDriver) wsVMXPath(vmName string) string {
+	out, code, err := d.wsRequest(http.MethodGet, "/api/vms", nil)
+	if err != nil || code != http.StatusOK {
+		return ""
+	}
+	var list []wsVM
+	if err := json.Unmarshal(out, &list); err != nil {
+		return ""
+	}
+	for _, vm := range list {
+		base := strings.TrimSuffix(filepath.Base(vm.Path), filepath.Ext(vm.Path))
+		if base == vmName {
+			return vm.Path
+		}
+	}
+	for _, vm := range list {
+		if vm.Path != "" && strings.Contains(vm.Path, vmName) {
+			return vm.Path
+		}
+	}
+	return ""
+}
+
+// cachedVid 读取缓存的 vmrest 内部 id（只读，锁内完成，不覆盖网络调用）。
+func (d *WorkstationDriver) cachedVid(vmName string) string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	cfg, ok := d.VmSaving[vmName]
+	if !ok || cfg == nil || cfg.ExtData == nil {
+		return ""
+	}
+	v, exists := cfg.ExtData["vmid"]
+	if !exists {
+		return ""
+	}
+	return strVal(v)
 }
 
 // setVid 缓存 vmrest 内部 id
@@ -162,8 +222,7 @@ func (d *WorkstationDriver) wsGetPower(vmID string) string {
 	if err != nil || code != http.StatusOK {
 		return "未知"
 	}
-	state := strings.Trim(strings.TrimSpace(string(out)), "\"")
-	switch strings.ToLower(state) {
+	switch strings.ToLower(parseVMRestPower(out)) {
 	case "poweredon", "on":
 		return "运行中"
 	case "poweredoff", "off":
@@ -173,6 +232,29 @@ func (d *WorkstationDriver) wsGetPower(vmID string) string {
 	default:
 		return "未知"
 	}
+}
+
+// parseVMRestPower 解析 vmrest 的电源响应。
+//
+// 实际返回是 JSON 对象 {"power_state":"poweredOn"}（不同版本也可能是裸字符串
+// "poweredOn"）。旧实现只去掉外层引号后比对，会把整段 JSON 当成状态值，
+// 导致所有虚拟机电源状态恒为「未知」，进而让截图等功能判定为「虚拟机未运行」。
+func parseVMRestPower(out []byte) string {
+	text := strings.TrimSpace(string(out))
+	if text == "" {
+		return ""
+	}
+	var obj struct {
+		PowerState string `json:"power_state"`
+	}
+	if err := json.Unmarshal(out, &obj); err == nil && obj.PowerState != "" {
+		return obj.PowerState
+	}
+	var s string
+	if err := json.Unmarshal(out, &s); err == nil {
+		return s
+	}
+	return strings.Trim(text, "\"")
 }
 
 // ScanVMs 扫描并同步虚拟机列表
@@ -186,12 +268,12 @@ func (d *WorkstationDriver) ScanVMs() (*model.ZMessage, error) {
 	}
 
 	// 前缀过滤（未配置 filter_name 时不过滤）
-	prefix := d.Config.FilterName
+	prefix := strings.TrimSpace(d.Config.FilterName)
 	d.mu.Lock()
 	scanned := 0
 	added := 0
 	for name, cfg := range vms {
-		if prefix != "" && !strings.HasPrefix(name, prefix) {
+		if !MatchFilterPrefix(prefix, cfg) {
 			continue
 		}
 		scanned++
@@ -203,10 +285,27 @@ func (d *WorkstationDriver) ScanVMs() (*model.ZMessage, error) {
 			d.setVid(d.VmSaving[name], strVal(cfg.ExtData["vmid"]))
 		}
 	}
+
+	// 移除历史遗留的「前缀不匹配」纳管记录（早期版本 Crontab 未过滤导致）。
+	// 只删本机记录，不做任何平台操作；返回 uuid 列表供上层同步清理数据库。
+	var removed []string
+	if prefix != "" {
+		for name, cfg := range d.VmSaving {
+			if MatchFilterPrefix(prefix, cfg) {
+				continue
+			}
+			delete(d.VmSaving, name)
+			removed = append(removed, name)
+		}
+	}
 	d.mu.Unlock()
 
-	return &model.ZMessage{Success: true, Action: "VMDetect",
-		Message: fmt.Sprintf("扫描完成：匹配 %d 个，新增 %d 个", scanned, added)}, nil
+	msg := fmt.Sprintf("扫描完成：匹配 %d 个，新增 %d 个", scanned, added)
+	if len(removed) > 0 {
+		msg += fmt.Sprintf("，清理 %d 个前缀不匹配记录", len(removed))
+	}
+	return &model.ZMessage{Success: true, Action: "VMDetect", Message: msg,
+		Results: map[string]interface{}{"added": added, "removed": removed}}, nil
 }
 
 // PowerControl 电源控制
@@ -232,10 +331,28 @@ func (d *WorkstationDriver) PowerControl(vmUUID string, action model.VMPowers) (
 		return d.BaseDriver.PowerControl(vmUUID, action)
 	}
 
+	if err := d.wsEnsureRunning(); err != nil {
+		return &model.ZMessage{Success: false, Action: "VMPowers", Message: err.Error()}, nil
+	}
+
 	vmID := d.selectVid(vmUUID)
 	if vmID == "" {
 		return &model.ZMessage{Success: false, Action: "VMPowers",
 			Message: fmt.Sprintf("未找到虚拟机: %s", vmUUID)}, nil
+	}
+
+	// 开机前补齐 VNC 控制台配置：Workstation GUI 里创建的虚拟机默认没有 VNC，
+	// 会导致截图与 noVNC 控制台都不可用。仅追加、不覆盖已有配置，失败不阻断开机。
+	if op == "on" {
+		if vmx := d.wsVMXPath(vmUUID); vmx != "" {
+			d.mu.RLock()
+			vcPort := ""
+			if cfg, ok := d.VmSaving[vmUUID]; ok && cfg != nil {
+				vcPort = cfg.VcPort
+			}
+			d.mu.RUnlock()
+			_ = ensureVMXVNC(vmx, vcPort)
+		}
 	}
 
 	req, err := http.NewRequest(http.MethodPut,
@@ -283,37 +400,77 @@ func (d *WorkstationDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, erro
 		return &model.ZMessage{Success: false, Action: "VMCreate",
 			Message: "创建目录失败: " + err.Error()}, nil
 	}
-	vmxPath := filepath.Join(dir, cfg.VmUUID+".vmx")
 
-	if err := os.WriteFile(vmxPath, []byte(d.buildVMX(cfg)), 0644); err != nil {
+	// 系统盘必须先就位：VMX 的 scsi0:0.fileName 是硬引用，
+	// 缺盘时 VMware 直接拒绝开机（File not found: <uuid>.vmdk）。
+	diskName, warn, err := d.prepareSystemDisk(cfg, dir, false)
+	if err != nil {
+		return &model.ZMessage{Success: false, Action: "VMCreate",
+			Message: "准备系统盘失败: " + err.Error()}, nil
+	}
+
+	vmxPath := filepath.Join(dir, cfg.VmUUID+".vmx")
+	if err := os.WriteFile(vmxPath, []byte(d.buildVMX(cfg, diskName, d.installISO(cfg))), 0644); err != nil {
 		return &model.ZMessage{Success: false, Action: "VMCreate",
 			Message: "写入VMX失败: " + err.Error()}, nil
 	}
 
 	out, code, err := d.wsRequest(http.MethodPost, "/api/vms/registration",
 		map[string]interface{}{"name": cfg.VmUUID, "path": vmxPath})
-	if err != nil || (code != http.StatusOK && code != http.StatusCreated) {
-		return &model.ZMessage{Success: false, Action: "VMCreate",
-			Message: fmt.Sprintf("注册虚拟机失败: %v (HTTP %d, %s)", err, code, strings.TrimSpace(string(out)))}, nil
+	registeredID := ""
+	if err == nil && (code == http.StatusOK || code == http.StatusCreated) {
+		var resp struct {
+			ID string `json:"id"`
+		}
+		_ = json.Unmarshal(out, &resp)
+		registeredID = resp.ID
+	} else {
+		// VMware 的 inventory 里可能残留上一次删除的同路径记录（vmrest DELETE
+		// 偶尔只把条目移出列表、不清 inventory），重新注册会报 Code 147
+		// "VM already added"。此时虚拟机其实已在纳管列表中，按成功处理。
+		if registeredID = d.vmrestIDByPath(vmxPath); registeredID == "" {
+			return &model.ZMessage{Success: false, Action: "VMCreate",
+				Message: fmt.Sprintf("注册虚拟机失败: %v (HTTP %d, %s)", err, code, strings.TrimSpace(string(out)))}, nil
+		}
 	}
 
 	cfg.VmFlag = model.VMPowerStopped
 	d.mu.Lock()
 	d.VmSaving[cfg.VmUUID] = cfg
+	if registeredID != "" {
+		d.setVid(cfg, registeredID)
+	}
 	d.mu.Unlock()
 
-	// 注册后回填 vmrest id
-	if id := d.selectVid(cfg.VmUUID); id != "" {
-		d.mu.Lock()
-		d.setVid(cfg, id)
-		d.mu.Unlock()
+	// 注册响应未带 id 时回填 vmrest id
+	if registeredID == "" {
+		if id := d.selectVid(cfg.VmUUID); id != "" {
+			d.mu.Lock()
+			d.setVid(cfg, id)
+			d.mu.Unlock()
+		}
 	}
 
-	return &model.ZMessage{Success: true, Action: "VMCreate", Message: "虚拟机创建成功"}, nil
+	msg := "虚拟机创建成功"
+	if warn != "" {
+		msg += "（" + warn + "）"
+	}
+
+	// 创建完成后直接开机：VMX 与系统盘均已就绪，用户不必再手动点一次开机
+	if res, startErr := d.PowerControl(cfg.VmUUID, model.VMPowerSStart); startErr != nil {
+		msg += "；自动开机失败: " + startErr.Error()
+	} else if res != nil && !res.Success {
+		msg += "；自动开机失败: " + res.Message
+	} else {
+		msg += "，已自动开机"
+	}
+	return &model.ZMessage{Success: true, Action: "VMCreate", Message: msg}, nil
 }
 
-// buildVMX 生成最小可用的 VMX 配置
-func (d *WorkstationDriver) buildVMX(cfg *model.VMConfig) string {
+// buildVMX 生成最小可用的 VMX 配置。
+// diskName 必须是 system_path 下真实存在的系统盘文件名，
+// isoPath 非空时挂到光驱（用于 ISO 安装镜像）。
+func (d *WorkstationDriver) buildVMX(cfg *model.VMConfig, diskName, isoPath string) string {
 	mem := cfg.MemNum
 	if mem <= 0 {
 		mem = 2048
@@ -327,7 +484,23 @@ func (d *WorkstationDriver) buildVMX(cfg *model.VMConfig) string {
 	if vncPort == "" {
 		vncPort = RandomVNCPort()
 	}
+	if strings.TrimSpace(diskName) == "" {
+		diskName = cfg.VmUUID + ".vmdk"
+	}
 
+	cdrom := ""
+	if isoPath != "" {
+		cdrom = fmt.Sprintf("ide1:0.present = \"TRUE\"\n"+
+			"ide1:0.deviceType = \"cdrom-image\"\n"+
+			"ide1:0.fileName = \"%s\"\n"+
+			"ide1:0.startConnected = \"TRUE\"\n", isoPath)
+	}
+
+	// UEFI 引导：云镜像（win-10-lite / debian cloud）均按 UEFI 构建，
+	// 传统 BIOS 引导会停在 "no bootable device"。
+	// Secure Boot 关闭：这些自制镜像没有微软签名，开启后会被固件拒绝引导。
+	// ulm.disableMitigations：关闭 Hyper-V 侧通道缓解（Spectre/Meltdown 补丁），
+	// 否则在已启用 Hyper-V 的宿主上 CPU 性能会明显下降。
 	return fmt.Sprintf(`.encoding = "UTF-8"
 config.version = "8"
 virtualHW.version = "19"
@@ -335,19 +508,22 @@ displayName = "%s"
 memsize = "%d"
 numvcpus = "%d"
 guestOS = "%s"
+firmware = "efi"
+uefi.secureBoot.enabled = "FALSE"
+ulm.disableMitigations = "TRUE"
 scsi0.present = "TRUE"
 scsi0.virtualDev = "lsilogic"
 scsi0:0.present = "TRUE"
-scsi0:0.fileName = "%s.vmdk"
+scsi0:0.fileName = "%s"
 scsi0:0.deviceType = "scsi-hardDisk"
 ethernet0.present = "TRUE"
 ethernet0.connectionType = "nat"
 ethernet0.virtualDev = "e1000"
 ethernet0.startConnected = "TRUE"
 floppy0.present = "FALSE"
-RemoteDisplay.vnc.enabled = "TRUE"
+%sRemoteDisplay.vnc.enabled = "TRUE"
 RemoteDisplay.vnc.port = "%s"
-`, cfg.VmUUID, mem, cpu, guestOS, cfg.VmUUID, vncPort)
+`, cfg.VmUUID, mem, cpu, guestOS, diskName, cdrom, vncPort)
 }
 
 // guestOS 将系统名映射为 VMware guestOS 标识（与 Python create_vmx 的映射思路一致）
@@ -432,16 +608,29 @@ func (d *WorkstationDriver) SetPassword(vmUUID string, password string) (*model.
 
 // GetVNCInfo 获取远程控制台信息（读取 VMX 中的 VNC 端口）
 func (d *WorkstationDriver) GetVNCInfo(vmUUID string, ipAddr string) (*model.ZMessage, error) {
-	host := d.Config.ServerAddr
-	if host == "" {
+	host, _ := d.wsHostPort()
+	if wsIsLocalAddress(host) {
 		host = "127.0.0.1"
 	}
-	port := 5900
-	d.mu.RLock()
-	if cfg, ok := d.VmSaving[vmUUID]; ok && cfg.VcPort != "" {
-		fmt.Sscanf(cfg.VcPort, "%d", &port)
+
+	// 端口以 VMX 实际配置为准：配置中心记录的 vc_port 可能与之不一致
+	// （外部导入的虚拟机尤其明显），不一致时控制台会连到错误端口。
+	port := 0
+	if vmx := d.wsVMXPath(vmUUID); vmx != "" {
+		if _, _, p := readVMXVNCConfig(vmx); p > 0 {
+			port = p
+		}
 	}
-	d.mu.RUnlock()
+	if port <= 0 {
+		d.mu.RLock()
+		if cfg, ok := d.VmSaving[vmUUID]; ok && cfg.VcPort != "" {
+			fmt.Sscanf(cfg.VcPort, "%d", &port)
+		}
+		d.mu.RUnlock()
+	}
+	if port <= 0 {
+		port = 5900
+	}
 
 	return &model.ZMessage{Success: true, Action: "VCRemote", Message: "控制台信息获取成功",
 		Results: map[string]interface{}{
@@ -455,8 +644,15 @@ func (d *WorkstationDriver) Crontab() bool {
 	if err != nil {
 		return false
 	}
+	// 与 ScanVMs 使用同一套前缀规则：调度器每轮都会跑 Crontab，
+	// 若不在这里过滤，平台上的其它虚拟机会被逐分钟「偷偷纳管」，
+	// 表现为「明明配了 filter_name，扫描/列表里却出现不带前缀的虚拟机」。
+	prefix := strings.TrimSpace(d.Config.FilterName)
 	d.mu.Lock()
 	for name, cfg := range vms {
+		if !MatchFilterPrefix(prefix, cfg) {
+			continue
+		}
 		if existing, ok := d.VmSaving[name]; ok {
 			existing.VmFlag = cfg.VmFlag
 			if cfg.ExtData != nil {

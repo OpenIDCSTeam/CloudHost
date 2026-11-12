@@ -3,10 +3,8 @@
 package driver
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -201,6 +199,14 @@ type HyperVDriver struct {
 	hvLimitMu sync.Mutex
 	// hvLimitAt 上一次全量同步限速规则的时间
 	hvLimitAt time.Time
+	// hvDevMu 保护设备枚举快照（GPU / PCI / USB 共用一次批量查询）
+	hvDevMu sync.Mutex
+	// hvDevAt 快照生成时间
+	hvDevAt time.Time
+	// hvDevData 最新设备快照
+	hvDevData *hvDeviceSnapshot
+	// hvDevLoading 标记后台刷新是否在飞，避免并发重复枚举
+	hvDevLoading bool
 }
 
 func NewHyperVDriver(cfg *model.HSConfig) *HyperVDriver {
@@ -210,7 +216,7 @@ func NewHyperVDriver(cfg *model.HSConfig) *HyperVDriver {
 func (d *HyperVDriver) GetPower(vmUUID string) string {
 	out, _, err := security.SafeExecWithTimeout(
 		[]string{"powershell", "-Command",
-			fmt.Sprintf("(Get-VM -Id '%s').State", vmUUID)},
+			hvVMExpr(vmUUID) + " | Select-Object -ExpandProperty State"},
 		15*time.Second)
 	if err != nil {
 		return "未知"
@@ -227,42 +233,84 @@ func (d *HyperVDriver) GetPower(vmUUID string) string {
 }
 
 func (d *HyperVDriver) GetVMList() (map[string]*model.VMConfig, error) {
+	// State 是枚举，直接序列化会变成数字（Off=3 / Running=2），
+	// Go 侧按字符串解析必然失败；这里先转成字符串。
+	// -InputObject 包一层 @() 保证只有一台虚拟机时也输出数组。
 	out, _, err := security.SafeExecWithTimeout(
-		[]string{"powershell", "-Command",
-			"Get-VM | Select-Object Id,Name,State | ConvertTo-Json -Compress"},
+		[]string{"powershell", "-NoProfile", "-NonInteractive", "-Command",
+			"ConvertTo-Json -InputObject @(Get-VM -ErrorAction Stop | " +
+				"Select-Object Id,Name,@{n='State';e={[string]$_.State}}) -Compress"},
 		15*time.Second)
 	if err != nil {
 		return d.BaseDriver.GetVMList()
 	}
+
 	var vms []struct {
 		Id    string `json:"Id"`
 		Name  string `json:"Name"`
 		State string `json:"State"`
 	}
-	if err := json.Unmarshal([]byte(out), &vms); err != nil {
-		return d.BaseDriver.GetVMList()
+	body := strings.TrimSpace(out)
+	if body == "" || body == "null" {
+		return d.GetVMSaving(), nil
+	}
+	if strings.HasPrefix(body, "[") {
+		if err := json.Unmarshal([]byte(body), &vms); err != nil {
+			return d.BaseDriver.GetVMList()
+		}
+	} else {
+		// 兜底：少数 PowerShell 版本仍会把单元素数组展开成对象
+		var one struct {
+			Id    string `json:"Id"`
+			Name  string `json:"Name"`
+			State string `json:"State"`
+		}
+		if err := json.Unmarshal([]byte(body), &one); err != nil {
+			return d.BaseDriver.GetVMList()
+		}
+		vms = append(vms, one)
 	}
 	result := d.GetVMSaving()
 	for _, v := range vms {
-		if cfg, ok := result[v.Id]; ok {
-			switch v.State {
-			case "Running":
-				cfg.VmFlag = model.VMPowerStarted
-			case "Off":
-				cfg.VmFlag = model.VMPowerStopped
-			}
-		} else {
-			cfg := model.NewVMConfig()
-			cfg.VmUUID = v.Id
-			cfg.OsName = v.Name
-			switch v.State {
-			case "Running":
-				cfg.VmFlag = model.VMPowerStarted
-			case "Off":
-				cfg.VmFlag = model.VMPowerStopped
-			}
-			result[v.Id] = cfg
+		// 以虚拟机名作为唯一键：创建路径（New-VM -Name vmUUID）与前端下发的
+		// vm_uuid 都是名字，早期版本用 GUID 作键会让同一台虚拟机在内存里
+		// 出现两条记录（一条名字、一条 GUID），状态也对不上。
+		key := strings.TrimSpace(v.Name)
+		if key == "" {
+			key = v.Id
 		}
+
+		cfg, ok := result[key]
+		if !ok {
+			// 兼容旧数据：把 GUID 键迁移到名字键
+			if old, legacy := result[v.Id]; legacy && old != nil {
+				delete(result, v.Id)
+				old.VmUUID = key
+				result[key] = old
+				cfg, ok = old, true
+			}
+		}
+
+		if ok && cfg != nil {
+			switch v.State {
+			case "Running":
+				cfg.VmFlag = model.VMPowerStarted
+			case "Off":
+				cfg.VmFlag = model.VMPowerStopped
+			}
+			continue
+		}
+
+		cfg = model.NewVMConfig()
+		cfg.VmUUID = key
+		cfg.OsName = v.Name
+		switch v.State {
+		case "Running":
+			cfg.VmFlag = model.VMPowerStarted
+		case "Off":
+			cfg.VmFlag = model.VMPowerStopped
+		}
+		result[key] = cfg
 	}
 	return result, nil
 }
@@ -355,33 +403,15 @@ func NewWorkstationDriver(cfg *model.HSConfig) *WorkstationDriver {
 	return &WorkstationDriver{BaseDriver: NewBaseDriver(cfg)}
 }
 
+// GetPower 查询电源状态。
+// vmrest 的电源端点返回 JSON 字符串（"poweredOn"/"poweredOff"/"suspended"），
+// 且路径中的 id 是 vmrest 内部 id，需先用虚拟机名反查（与 selectVid 一致）。
 func (d *WorkstationDriver) GetPower(vmUUID string) string {
-	url := fmt.Sprintf("http://%s/api/vms/%s/power",
-		d.Config.ServerAddr, vmUUID)
-	ctx, cancel := context.WithTimeout(d.Ctx(vmUUID), 10*time.Second)
-	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-	req.SetBasicAuth(d.Config.ServerUser, d.Config.ServerPass)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "未知"
+	vmID := vmUUID
+	if id := d.selectVid(vmUUID); id != "" {
+		vmID = id
 	}
-	defer resp.Body.Close()
-	var result struct {
-		PowerState string `json:"power_state"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "未知"
-	}
-	switch result.PowerState {
-	case "poweredOn":
-		return "运行中"
-	case "poweredOff":
-		return "已关机"
-	case "suspended":
-		return "已暂停"
-	}
-	return "未知"
+	return d.wsGetPower(vmID)
 }
 
 // ============================================================

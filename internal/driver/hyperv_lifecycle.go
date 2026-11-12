@@ -5,7 +5,9 @@ package driver
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -14,10 +16,25 @@ import (
 )
 
 // execPS 执行 PowerShell 命令
+//
+// 统一前置 UTF-8 输出设置，避免中文错误信息变成乱码；
+// 权限不足时在 error 里追加可执行的处置建议，调用方直接展示即可。
 func (d *HyperVDriver) execPS(script string) (string, error) {
+	return d.execPSTimeout(script, 2*time.Minute)
+}
+
+// execPSTimeout 同 execPS，但允许指定超时。
+//
+// 镜像转换/复制这类操作按 GB 计，2 分钟远远不够，
+// 超时被杀会留下半截系统盘，反而更难排查。
+func (d *HyperVDriver) execPSTimeout(script string, timeout time.Duration) (string, error) {
 	out, _, err := security.SafeExecWithTimeout(
-		[]string{"powershell", "-NoProfile", "-NonInteractive", "-Command", script},
-		2*time.Minute)
+		[]string{"powershell", "-NoProfile", "-NonInteractive", "-Command", psUTF8Prelude + script},
+		timeout)
+	if err != nil && psHasPermissionDenied(out) {
+		return out, fmt.Errorf("%w（HostAgent 进程缺少 Hyper-V 管理权限：请以管理员身份运行，"+
+			"或把运行账户加入本地组 Hyper-V Administrators 后重启进程）", err)
+	}
 	return out, err
 }
 
@@ -111,23 +128,27 @@ func (d *HyperVDriver) ScanVMs() (*model.ZMessage, error) {
 
 // PowerControl 电源控制
 func (d *HyperVDriver) PowerControl(vmUUID string, action model.VMPowers) (*model.ZMessage, error) {
-	var script string
+	var verb string
 	switch action {
 	case model.VMPowerSStart:
-		script = fmt.Sprintf("Start-VM -Id '%s'", psEscape(vmUUID))
+		verb = "Start-VM"
 	case model.VMPowerSClose:
-		script = fmt.Sprintf("Stop-VM -Id '%s'", psEscape(vmUUID))
+		verb = "Stop-VM"
 	case model.VMPowerHClose:
-		script = fmt.Sprintf("Stop-VM -Id '%s' -Force -TurnOff", psEscape(vmUUID))
+		verb = "Stop-VM -Force -TurnOff"
 	case model.VMPowerSReset, model.VMPowerHReset:
-		script = fmt.Sprintf("Restart-VM -Id '%s' -Force", psEscape(vmUUID))
+		verb = "Restart-VM -Force"
 	case model.VMPowerAPause:
-		script = fmt.Sprintf("Suspend-VM -Id '%s'", psEscape(vmUUID))
+		verb = "Suspend-VM"
 	case model.VMPowerAWaked:
-		script = fmt.Sprintf("Resume-VM -Id '%s'", psEscape(vmUUID))
+		verb = "Resume-VM"
 	default:
 		return d.BaseDriver.PowerControl(vmUUID, action)
 	}
+
+	script := fmt.Sprintf(
+		"$vm = %s; if (-not $vm) { throw '虚拟机不存在: %s' }; $vm | %s -ErrorAction Stop",
+		hvVMExpr(vmUUID), psEscape(vmUUID), verb)
 
 	if out, err := d.execPS(script); err != nil {
 		return &model.ZMessage{Success: false, Action: "VMPowers",
@@ -147,7 +168,175 @@ func (d *HyperVDriver) PowerControl(vmUUID string, action model.VMPowers) (*mode
 // SupportsGracefulShutdown Stop-VM（不带 -TurnOff）通过集成服务优雅关机。
 func (d *HyperVDriver) SupportsGracefulShutdown() bool { return true }
 
+// hvVMExpr 返回「取单个虚拟机对象」的 PowerShell 表达式。
+//
+// 本项目里 vmUUID 有两种来源：创建时写入的虚拟机名（hpv-xxxx），
+// 以及早期扫描落库的 GUID。Hyper-V 的 Stop-VM / Remove-VM / Start-VM
+// 等 cmdlet 都没有 -Id 参数（只有 -Name / -VM），直接拼 -Id 会报
+// "A parameter cannot be found that matches parameter name 'Id'"，
+// 因此统一按名字或 ID 过滤，再用对象管道调用 cmdlet。
+func hvVMExpr(vmUUID string) string {
+	q := psEscape(vmUUID)
+	return fmt.Sprintf(
+		"@(Get-VM -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq '%s' -or [string]$_.Id -eq '%s' } | Select-Object -First 1)",
+		q, q)
+}
+
+// hvSystemDiskPath 返回虚拟机系统盘路径（与主机配置的 system_path 同目录）
+func (d *HyperVDriver) hvSystemDiskPath(vmName string) string {
+	return filepath.Join(d.hvDiskDir(), vmName+".vhdx")
+}
+
+// hvVMDir 返回虚拟机的配置文件目录。
+//
+// New-VM 默认把 .vmcx 放到 %ProgramData%\Microsoft\Windows\Hyper-V，
+// 传 -Path 后才会落在主机配置的系统路径下，与磁盘保持同一位置。
+func (d *HyperVDriver) hvVMDir(vmName string) string {
+	return filepath.Join(d.hvDiskDir(), vmName)
+}
+
+// hvCreateSystemDisk 从镜像库复制模板并扩容到目标容量。
+//
+// 直接用 New-VHD 建出来的是空盘，Gen2 启动只会停在
+// "The boot loader did not load an operating system"。
+func (d *HyperVDriver) hvCreateSystemDisk(cfg *model.VMConfig, diskPath string) *model.ZMessage {
+	imagesPath := strings.TrimSpace(d.Config.ImagesPath)
+	osName := strings.TrimSpace(cfg.OsName)
+	if imagesPath == "" {
+		return &model.ZMessage{Success: false, Action: "VMCreate",
+			Message: "主机未配置系统镜像路径（images_path）"}
+	}
+	if osName == "" {
+		return &model.ZMessage{Success: false, Action: "VMCreate",
+			Message: "未选择操作系统镜像"}
+	}
+
+	src := filepath.Join(imagesPath, osName)
+	st, err := os.Stat(src)
+	if err != nil || st.IsDir() {
+		return &model.ZMessage{Success: false, Action: "VMCreate",
+			Message: fmt.Sprintf("系统镜像不存在: %s", src)}
+	}
+
+	// 实例系统盘统一是 .vhdx。
+	// 镜像库里的模板常见为 .vhd（Gen1 时代格式，动态盘最大 2TB），
+	// 直接把文件改名成 .vhdx 会因文件头不符被 Hyper-V 拒绝，必须真正转换。
+	switch strings.ToLower(filepath.Ext(src)) {
+	case ".vhdx":
+		if err := copyLocalFile(src, diskPath); err != nil {
+			return &model.ZMessage{Success: false, Action: "VMCreate",
+				Message: fmt.Sprintf("复制系统镜像失败: %v", err)}
+		}
+	case ".vhd":
+		_ = os.Remove(diskPath)
+		script := fmt.Sprintf(
+			"Convert-VHD -Path '%s' -DestinationPath '%s' -VHDType Dynamic -ErrorAction Stop",
+			psEscape(src), psEscape(diskPath))
+		if out, err := d.execPSTimeout(script, 30*time.Minute); err != nil {
+			_ = os.Remove(diskPath)
+			return &model.ZMessage{Success: false, Action: "VMCreate",
+				Message: fmt.Sprintf("系统镜像转换为 VHDX 失败: %v (%s)", err, strings.TrimSpace(out))}
+		}
+	default:
+		return &model.ZMessage{Success: false, Action: "VMCreate",
+			Message: fmt.Sprintf("不支持的镜像格式（需要 .vhd / .vhdx）: %s", src)}
+	}
+
+	sizeMB := cfg.HddNum
+	if sizeMB <= 0 {
+		sizeMB = 8192
+	}
+	sizeBytes := int64(sizeMB) * 1024 * 1024
+
+	// Resize-VHD 只能扩容，模板本身已大于目标容量时保持原样
+	script := fmt.Sprintf(
+		"$v = Get-VHD -Path '%s' -ErrorAction Stop; "+
+			"if ($v.Size -lt %d) { Resize-VHD -Path '%s' -SizeBytes %d -ErrorAction Stop }",
+		psEscape(diskPath), sizeBytes, psEscape(diskPath), sizeBytes)
+	if out, err := d.execPS(script); err != nil {
+		_ = os.Remove(diskPath)
+		return &model.ZMessage{Success: false, Action: "VMCreate",
+			Message: fmt.Sprintf("系统盘扩容失败: %v (%s)", err, strings.TrimSpace(out))}
+	}
+	return nil
+}
+
+// hvRollbackCreate 清理创建失败留下的半成品：
+// 不清理会让同名虚拟机在下次创建时直接冲突，磁盘也会一直占着空间。
+func (d *HyperVDriver) hvRollbackCreate(vmName, vmDir, diskPath string) {
+	script := fmt.Sprintf(
+		"Stop-VM -Name '%s' -Force -TurnOff -ErrorAction SilentlyContinue; "+
+			"Remove-VM -Name '%s' -Force -ErrorAction SilentlyContinue",
+		psEscape(vmName), psEscape(vmName))
+	_, _ = d.execPS(script)
+
+	if vmDir != "" {
+		_ = os.RemoveAll(vmDir)
+	}
+	if diskPath != "" {
+		_ = os.Remove(diskPath)
+	}
+}
+
+// hvConnectNics 按 nic_all 把网卡接到虚拟交换机。
+//
+// Hyper-V 的交换机名沿用主机的 network_nat / network_pub 字段
+// （与 QEMU 驱动里的 bridge 名同一语义）。未配置时保持网卡未连接，
+// 不阻断创建流程，只把原因带回消息里。
+func (d *HyperVDriver) hvConnectNics(vmName string, nics map[string]model.NCConfig) string {
+	if len(nics) == 0 {
+		return ""
+	}
+
+	names := make([]string, 0, len(nics))
+	for name := range nics {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	parts := []string{"$ErrorActionPreference='SilentlyContinue';"}
+	added := 0
+	for _, name := range names {
+		nic := nics[name]
+		sw := strings.TrimSpace(d.Config.NetworkPub)
+		if nic.EffectiveNicType() != "pub" {
+			sw = strings.TrimSpace(d.Config.NetworkNat)
+		}
+		if sw == "" {
+			continue
+		}
+
+		if added == 0 {
+			// New-VM 已经创建了一张未连接的适配器，优先复用它
+			parts = append(parts, fmt.Sprintf(
+				"$nic = Get-VMNetworkAdapter -VMName '%s' | Select-Object -First 1; "+
+					"if ($nic) { Connect-VMNetworkAdapter -VMNetworkAdapter $nic -SwitchName '%s' }",
+				psEscape(vmName), psEscape(sw)))
+		} else {
+			parts = append(parts, fmt.Sprintf(
+				"Add-VMNetworkAdapter -VMName '%s' -Name '%s'; "+
+					"Connect-VMNetworkAdapter -VMName '%s' -Name '%s' -SwitchName '%s'",
+				psEscape(vmName), psEscape(name), psEscape(vmName), psEscape(name), psEscape(sw)))
+		}
+		added++
+	}
+	if added == 0 {
+		return ""
+	}
+
+	if out, err := d.execPS(strings.Join(parts, " ")); err != nil {
+		return fmt.Sprintf("（网卡连接失败: %s）", strings.TrimSpace(out))
+	}
+	return ""
+}
+
 // CreateVM 创建虚拟机
+//
+// 与旧实现的差异：
+//   - 系统盘从镜像库复制并扩容，不再 New-VHD 建空盘
+//   - 虚拟机配置文件跟随 system_path，不再落到 C:\ProgramData\Microsoft\Windows\Hyper-V
+//   - 关闭自动检查点，关闭安全启动但保留 TPM
+//   - 启动顺序优先系统盘，避免每次先走网络引导超时
 func (d *HyperVDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	vmName := cfg.VmUUID
 	mem := cfg.MemNum
@@ -158,25 +347,47 @@ func (d *HyperVDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	if cpu <= 0 {
 		cpu = 1
 	}
-	diskPath := filepath.Join(d.hvDiskDir(), vmName+".vhdx")
-	sizeMB := cfg.HddNum
-	if sizeMB <= 0 {
-		sizeMB = 8192
+
+	diskPath := d.hvSystemDiskPath(vmName)
+	vmDir := d.hvVMDir(vmName)
+
+	if msg := d.hvCreateSystemDisk(cfg, diskPath); msg != nil {
+		return msg, nil
 	}
-	sizeBytes := int64(sizeMB) * 1024 * 1024
 
 	script := fmt.Sprintf(
-		"New-VM -Name '%s' -MemoryStartupBytes %dMB -Generation 2 -ErrorAction Stop; "+
-			"New-VHD -Path '%s' -SizeBytes %d -Dynamic -ErrorAction Stop; "+
+		"New-Item -ItemType Directory -Force -Path '%s' | Out-Null; "+
+			"New-VM -Name '%s' -MemoryStartupBytes %dMB -Generation 2 -Path '%s' -ErrorAction Stop; "+
+			"Set-VM -Name '%s' -AutomaticCheckpointsEnabled $false -ErrorAction Stop; "+
+			"Set-VMFirmware -VMName '%s' -EnableSecureBoot Off -ErrorAction Stop; "+
+			"Set-VMKeyProtector -VMName '%s' -NewLocalKeyProtector -ErrorAction Stop; "+
+			"Enable-VMTPM -VMName '%s' -ErrorAction Stop; "+
 			"Add-VMHardDiskDrive -VMName '%s' -Path '%s' -ErrorAction Stop; "+
-			"Set-VMProcessor -VMName '%s' -Count %d; "+
-			"Start-VM -Name '%s'",
-		psEscape(vmName), mem, psEscape(diskPath), sizeBytes,
-		psEscape(vmName), psEscape(diskPath), psEscape(vmName), cpu, psEscape(vmName))
+			"Set-VMProcessor -VMName '%s' -Count %d -ErrorAction Stop; "+
+			"$disk = Get-VMHardDiskDrive -VMName '%s' | Select-Object -First 1; "+
+			"Set-VMFirmware -VMName '%s' -FirstBootDevice $disk -ErrorAction SilentlyContinue",
+		psEscape(vmDir),
+		psEscape(vmName), mem, psEscape(vmDir),
+		psEscape(vmName),
+		psEscape(vmName),
+		psEscape(vmName),
+		psEscape(vmName),
+		psEscape(vmName), psEscape(diskPath),
+		psEscape(vmName), cpu,
+		psEscape(vmName),
+		psEscape(vmName))
 
 	if out, err := d.execPS(script); err != nil {
+		d.hvRollbackCreate(vmName, vmDir, diskPath)
 		return &model.ZMessage{Success: false, Action: "VMCreate",
 			Message: fmt.Sprintf("创建虚拟机失败: %v (%s)", err, strings.TrimSpace(out))}, nil
+	}
+
+	nicWarn := d.hvConnectNics(vmName, cfg.NicAll)
+
+	if out, err := d.execPS(fmt.Sprintf("Start-VM -Name '%s' -ErrorAction Stop", psEscape(vmName))); err != nil {
+		return &model.ZMessage{Success: false, Action: "VMCreate",
+			Message: fmt.Sprintf("虚拟机已创建但启动失败: %v (%s)", err, strings.TrimSpace(out))}, nil
 	}
 
 	cfg.VmFlag = model.VMPowerStarted
@@ -188,7 +399,7 @@ func (d *HyperVDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	limitErr := d.hvApplyVMBandwidth(cfg)
 
 	return &model.ZMessage{Success: true, Action: "VMCreate",
-		Message: "虚拟机创建成功" + hvLimitWarn(limitErr)}, nil
+		Message: "虚拟机创建成功" + nicWarn + hvLimitWarn(limitErr)}, nil
 }
 
 // DeleteVM 删除虚拟机
@@ -208,9 +419,10 @@ func (d *HyperVDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMessa
 	}
 
 	script := fmt.Sprintf(
-		"Stop-VM -Id '%s' -Force -TurnOff -ErrorAction SilentlyContinue; "+
-			"Remove-VM -Id '%s' -Force -ErrorAction Stop",
-		psEscape(vmUUID), psEscape(vmUUID))
+		"$vm = %s; if (-not $vm) { throw '虚拟机不存在: %s' }; "+
+			"$vm | Stop-VM -Force -TurnOff -ErrorAction SilentlyContinue; "+
+			"$vm | Remove-VM -Force -ErrorAction Stop",
+		hvVMExpr(vmUUID), psEscape(vmUUID))
 
 	if out, err := d.execPS(script); err != nil {
 		return &model.ZMessage{Success: false, Action: "VMDelete",
@@ -270,26 +482,36 @@ func (d *HyperVDriver) UpdateVM(cfg *model.VMConfig, oldCfg *model.VMConfig) (*m
 		Message: "虚拟机配置更新成功" + hvLimitWarn(limitErr)}, nil
 }
 
-// ReinstallVM 重装系统（断开旧盘、创建新盘并启动）
+// ReinstallVM 重装系统（断开旧盘、从镜像库重建系统盘并启动）
 func (d *HyperVDriver) ReinstallVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	vmName := cfg.VmUUID
 	_, _ = d.PowerControl(vmName, model.VMPowerHClose)
 
-	diskPath := filepath.Join(d.hvDiskDir(), vmName+".vhdx")
-	sizeMB := cfg.HddNum
-	if sizeMB <= 0 {
-		sizeMB = 8192
+	diskPath := d.hvSystemDiskPath(vmName)
+
+	// 先摘除并删除旧盘：文件被挂载时无法覆盖
+	detach := fmt.Sprintf(
+		"Get-VMHardDiskDrive -VMName '%s' | Where-Object { $_.Path -like '*%s*' } | "+
+			"Remove-VMHardDiskDrive -ErrorAction SilentlyContinue; "+
+			"Remove-Item -LiteralPath '%s' -Force -ErrorAction SilentlyContinue",
+		psEscape(vmName), psEscape(diskPath), psEscape(diskPath))
+	if out, err := d.execPS(detach); err != nil {
+		return &model.ZMessage{Success: false, Action: "VMReinstall",
+			Message: fmt.Sprintf("卸载旧系统盘失败: %v (%s)", err, strings.TrimSpace(out))}, nil
 	}
-	sizeBytes := int64(sizeMB) * 1024 * 1024
+
+	if msg := d.hvCreateSystemDisk(cfg, diskPath); msg != nil {
+		return &model.ZMessage{Success: false, Action: "VMReinstall",
+			Message: "重装失败: " + msg.Message}, nil
+	}
 
 	script := fmt.Sprintf(
-		"Get-VMHardDiskDrive -VMName '%s' | Remove-VMHardDiskDrive -ErrorAction SilentlyContinue; "+
-			"Remove-Item -Path '%s' -Force -ErrorAction SilentlyContinue; "+
-			"New-VHD -Path '%s' -SizeBytes %d -Dynamic -ErrorAction Stop; "+
-			"Add-VMHardDiskDrive -VMName '%s' -Path '%s' -ErrorAction Stop; "+
-			"Start-VM -Name '%s'",
-		psEscape(vmName), psEscape(diskPath), psEscape(diskPath), sizeBytes,
-		psEscape(vmName), psEscape(diskPath), psEscape(vmName))
+		"Add-VMHardDiskDrive -VMName '%s' -Path '%s' -ErrorAction Stop; "+
+			"$disk = Get-VMHardDiskDrive -VMName '%s' | Select-Object -First 1; "+
+			"Set-VMFirmware -VMName '%s' -FirstBootDevice $disk -ErrorAction SilentlyContinue; "+
+			"Start-VM -Name '%s' -ErrorAction Stop",
+		psEscape(vmName), psEscape(diskPath),
+		psEscape(vmName), psEscape(vmName), psEscape(vmName))
 
 	if out, err := d.execPS(script); err != nil {
 		return &model.ZMessage{Success: false, Action: "VMReinstall",

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
@@ -46,6 +47,61 @@ func (d *ESXiDriver) esxiDefaultHost() (*object.HostSystem, error) {
 		return nil, err
 	}
 	return d.finder.DefaultHostSystem(d.Ctx(""))
+}
+
+// esxiSplitDatastore 拆分 vSphere 数据存储路径 `[ds] sub/path`。
+// ok=false 表示配置里没有方括号（只给了数据存储名）。
+func esxiSplitDatastore(v string) (ds, sub string, ok bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "", "", false
+	}
+	i := strings.Index(v, "]")
+	if i < 0 {
+		return strings.Trim(v, "[] "), "", false
+	}
+	ds = strings.TrimSpace(strings.TrimLeft(v[:i], "["))
+	sub = strings.TrimSpace(strings.Trim(v[i+1:], "/"))
+	return ds, sub, true
+}
+
+// esxiDatastorePath 把「存储目录配置」与「文件名」拼成 `[ds] dir/name`。
+//
+// 主机表单里的存储路径按目录语义填写，支持三种写法：
+//   - datastore1             仅数据存储名
+//   - [datastore1]           数据存储根目录
+//   - [datastore1] images/   数据存储内的子目录
+//
+// 若配置本身已指向文件（末段带扩展名），原样返回，兼容历史写法。
+func esxiDatastorePath(dir, name string) string {
+	dir = strings.TrimSpace(dir)
+	name = strings.TrimLeft(strings.TrimSpace(name), "/")
+	if dir == "" {
+		return name
+	}
+
+	ds, sub, ok := esxiSplitDatastore(dir)
+	if !ok {
+		if name == "" {
+			return fmt.Sprintf("[%s]", ds)
+		}
+		return fmt.Sprintf("[%s] %s", ds, name)
+	}
+	if name == "" {
+		if sub == "" {
+			return fmt.Sprintf("[%s]", ds)
+		}
+		return fmt.Sprintf("[%s] %s", ds, sub)
+	}
+	// 配置已指向具体文件：视为完整路径，不再拼接
+	if path.Ext(sub) != "" {
+		return fmt.Sprintf("[%s] %s", ds, sub)
+	}
+	// 文件名自带子目录时以它为准，避免 images/images 重复
+	if sub == "" || strings.Contains(name, "/") {
+		return fmt.Sprintf("[%s] %s", ds, name)
+	}
+	return fmt.Sprintf("[%s] %s", ds, path.Join(sub, name))
 }
 
 // ensurePoweredOff 确保虚拟机处于关机状态，返回原状态以便恢复
@@ -343,14 +399,20 @@ func (d *ESXiDriver) MountISO(vmUUID string, iso *model.IMConfig, mount bool) (*
 	}
 
 	if mount {
-		isoPath := iso.IsoPath
+		isoPath := strings.TrimSpace(iso.IsoPath)
 		if isoPath == "" {
-			dsName := strings.TrimSpace(d.Config.DvdromPath)
-			if dsName == "" {
-				isoPath = iso.IsoFile
-			} else {
-				isoPath = fmt.Sprintf("[%s] %s", dsName, iso.IsoFile)
+			isoPath = strings.TrimSpace(iso.IsoFile)
+		}
+		// 裸文件名/相对路径（不含 [ds]）按配置目录拼接；已带方括号的原样使用
+		if isoPath != "" && !strings.Contains(isoPath, "]") && !strings.HasPrefix(isoPath, "/") {
+			dir := strings.TrimSpace(d.Config.DvdromPath)
+			if dir == "" {
+				dir = strings.TrimSpace(d.Config.ImagesPath)
 			}
+			isoPath = esxiDatastorePath(dir, isoPath)
+		}
+		if isoPath == "" {
+			return &model.ZMessage{Success: false, Action: "ISOMount", Message: "未指定 ISO 文件"}, nil
 		}
 		devices.InsertIso(cdrom, isoPath)
 		if err := vm.EditDevice(d.Ctx(""), cdrom); err != nil {
@@ -451,10 +513,7 @@ func (d *ESXiDriver) ReinstallVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	newPath := ds.Path(fmt.Sprintf("%s/%s.vmdk", cfg.VmUUID, cfg.VmUUID))
 	copied := false
 	if tpl := strings.TrimSpace(d.Config.ImagesPath); tpl != "" && cfg.OsName != "" {
-		src := tpl
-		if !strings.Contains(src, "]") {
-			src = fmt.Sprintf("[%s] %s", tpl, cfg.OsName)
-		}
+		src := esxiDatastorePath(tpl, cfg.OsName)
 		fm := object.NewFileManager(vm.Client())
 		if task, err := fm.CopyDatastoreFile(d.Ctx(""), src, d.datacenter, newPath, d.datacenter, true); err == nil && task != nil {
 			if task.Wait(d.Ctx("")) == nil {

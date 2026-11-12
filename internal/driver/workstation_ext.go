@@ -2,7 +2,7 @@
 //
 // 补齐 Python 版 HostServer/Workstation.py 中存在、而 Go 版此前缺失的能力：
 //   - 系统重装（VMSetups）：复制系统模板镜像并扩展磁盘容量
-//   - 屏幕截图（VMScreen）：vmrun captureScreen
+//   - 屏幕截图（VMScreen）：Workstation 无截图 API，改走 RemoteDisplay VNC 帧缓冲
 //   - USB 设备枚举（USBShows）：Windows 走 PowerShell，其它平台走 lsusb
 //
 // 说明：HDDMount / ISOMount / RMMounts 在 Python 版中同样是调用基类
@@ -10,9 +10,11 @@
 package driver
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,9 +53,9 @@ func (d *WorkstationDriver) vmxPath(vmUUID string) string {
 
 // ReinstallVM 重装系统：用系统模板镜像覆盖系统盘，并把磁盘扩展到目标容量。
 //
-// 与 Python 版 Workstation.VMSetups 一致：
-//  1. 复制 <images_path>/<os_name> → <system_path>/<vm_uuid>.<ext>
-//  2. vmware-vdiskmanager -x <size>GB 扩展磁盘
+// 与 Python 版 Workstation.VMSetups 一致，并补上 VMX 引用同步：
+// 原实现复制出 <uuid>.vhd 后 VMX 仍指向 <uuid>.vmdk，重装完成开机依旧报
+// File not found，等于把系统重装成了「不可启动」。
 func (d *WorkstationDriver) ReinstallVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	vmUUID := cfg.VmUUID
 
@@ -64,61 +66,27 @@ func (d *WorkstationDriver) ReinstallVM(cfg *model.VMConfig) (*model.ZMessage, e
 	}
 	time.Sleep(2 * time.Second)
 
-	templateName := strings.TrimSpace(cfg.OsName)
-	imagesPath := strings.TrimSpace(d.Config.ImagesPath)
-	if templateName == "" || imagesPath == "" {
-		return &model.ZMessage{Success: false, Action: "VMReinstall",
-			Message: "未配置系统模板镜像（os_name / images_path）"}, nil
-	}
-
-	srcFile := filepath.Join(imagesPath, templateName)
-	if _, err := os.Stat(srcFile); err != nil {
-		return &model.ZMessage{Success: false, Action: "VMReinstall",
-			Message: "系统模板镜像不存在: " + srcFile}, nil
-	}
-
 	dir := strings.TrimSpace(d.Config.SystemPath)
 	if dir == "" {
 		dir = "."
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	vmxPath := d.vmxPath(vmUUID)
+	oldDisk := readVMXDiskFile(vmxPath)
+
+	diskName, warn, err := d.prepareSystemDisk(cfg, dir, true)
+	if err != nil {
 		return &model.ZMessage{Success: false, Action: "VMReinstall",
-			Message: "创建虚拟机目录失败: " + err.Error()}, nil
+			Message: "准备系统盘失败: " + err.Error()}, nil
 	}
 
-	// 目标盘沿用模板扩展名（vmdk 等），与 Python 版 _get_vm_path + 后缀拼接一致
-	ext := filepath.Ext(templateName)
-	dstFile := filepath.Join(dir, vmUUID+ext)
-
-	if _, _, err := security.SafeExecWithTimeout([]string{"cp", "-f", srcFile, dstFile}, 30*time.Minute); err != nil {
-		// Windows 无 cp，改用 PowerShell Copy-Item
-		ps := fmt.Sprintf("Copy-Item -LiteralPath '%s' -Destination '%s' -Force -ErrorAction Stop",
-			psEscape(srcFile), psEscape(dstFile))
-		if out, _, e := security.SafeExecWithTimeout(
-			[]string{"powershell", "-NoProfile", "-NonInteractive", "-Command", ps}, 30*time.Minute); e != nil {
+	// 模板扩展名可能变化（.vmdk → .vhd），旧盘残留会被误认为数据盘
+	if oldDisk != "" && !strings.EqualFold(oldDisk, diskName) {
+		_ = os.Remove(filepath.Join(dir, oldDisk))
+	}
+	if _, statErr := os.Stat(vmxPath); statErr == nil {
+		if updErr := updateVMXDiskFile(vmxPath, diskName); updErr != nil {
 			return &model.ZMessage{Success: false, Action: "VMReinstall",
-				Message: fmt.Sprintf("复制系统镜像失败: %v (%s)", e, strings.TrimSpace(out))}, nil
-		}
-	}
-
-	// 扩展磁盘到目标容量（GB）
-	if cfg.HddNum > 0 {
-		sizeGB := cfg.HddNum / 1024
-		if sizeGB <= 0 {
-			sizeGB = 20
-		}
-		// vmware-vdiskmanager -x 20GB /path/to/disk.vmdk
-		if out, _, err := security.SafeExecWithTimeout(
-			[]string{"vmware-vdiskmanager", "-x", fmt.Sprintf("%dGB", sizeGB), dstFile},
-			30*time.Minute); err != nil {
-			// 扩展失败不阻断重装（部分镜像不支持在线扩展），但需明确告知
-			d.mu.Lock()
-			if c, ok := d.VmSaving[vmUUID]; ok {
-				c.OsName = cfg.OsName
-			}
-			d.mu.Unlock()
-			return &model.ZMessage{Success: true, Action: "VMReinstall",
-				Message: fmt.Sprintf("系统盘已重建，但磁盘扩展失败（可手动扩容）: %s", strings.TrimSpace(out))}, nil
+				Message: "更新 VMX 磁盘引用失败: " + updErr.Error()}, nil
 		}
 	}
 
@@ -132,32 +100,159 @@ func (d *WorkstationDriver) ReinstallVM(cfg *model.VMConfig) (*model.ZMessage, e
 	// 重新启动
 	_, _ = d.PowerControl(vmUUID, model.VMPowerSStart)
 
-	return &model.ZMessage{Success: true, Action: "VMReinstall", Message: "系统重装成功"}, nil
+	msg := "系统重装成功"
+	if warn != "" {
+		msg += "（" + warn + "）"
+	}
+	return &model.ZMessage{Success: true, Action: "VMReinstall", Message: msg}, nil
 }
 
-// GetScreenshot 通过 vmrun captureScreen 截图
+// GetScreenshot 采集虚拟机当前屏幕。
+//
+// Workstation 没有可用的截图 API：vmrest 无截图端点；vmrun captureScreen 在
+// Workstation 上被当作 guest 操作执行，直接报
+// 「Anonymous guest operations are not allowed ... VixVM_LoginInGuest」。
+// 这里改为复用驱动的 RemoteDisplay VNC 通道（与前端 noVNC 控制台同源）
+// 读取一帧帧缓冲并转成 PNG。
 func (d *WorkstationDriver) GetScreenshot(vmUUID string) (string, error) {
 	if d.GetPower(vmUUID) != "运行中" {
 		return "", fmt.Errorf("虚拟机未运行，无法截图")
 	}
-	vmx := d.vmxPath(vmUUID)
-	if _, err := os.Stat(vmx); err != nil {
-		return "", fmt.Errorf("虚拟机配置文件不存在: %s", vmx)
-	}
-
-	tmp := filepath.Join(os.TempDir(),
-		fmt.Sprintf("hostagent-screen-%s-%d.png", vmUUID, time.Now().UnixNano()))
-	defer os.Remove(tmp)
-
-	out, _, err := security.SafeExecWithTimeout(
-		[]string{d.vmrunBin(), "-T", "ws", "captureScreen", vmx, tmp}, 60*time.Second)
+	host, port, err := d.vncCaptureEndpoint(vmUUID)
 	if err != nil {
-		return "", fmt.Errorf("vmrun captureScreen 失败: %v (%s)", err, strings.TrimSpace(out))
+		return "", err
 	}
-	if _, err := os.Stat(tmp); err != nil {
-		return "", fmt.Errorf("截图文件未生成")
+	pngData, err := captureVNCScreenshot(host, port, 12*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("VNC 抓屏失败: %w", err)
 	}
-	return readFileAsDataURL(tmp)
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngData), nil
+}
+
+// vncCaptureEndpoint 解析截图使用的 VNC 地址与端口。
+//
+// 端口以 VMX 中的 RemoteDisplay.vnc.port 为准（外部创建的虚拟机可能不在
+// system_path 下、端口也与配置中心记录的不一致），VMX 不可用时回退到
+// 配置中心记录的 vc_port。
+func (d *WorkstationDriver) vncCaptureEndpoint(vmUUID string) (string, int, error) {
+	vmx := d.wsVMXPath(vmUUID)
+	if vmx == "" {
+		vmx = d.vmxPath(vmUUID)
+	}
+
+	fallback := ""
+	d.mu.RLock()
+	if cfg, ok := d.VmSaving[vmUUID]; ok && cfg != nil {
+		fallback = cfg.VcPort
+	}
+	d.mu.RUnlock()
+
+	port, err := resolveVNCConfigPort(vmx, fallback)
+	if err != nil {
+		return "", 0, err
+	}
+
+	host, _ := d.wsHostPort()
+	if wsIsLocalAddress(host) {
+		host = "127.0.0.1"
+	}
+	return host, port, nil
+}
+
+// resolveVNCConfigPort 决定截图使用的 VNC 端口：
+// VMX 中的 RemoteDisplay.vnc.port 优先，其次配置中心记录的 vc_port。
+// VMX 明确关闭 VNC 时直接返回可操作的提示，避免无意义的连接尝试。
+func resolveVNCConfigPort(vmxPath, fallbackPort string) (int, error) {
+	if strings.TrimSpace(vmxPath) == "" {
+		return 0, fmt.Errorf("无法定位虚拟机配置文件，无法截图")
+	}
+	// 配置文件读不到时只能凭配置端口尝试（虚拟机可能不在 system_path 下）
+	if _, err := os.Stat(vmxPath); err != nil {
+		if n, e := strconv.Atoi(strings.TrimSpace(fallbackPort)); e == nil && n > 0 {
+			return n, nil
+		}
+		return 0, fmt.Errorf("未找到虚拟机配置文件: %s", vmxPath)
+	}
+
+	found, enabled, vncPort := readVMXVNCConfig(vmxPath)
+	if !found || !enabled {
+		return 0, fmt.Errorf("虚拟机未启用 VNC 控制台，无法截图；开机会自动补配置，请关机重启后重试")
+	}
+	if vncPort > 0 {
+		return vncPort, nil
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(fallbackPort)); err == nil && n > 0 {
+		return n, nil
+	}
+	return 0, fmt.Errorf("虚拟机未配置 VNC 控制台端口，无法截图")
+}
+
+// ensureVMXVNC 在开机前补齐 VNC 控制台配置。
+//
+// 只在 VMX 完全没有 RemoteDisplay.vnc.* 时追加，不覆盖已有配置：
+// 用户显式关闭 VNC 时保持关闭。端口优先取主机配置里的 vc_port，
+// 否则随机分配（与 CreateVM 一致）。
+func ensureVMXVNC(vmxPath, fallbackPort string) error {
+	if strings.TrimSpace(vmxPath) == "" {
+		return nil
+	}
+	if found, _, _ := readVMXVNCConfig(vmxPath); found {
+		return nil
+	}
+	port := 0
+	if n, err := strconv.Atoi(strings.TrimSpace(fallbackPort)); err == nil && n > 0 {
+		port = n
+	}
+	if port <= 0 {
+		if n, err := strconv.Atoi(RandomVNCPort()); err == nil && n > 0 {
+			port = n
+		}
+	}
+	if port <= 0 {
+		port = 5900
+	}
+
+	data, err := os.ReadFile(vmxPath)
+	if err != nil {
+		return err
+	}
+	text := string(data)
+	if text != "" && !strings.HasSuffix(text, "\n") {
+		text += "\n"
+	}
+	text += fmt.Sprintf("RemoteDisplay.vnc.enabled = \"TRUE\"\nRemoteDisplay.vnc.port = \"%d\"\n", port)
+	return os.WriteFile(vmxPath, []byte(text), 0o644)
+}
+
+// readVMXVNCConfig 读取 VMX 中的 VNC 控制台配置。
+// found 表示 VMX 中是否存在 RemoteDisplay.vnc.* 键，用于区分「明确关闭」与「文件不可读」。
+func readVMXVNCConfig(vmxPath string) (found bool, enabled bool, port int) {
+	data, err := os.ReadFile(vmxPath)
+	if err != nil {
+		return false, false, 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		i := strings.Index(line, "=")
+		if i <= 0 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(line[:i]))
+		if !strings.HasPrefix(key, "remotedisplay.vnc.") {
+			continue
+		}
+		found = true
+		val := strings.Trim(strings.TrimSpace(line[i+1:]), `"'`)
+		switch key {
+		case "remotedisplay.vnc.enabled":
+			enabled = strings.EqualFold(val, "TRUE")
+		case "remotedisplay.vnc.port":
+			if n, err := strconv.Atoi(val); err == nil {
+				port = n
+			}
+		}
+	}
+	return found, enabled, port
 }
 
 // GetPCIList Workstation 不支持 PCI 直通（与 Python 版 PCIShows 返回空一致）

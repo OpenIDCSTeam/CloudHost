@@ -412,13 +412,14 @@ func (app *App) handleHostList(c *gin.Context) {
 	utils.Success(c, result)
 }
 
-// hostVMUUIDs 返回主机下的虚拟机 UUID 列表（优先内存态，回退数据库）
+// hostVMUUIDs 返回主机下的虚拟机 UUID 列表（优先内存态，回退数据库）。
+//
+// 走带缓存的快照读取：该函数被主机列表遍历调用，
+// 一旦某台主机的驱动卡住，整个 /api/server/detail 会被拖死。
 func (app *App) hostVMUUIDs(hsName string) []string {
 	uuids := []string{}
-	if d := app.HostSvc.GetDriver(hsName); d != nil {
-		for uuid := range d.GetVMSaving() {
-			uuids = append(uuids, uuid)
-		}
+	for uuid := range app.HostSvc.VMDriverSnapshot(hsName) {
+		uuids = append(uuids, uuid)
 	}
 	if len(uuids) == 0 {
 		if vms, err := app.DB.GetVMSaving(hsName); err == nil {

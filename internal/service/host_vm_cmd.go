@@ -71,26 +71,35 @@ func (s *HostService) CheckVMOwnership(username, hsName, vmUUID string) bool {
 	return false
 }
 
-// VMCount 返回主机下的虚拟机数量（优先驱动内存，其次数据库）
+// VMCount 返回主机下的虚拟机数量（优先驱动快照缓存，其次数据库）。
+//
+// 走缓存而不是驱动的原始内存：该函数会被主机列表逐台调用，
+// 一旦某台主机的驱动锁被占用，列表接口会被整体拖死。
 func (s *HostService) VMCount(hsName string) int {
-	if d := s.getDriver(hsName); d != nil {
-		return len(d.GetVMSaving())
+	if vms := s.VMDriverSnapshot(hsName); vms != nil {
+		return len(vms)
 	}
-	vms, err := s.db.GetVMSaving(hsName)
+	raws, err := s.db.GetVMSaving(hsName)
 	if err != nil {
 		return 0
 	}
-	return len(vms)
+	return len(raws)
 }
 
 // MustGetVMConfig 读取虚拟机配置：优先驱动内存，其次数据库；
 // 不存在或无法解析时返回 nil。
+//
+// 驱动侧读取限时 vmReadTimeout：详情 / 写前校验都不能被平台锁拖住，
+// 超时直接回退数据库中的配置（写操作随后会以数据库为基准）。
 func (s *HostService) MustGetVMConfig(hsName, vmUUID string) *model.VMConfig {
 	if hsName == "" || vmUUID == "" {
 		return nil
 	}
-	if d := s.GetDriver(hsName); d != nil {
-		if cfg, err := d.GetVMDetail(vmUUID); err == nil {
+	if d := s.getDriver(hsName); d != nil {
+		cfg, err := callWithTimeout(vmReadTimeout, func() (*model.VMConfig, error) {
+			return d.GetVMDetail(vmUUID)
+		})
+		if err == nil && cfg != nil {
 			return cfg
 		}
 	}

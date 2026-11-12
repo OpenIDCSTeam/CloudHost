@@ -39,6 +39,22 @@ var errNetLimiterUnsupported = errors.New("当前系统不支持 NetLimiter 限�
 // 显式安装（EnsureBandwidthDriver / 运维接口）可解除该状态。
 var errNetLimiterDisabled = errors.New("限速驱动已被手动卸载，需重新安装后才能限速")
 
+// nlFeatureEnabled 默认部署是否启用内核限速驱动。
+//
+// 现状：NetLimiter.sys 在部分宿主上加载后会导致虚拟交换机网络中断，
+// 因此默认关闭。关闭后默认流程：
+//   - 不释放驱动文件、不创建内核服务、不启动服务
+//   - 不主动卸载：宿主上已有的服务不会被默认流程改动
+//   - 不下发任何限速规则（创建、改配、Crontab 同步全部跳过）
+//
+// 代码与其运维接口保留：管理员显式调用 InstallBandwidthDriver（运维接口）
+// 仍可解除限制并安装，装好之后限速逻辑恢复正常。驱动字节仍内嵌在二进制里。
+const nlFeatureEnabled = false
+
+// errNetLimiterRemoved 默认流程已停用自动安装限速驱动。
+// 仅在非显式（force=false）的安装入口返回，提示调用方改走运维接口。
+var errNetLimiterRemoved = errors.New("带宽限速驱动默认不安装（加载后会导致虚拟交换机断网），如需启用请显式调用安装接口")
+
 // netLimiterDriverBytes 内置的 NetLimiter.sys（WFP 限速驱动）。
 // 运行时释放到 %SystemRoot%\System32\drivers\ 并以内核服务方式加载。
 //
@@ -162,6 +178,7 @@ func defaultNetLimiterPath(cfg *model.HSConfig) string {
 }
 
 // netLimiterAvailable 报告限速驱动是否已就绪。
+// 默认流程从不安装驱动，因此未显式安装时恒为 false。
 func netLimiterAvailable() bool {
 	nlMu.Lock()
 	defer nlMu.Unlock()
@@ -170,6 +187,7 @@ func netLimiterAvailable() bool {
 
 // netLimiterStatus 限速驱动的运行状态快照（用于运维自检）。
 type netLimiterStatus struct {
+	Enabled    bool   // 功能是否启用（false = 代码层面已停用，不会加载驱动）
 	Supported  bool   // 当前平台是否支持（仅 Windows）
 	Installed  bool   // 内核服务是否已注册
 	Running    bool   // 内核服务是否在运行
@@ -181,7 +199,7 @@ type netLimiterStatus struct {
 
 // netLimiterReport 查询驱动状态；驱动未就绪时不会触发安装。
 func netLimiterReport(driverPath string) netLimiterStatus {
-	st := netLimiterStatus{Supported: nlSupported(), Rules: -1}
+	st := netLimiterStatus{Enabled: nlFeatureEnabled, Supported: nlSupported(), Rules: -1}
 	if st.Supported {
 		installed, running, err := nlQueryDriver()
 		if err == nil {
@@ -236,11 +254,19 @@ func netLimiterUninstall(driverPath string) error {
 
 // netLimiterEnsure 幂等地安装并启动驱动、打开设备并启用全局开关。
 //
-// 管理员显式卸载过驱动时直接返回 errNetLimiterDisabled，
-// 避免 Crontab / 创建虚拟机等后台流程把驱动又装回去。
+// 默认路径（主机加载 / 创建虚拟机 / 改配 / Crontab）一律走这里：
+// 默认部署不安装驱动，直接返回 errNetLimiterRemoved；
+// 只有显式安装入口 netLimiterEnsureForce 才能绕过该限制。
+//
+// 管理员显式卸载过驱动时返回 errNetLimiterDisabled。
 func netLimiterEnsure(driverPath string) error {
 	nlMu.Lock()
 	defer nlMu.Unlock()
+	// 默认部署不安装驱动（nlReady 恒为 false）；
+	// 管理员显式安装过之后 nlReady=true，这里恢复正常的幂等语义。
+	if !nlFeatureEnabled && !nlReady {
+		return errNetLimiterRemoved
+	}
 	return nlEnsureLocked(driverPath)
 }
 

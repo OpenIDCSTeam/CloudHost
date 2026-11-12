@@ -1,5 +1,11 @@
 // Package driver Hyper-V 按虚拟机上下行带宽限速。
 //
+// 【默认不安装、不启动】NetLimiter.sys 在部分宿主上加载后会导致虚拟交换机
+// 网络中断，因此默认部署由 nlFeatureEnabled 关闭（见 netlimiter.go）：
+// 主机加载、创建虚拟机、改配、Crontab 都不会释放驱动文件或创建内核服务。
+// 代码与运维接口完整保留：显式调用 InstallBandwidthDriver 即可启用，
+// 或把 nlFeatureEnabled 改回 true 重新编译。
+//
 // Hyper-V 原生的 Set-VMNetworkAdapter -MaximumBandwidth 只能限制网卡双向
 // 合计带宽，无法区分上行/下行。这里通过随附的 NetLimiter WFP 驱动
 // （\\Device\\TransMonitor）按虚拟机网卡 MAC 下发规则，实现：
@@ -141,6 +147,11 @@ func (d *HyperVDriver) hvLimitDue() bool {
 // 当前没有任何虚拟机配置带宽时直接跳过，避免为不用的功能加载内核组件；
 // 管理员手动卸载过的驱动不会被后台流程装回（需显式 InstallBandwidthDriver）。
 func (d *HyperVDriver) EnsureBandwidthDriver() error {
+	if !nlFeatureEnabled {
+		// 默认部署不安装、不启动，也不去动宿主上已有的服务：
+		// 主机加载 / 配置重载都会被这条分支挡住，内核组件不会被拉起。
+		return nil
+	}
 	if !nlSupported() {
 		return errNetLimiterUnsupported
 	}
@@ -151,6 +162,9 @@ func (d *HyperVDriver) EnsureBandwidthDriver() error {
 }
 
 // InstallBandwidthDriver 显式安装（运维接口使用）：解除手动卸载抑制并强制加载。
+//
+// 这是唯一的非默认入口，专门用于需要恢复限速时人工触发；
+// 默认流程（主机加载 / 创建 / 改配 / Crontab）不会走到这里。
 func (d *HyperVDriver) InstallBandwidthDriver() error {
 	if !nlSupported() {
 		return errNetLimiterUnsupported
@@ -199,6 +213,7 @@ func (d *HyperVDriver) BandwidthDriverStatus() map[string]interface{} {
 	st := netLimiterReport(d.hvDriverPath())
 	rules := st.Rules
 	out := map[string]interface{}{
+		"enabled":     st.Enabled,
 		"supported":   st.Supported,
 		"installed":   st.Installed,
 		"running":     st.Running,
@@ -250,7 +265,14 @@ func (d *HyperVDriver) hvLimitedConfigs() []*model.VMConfig {
 }
 
 // hvApplyVMBandwidth 单独下发一台虚拟机的限速（创建 / 修改配置后立即生效）。
+//
+// 默认不安装驱动：驱动未就绪时直接返回成功，既不影响创建 / 改配流程，
+// 也不会在返回消息里带出「限速下发失败」的干扰信息；
+// 管理员显式安装过驱动后，这里自动恢复正常下发。
 func (d *HyperVDriver) hvApplyVMBandwidth(cfg *model.VMConfig) error {
+	if !nlFeatureEnabled && !netLimiterAvailable() {
+		return nil
+	}
 	if cfg == nil {
 		return nil
 	}
@@ -300,6 +322,10 @@ func (d *HyperVDriver) hvClearVMBandwidth(cfg *model.VMConfig) error {
 // hvSyncBandwidth 全量同步限速规则（供 Crontab 周期调用）。
 // 驱动重启后规则表会清空，周期同步可自动恢复。
 func (d *HyperVDriver) hvSyncBandwidth() error {
+	// 驱动未就绪直接返回：Crontab 每轮不再为限速去枚举虚拟机网卡（一次 PowerShell）
+	if !nlFeatureEnabled && !netLimiterAvailable() {
+		return nil
+	}
 	if !nlSupported() {
 		return nil
 	}

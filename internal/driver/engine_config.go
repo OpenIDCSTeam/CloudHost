@@ -96,7 +96,7 @@ var engineConfigs = []EngineMeta{
 		CPUArch:     []string{"x86_64"},
 		Optional:    map[string]string{},
 		Messages: []string{
-			"1、支持按虚拟机分别限制上行/下行带宽（内置 NetLimiter 限速驱动，需管理员权限加载）",
+			"1、支持按虚拟机分别限制上行/下行带宽：Hyper-V 原生只能限制双向合计，需 agent 以管理员身份运行以加载随附的 WFP 限速驱动；未以管理员身份运行时上下行限制不会生效",
 			"2、不支持USB直通，支持GPU PV和DDA设备直通",
 		},
 		BanInit: []string{},

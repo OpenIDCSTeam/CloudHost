@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/model"
 )
@@ -137,52 +138,114 @@ func (d *HyperVDriver) TransferHDD(vmUUID string, hdd *model.SDConfig, targetVM 
 	return &model.ZMessage{Success: true, Action: "HDDTrans", Message: "数据盘移交成功"}, nil
 }
 
-// GetPCIList 枚举可 DDA 直通的 PCI 设备（Get-PnpDevice + 位置路径）
-func (d *HyperVDriver) GetPCIList() (map[string]*model.VFConfig, error) {
-	result := make(map[string]*model.VFConfig)
-
-	script := `$ErrorActionPreference='SilentlyContinue'; ` +
-		`Get-PnpDevice | Where-Object { $_.InstanceId -like 'PCI\*' -and $_.Status -eq 'OK' } | ` +
-		`ForEach-Object { ` +
-		`$lp = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_LocationPaths').Data; ` +
-		`if ($lp) { [pscustomobject]@{ id=$_.InstanceId; lp=$lp[0]; name=$_.FriendlyName } } ` +
-		`} | ConvertTo-Json -Compress`
-
-	out, err := d.execPS(script)
-	if err != nil {
-		return result, nil
-	}
-	items := parsePnpJSON(out)
-	for _, it := range items {
-		if it.LocationPath == "" {
-			continue
-		}
-		result[it.LocationPath] = &model.VFConfig{
-			PciKey:  it.LocationPath,
-			GpuUUID: it.LocationPath,
-			GpuMdev: "DDA",
-			GpuHint: it.Name,
-		}
-	}
-	return result, nil
+// hvDeviceSnapshot 一次 PowerShell 批量枚举得到的宿主机设备快照。
+//
+// 设备枚举曾是本驱动最慢的一段：旧实现按设备逐个 Get-PnpDeviceProperty，
+// 每台设备一次 CIM 往返，二十几个设备就要 50 秒以上，创建弹窗一打开就卡住。
+// 这里改成批量查询（-InstanceId 接受数组）并把结果做成带 TTL 的快照，
+// 让 gpu-list / pci-list / usb-list 三个接口共享同一次枚举。
+type hvDeviceSnapshot struct {
+	gpus map[string]*model.VFConfig
+	pcis map[string]*model.VFConfig
+	usbs map[string]*model.USBInfos
 }
 
-// GetGPUList 枚举显卡设备（可用于 GPU-PV 或 DDA）
-func (d *HyperVDriver) GetGPUList() (map[string]*model.VFConfig, error) {
-	result := make(map[string]*model.VFConfig)
+// hvDeviceCacheTTL 设备快照有效期。热插拔不需要秒级可见，短 TTL 足以挡掉弹窗反复打开。
+const hvDeviceCacheTTL = 30 * time.Second
 
-	script := `$ErrorActionPreference='SilentlyContinue'; ` +
-		`Get-PnpDevice -Class Display | Where-Object { $_.Status -eq 'OK' } | ` +
-		`ForEach-Object { ` +
-		`$lp = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_LocationPaths').Data; ` +
-		`[pscustomobject]@{ id=$_.InstanceId; lp=$(if($lp){$lp[0]}else{''}); name=$_.FriendlyName } ` +
-		`} | ConvertTo-Json -Compress`
+// hvDeviceScript 一次输出 GPU / PCI / USB 三类设备。
+const hvDeviceScript = `$ErrorActionPreference='SilentlyContinue';
+$devs = @(Get-PnpDevice);
+$pci = @($devs | Where-Object { $_.InstanceId -like 'PCI\*' -and $_.Status -eq 'OK' });
+$gpu = @($devs | Where-Object { $_.Class -eq 'Display' -and $_.Status -eq 'OK' });
+$usb = @($devs | Where-Object { $_.Class -eq 'USB' -and $_.Status -eq 'OK' });
+$lp = @{};
+$ids = @(@($pci | Select-Object -ExpandProperty InstanceId) + @($gpu | Select-Object -ExpandProperty InstanceId));
+if ($ids.Count -gt 0) {
+  Get-PnpDeviceProperty -InstanceId $ids -KeyName 'DEVPKEY_Device_LocationPaths' | ForEach-Object { $lp[$_.InstanceId] = @($_.Data)[0] }
+};
+$hw = @{};
+$uids = @($usb | Select-Object -ExpandProperty InstanceId);
+if ($uids.Count -gt 0) {
+  Get-PnpDeviceProperty -InstanceId $uids -KeyName 'DEVPKEY_Device_HardwareIds' | ForEach-Object { $hw[$_.InstanceId] = (@($_.Data) -join ',') }
+};
+ConvertTo-Json -InputObject ([pscustomobject]@{
+  gpu = @($gpu | ForEach-Object { [pscustomobject]@{ id=$_.InstanceId; lp=$lp[$_.InstanceId]; name=$_.FriendlyName } });
+  pci = @($pci | ForEach-Object { [pscustomobject]@{ id=$_.InstanceId; lp=$lp[$_.InstanceId]; name=$_.FriendlyName } });
+  usb = @($usb | ForEach-Object { [pscustomobject]@{ id=$_.InstanceId; name=$_.FriendlyName; hw=$hw[$_.InstanceId] } })
+}) -Compress -Depth 4`
 
-	out, err := d.execPS(script)
-	if err != nil {
-		return result, nil
+// hvDevices 返回设备快照。
+//
+// 缓存策略与列表接口一致（stale-while-revalidate）：
+//   - 有快照立刻返回，即使已过期，刷新放到后台
+//   - 同一时刻只有一个枚举在飞，避免并发打开弹窗时反复启动 PowerShell
+//   - 首次枚举最多等 8 秒，超时返回空快照
+func (d *HyperVDriver) hvDevices() *hvDeviceSnapshot {
+	d.hvDevMu.Lock()
+
+	if d.hvDevData != nil {
+		if time.Since(d.hvDevAt) >= hvDeviceCacheTTL && !d.hvDevLoading {
+			d.hvDevLoading = true
+			go func() {
+				snap := d.hvQueryDevices()
+				d.hvDevMu.Lock()
+				if snap != nil {
+					d.hvDevData = snap
+					d.hvDevAt = time.Now()
+				}
+				d.hvDevLoading = false
+				d.hvDevMu.Unlock()
+			}()
+		}
+		data := d.hvDevData
+		d.hvDevMu.Unlock()
+		return data
 	}
-	for _, it := range parsePnpJSON(out) {
+
+	// 首次：持锁枚举，并发请求在此合并
+	snap := d.hvQueryDevices()
+	d.hvDevMu.Unlock()
+
+	if snap == nil {
+		snap = &hvDeviceSnapshot{
+			gpus: make(map[string]*model.VFConfig),
+			pcis: make(map[string]*model.VFConfig),
+			usbs: make(map[string]*model.USBInfos),
+		}
+		return snap
+	}
+
+	d.hvDevMu.Lock()
+	d.hvDevData = snap
+	d.hvDevAt = time.Now()
+	d.hvDevMu.Unlock()
+	return snap
+}
+
+// hvQueryDevices 执行一次批量枚举，失败（含超时）返回 nil。
+func (d *HyperVDriver) hvQueryDevices() *hvDeviceSnapshot {
+	snap := &hvDeviceSnapshot{
+		gpus: make(map[string]*model.VFConfig),
+		pcis: make(map[string]*model.VFConfig),
+		usbs: make(map[string]*model.USBInfos),
+	}
+
+	// 单次枚举限制在 8 秒：设备信息允许旧，接口不能被 PowerShell 拖住
+	out, err := d.execPSTimeout(hvDeviceScript, 8*time.Second)
+	if err != nil {
+		return nil
+	}
+	body := strings.TrimSpace(out)
+	if body == "" {
+		return snap
+	}
+	var parsed hvDeviceJSON
+	if err := jsonUnmarshalLoose(body, &parsed); err != nil {
+		return snap
+	}
+
+	for _, it := range parsed.Gpu {
 		key := it.LocationPath
 		if key == "" {
 			key = it.InstanceID
@@ -190,14 +253,57 @@ func (d *HyperVDriver) GetGPUList() (map[string]*model.VFConfig, error) {
 		if key == "" {
 			continue
 		}
-		result[key] = &model.VFConfig{
+		snap.gpus[key] = &model.VFConfig{
 			PciKey:  key,
 			GpuUUID: it.LocationPath,
 			GpuMdev: "PV",
 			GpuHint: it.Name,
 		}
 	}
-	return result, nil
+	for _, it := range parsed.Pci {
+		if it.LocationPath == "" {
+			continue
+		}
+		snap.pcis[it.LocationPath] = &model.VFConfig{
+			PciKey:  it.LocationPath,
+			GpuUUID: it.LocationPath,
+			GpuMdev: "DDA",
+			GpuHint: it.Name,
+		}
+	}
+	for _, it := range parsed.Usb {
+		vid, pid := extractVidPid(it.Hardware)
+		if vid == "" || pid == "" {
+			continue
+		}
+		key := strings.ToLower(vid + ":" + pid)
+		snap.usbs[key] = &model.USBInfos{
+			UsbKey:  key,
+			VidUUID: strings.ToLower(vid),
+			PidUUID: strings.ToLower(pid),
+			UsbHint: it.Name,
+		}
+	}
+
+	// 缓存写入由 hvDevices 统一负责（需要持 hvDevMu）
+	return snap
+}
+
+// GetPCIList 枚举可 DDA 直通的 PCI 设备（来自设备快照）
+func (d *HyperVDriver) GetPCIList() (map[string]*model.VFConfig, error) {
+	return d.hvDevices().pcis, nil
+}
+
+// GetGPUList 枚举显卡设备（来自设备快照，可用于 GPU-PV 或 DDA）
+func (d *HyperVDriver) GetGPUList() (map[string]*model.VFConfig, error) {
+	return d.hvDevices().gpus, nil
+}
+
+// hvDeviceJSON hvDeviceScript 的 JSON 输出结构
+type hvDeviceJSON struct {
+	Gpu []pnpDevice   `json:"gpu"`
+	Pci []pnpDevice   `json:"pci"`
+	Usb []hvUSBDevice `json:"usb"`
 }
 
 // pnpDevice PowerShell 输出的设备条目
@@ -207,81 +313,16 @@ type pnpDevice struct {
 	Name         string `json:"name"`
 }
 
-// parsePnpJSON 解析 ConvertTo-Json 的输出（兼容单对象与数组）
-func parsePnpJSON(out string) []pnpDevice {
-	body := strings.TrimSpace(out)
-	if body == "" {
-		return nil
-	}
-	if strings.HasPrefix(body, "[") {
-		var arr []pnpDevice
-		if err := jsonUnmarshalLoose(body, &arr); err == nil {
-			return arr
-		}
-		return nil
-	}
-	var one pnpDevice
-	if err := jsonUnmarshalLoose(body, &one); err == nil {
-		return []pnpDevice{one}
-	}
-	return nil
+// hvUSBDevice USB 设备条目
+type hvUSBDevice struct {
+	InstanceID string `json:"id"`
+	Name       string `json:"name"`
+	Hardware   string `json:"hw"`
 }
 
-// GetUSBList 枚举宿主机 USB 设备
+// GetUSBList 枚举宿主机 USB 设备（来自设备快照）
 func (d *HyperVDriver) GetUSBList() (map[string]*model.USBInfos, error) {
-	result := make(map[string]*model.USBInfos)
-
-	script := `$ErrorActionPreference='SilentlyContinue'; ` +
-		`Get-PnpDevice -Class USB | Where-Object { $_.Status -eq 'OK' } | ` +
-		`ForEach-Object { ` +
-		`$vid = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_HardwareIds').Data; ` +
-		`[pscustomobject]@{ id=$_.InstanceId; name=$_.FriendlyName; hw=($vid -join ',') } ` +
-		`} | ConvertTo-Json -Compress`
-
-	out, err := d.execPS(script)
-	if err != nil {
-		return result, nil
-	}
-
-	var items []struct {
-		InstanceID string `json:"id"`
-		Name       string `json:"name"`
-		Hardware   string `json:"hw"`
-	}
-	body := strings.TrimSpace(out)
-	if body == "" {
-		return result, nil
-	}
-	if strings.HasPrefix(body, "[") {
-		if err := jsonUnmarshalLoose(body, &items); err != nil {
-			return result, nil
-		}
-	} else {
-		var one struct {
-			InstanceID string `json:"id"`
-			Name       string `json:"name"`
-			Hardware   string `json:"hw"`
-		}
-		if err := jsonUnmarshalLoose(body, &one); err != nil {
-			return result, nil
-		}
-		items = append(items, one)
-	}
-
-	for _, it := range items {
-		vid, pid := extractVidPid(it.Hardware)
-		if vid == "" || pid == "" {
-			continue
-		}
-		key := strings.ToLower(vid + ":" + pid)
-		result[key] = &model.USBInfos{
-			UsbKey:  key,
-			VidUUID: strings.ToLower(vid),
-			PidUUID: strings.ToLower(pid),
-			UsbHint: it.Name,
-		}
-	}
-	return result, nil
+	return d.hvDevices().usbs, nil
 }
 
 // extractVidPid 从 HardwareIds 字符串中解析 VID/PID（形如 USB\VID_046D&PID_C52B）

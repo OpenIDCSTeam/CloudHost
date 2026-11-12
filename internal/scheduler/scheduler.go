@@ -10,6 +10,7 @@ import (
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/data"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/driver"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/logger"
+	"github.com/OpenIDCSTeam/HostAgent-Go/internal/model"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/service"
 )
 
@@ -217,17 +218,23 @@ func (s *Scheduler) syncHost(hsName string, d driver.HostDriver) {
 			actualStatus := d.GetPower(vmUUID)
 			// 通过驱动锁内方法写回：快照对象是复制品，
 			// 直接修改不会生效，且与其它请求并发时会形成数据竞争。
+			powerState := model.VMPowerUnknown
 			if newState, ok := driver.PowerStatusMap[actualStatus]; ok {
+				powerState = newState
 				d.SetVMPowerState(vmUUID, newState)
 			}
 			_ = vmCfg
 
-			// 保存VM状态到数据库
+			// 状态历史必须带 ac_status：
+			//  1) 前端按 ac_status（STARTED/STOPPED/PAUSED）判断电源态；
+			//  2) handleVMStatus 会丢弃既无 ac_status 也无资源指标的记录，
+			//     只写 vm_state 会让状态历史永久为空，表现为「拿不到虚拟机状态」。
 			statusData := map[string]interface{}{
+				"ac_status": string(powerState),
 				"vm_state":  actualStatus,
 				"on_update": now,
 			}
-			if err := s.db.AddVMStatus(hsName, vmUUID, statusData, actualStatus, now, 0); err != nil {
+			if err := s.db.AddVMStatus(hsName, vmUUID, statusData, string(powerState), now, 0); err != nil {
 				s.log.Event("scheduler", "状态采集").Host(hsName).VM(vmUUID, "").Err(err).
 					Warn("保存虚拟机 %s 状态失败: %v", vmUUID, err)
 			}

@@ -13,6 +13,7 @@ package api
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/auth"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/model"
@@ -37,20 +38,32 @@ func toMap(v interface{}) map[string]interface{} {
 	return result
 }
 
-// buildVMStatusList 读取虚拟机的历史状态（最近若干条）
+// buildVMStatusList 读取虚拟机的历史状态（最近若干条，最新在前）。
+//
+// 只保留含 ac_status 或资源指标的记录：调度器早期版本写入的是
+// {"vm_state":"运行中","on_update":...}，既没有电源态也没有指标。
+// 前端列表页取 status[0].ac_status 展示电源态，拿到这种记录只会退化成
+// 「未知」，即使驱动里的真实状态是正确的。
 func (app *App) buildVMStatusList(hsName, vmUUID string) []interface{} {
 	rawList, err := app.DB.GetVMStatus(hsName, vmUUID, 0, 0)
 	if err != nil || len(rawList) == 0 {
 		return []interface{}{}
 	}
 	result := make([]interface{}, 0, vmStatusHistoryMax)
-	for i, raw := range rawList {
-		if i >= vmStatusHistoryMax {
+	for _, raw := range rawList {
+		if len(result) >= vmStatusHistoryMax {
 			break
 		}
-		var item interface{}
-		if err := json.Unmarshal([]byte(raw), &item); err != nil {
+		var item map[string]interface{}
+		if err := json.Unmarshal([]byte(raw), &item); err != nil || item == nil {
 			continue
+		}
+		if _, ok := item["ac_status"]; !ok {
+			if _, ok := item["cpu_total"]; !ok {
+				if _, ok := item["mem_total"]; !ok {
+					continue
+				}
+			}
 		}
 		result = append(result, item)
 	}
@@ -93,10 +106,21 @@ func (app *App) buildVMView(hsName, vmUUID string, vm *model.VMConfig, uc *auth.
 		}
 	}
 
+	statusList := app.buildVMStatusList(hsName, vmUUID)
+	if len(statusList) == 0 && vm != nil && vm.VmFlag != "" {
+		// 没有任何有效历史时补一条：前端列表页按 status[0].ac_status 展示电源态，
+		// 空数组会退化成「未知」，即使驱动里已经有准确状态。
+		statusList = []interface{}{map[string]interface{}{
+			"ac_status": string(vm.VmFlag),
+			"vm_state":  string(vm.VmFlag),
+			"on_update": time.Now().Unix(),
+		}}
+	}
+
 	return map[string]interface{}{
 		"uuid":             vmUUID,
 		"config":           config,
-		"status":           app.buildVMStatusList(hsName, vmUUID),
+		"status":           statusList,
 		"user_permissions": mask.ToBits(),
 		"is_admin":         isAdmin,
 	}

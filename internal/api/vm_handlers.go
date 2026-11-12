@@ -151,19 +151,19 @@ func (app *App) handleVMList(c *gin.Context) {
 			}
 		}
 	}
-	if d := app.HostSvc.GetDriver(hsName); d != nil {
-		for uuid, live := range d.GetVMSaving() {
-			if live == nil {
-				continue
-			}
-			if base, ok := vms[uuid]; ok {
-				// 保留数据库中的业务字段，仅同步平台侧运行时状态
-				base.VmFlag = live.VmFlag
-				base.VmDeleted = live.VmDeleted
-				continue
-			}
-			vms[uuid] = live
+	// 只读带缓存的驱动快照：既不触发惰性创建，也不会被驱动内部的锁拖死。
+	// 拿不到时直接用数据库里的配置（列表允许略旧）。
+	for uuid, live := range app.HostSvc.VMDriverSnapshot(hsName) {
+		if live == nil {
+			continue
 		}
+		if base, ok := vms[uuid]; ok {
+			// 保留数据库中的业务字段，仅同步平台侧运行时状态
+			base.VmFlag = live.VmFlag
+			base.VmDeleted = live.VmDeleted
+			continue
+		}
+		vms[uuid] = live
 	}
 
 	isSuperUser := uc.IsAdmin || uc.IsToken
@@ -326,6 +326,56 @@ func (app *App) handleVMCreate(c *gin.Context) {
 	}
 	if v, ok := req["web_all"]; ok {
 		cfg.WebAll = parseWebAll(v)
+	}
+
+	// 套餐模式：资源规格以套餐为准。
+	//
+	// 前端在套餐模式下会把硬件分区折叠起来，折叠后的 Form.Item 不会参与
+	// onFinish 的值收集，请求里可能根本没有 cpu_num / mem_num / hdd_num，
+	// 后端于是保留 NewVMConfig 的默认值（2C2G/8G），
+	// 与用户在套餐卡片上看到的规格（比如 4C4G）不一致。
+	// 这里按套餐补齐，配额校验也基于补齐后的规格进行。
+	if planName, _ := req["plan_name"].(string); strings.TrimSpace(planName) != "" {
+		plan := app.HostSvc.GetHostPlanConfig(hsName, planName)
+		if plan == nil {
+			utils.BadRequest(c, "套餐不存在: "+planName)
+			return
+		}
+		if plan.CpuNum > 0 {
+			cfg.CpuNum = plan.CpuNum
+		}
+		if plan.CpuPer > 0 {
+			cfg.CpuPer = plan.CpuPer
+		}
+		if plan.MemNum > 0 {
+			cfg.MemNum = plan.MemNum
+		}
+		if plan.HddNum > 0 {
+			cfg.HddNum = plan.HddNum
+		}
+		if plan.HddIop > 0 {
+			cfg.HddIop = plan.HddIop
+		}
+		if plan.SpeedU > 0 {
+			cfg.SpeedU = plan.SpeedU
+		}
+		if plan.SpeedD > 0 {
+			cfg.SpeedD = plan.SpeedD
+		}
+		// 配额类字段允许为 0（表示不限/不分配），直接覆盖
+		cfg.GpuMem = plan.GpuMem
+		cfg.BakNum = plan.BakNum
+		cfg.IsoNum = plan.IsoNum
+		cfg.PciNum = plan.PciNum
+		cfg.UsbNum = plan.UsbNum
+		cfg.DatNum = plan.DatNum
+		cfg.DatAll = plan.DatAll
+		cfg.NatNum = plan.NatNum
+		cfg.WebNum = plan.WebNum
+		cfg.FluNum = plan.FluNum
+		if plan.FluRst != nil {
+			cfg.FluRst = plan.FluRst
+		}
 	}
 
 	// 设置所有者
@@ -653,6 +703,8 @@ func (app *App) handleVMPowers(c *gin.Context) {
 
 	// 电源状态变化后旧截图必然失效，丢弃缓存避免前端继续看到关机画面
 	invalidateScreenshotCache(hsName, vmUUID)
+	// 列表快照缓存同样失效，否则前端刷新仍显示操作前的电源状态
+	app.HostSvc.InvalidateVMSnapshot(hsName)
 
 	// 软关机 / 软重启是异步操作：平台受理后状态不会立刻变化，
 	// 需要后台监控直到实际状态稳定（对应 Python 版 BasicServer.soft_pwr）。
@@ -1241,6 +1293,16 @@ func (app *App) handleVMStatus(c *gin.Context) {
 	if vmCfg := app.HostSvc.MustGetVMConfig(hsName, vmUUID); vmCfg != nil && vmCfg.VmFlag != "" {
 		powerStatus = string(vmCfg.VmFlag)
 	}
+	// 驱动内存里的状态由调度器每 60 秒刷新一次：agent 刚启动、虚拟机刚纳管时
+	// 仍是「未知」，详情页会先显示未知再跳变。这里未知时实时问一次平台并写回。
+	if powerStatus == string(model.VMPowerUnknown) {
+		if d := app.HostSvc.GetDriver(hsName); d != nil {
+			if state, ok := driver.PowerStatusMap[d.GetPower(vmUUID)]; ok && state != model.VMPowerUnknown {
+				powerStatus = string(state)
+				d.SetVMPowerState(vmUUID, state)
+			}
+		}
+	}
 
 	utils.Success(c, map[string]interface{}{
 		"power_status": powerStatus,
@@ -1367,15 +1429,52 @@ func (app *App) handleVMScan(c *gin.Context) {
 		return
 	}
 
+	prefix := strings.TrimSpace(row.FilterName)
+
+	// 统计只算「符合前缀」的虚拟机：平台上的其它虚拟机不属于本主机纳管范围，
+	// 计入扫描结果会让用户以为 prefix_filter 没生效。
+	matched := 0
+	for _, vm := range platformVMs {
+		if driver.MatchFilterPrefix(prefix, vm) {
+			matched++
+		}
+	}
+
 	snapshot := d.GetVMSaving()
 	recovered := 0
 	for uuid, vm := range snapshot {
 		if vm == nil || !vm.VmDeleted {
 			continue
 		}
+		if !driver.MatchFilterPrefix(prefix, vm) {
+			continue
+		}
 		if _, exists := platformVMs[uuid]; exists {
 			d.SetVMDeleted(uuid, false)
 			recovered++
+		}
+	}
+
+	// 清理历史错前缀记录（早期版本调度器/扫描未按 filter_name 过滤）：
+	// 驱动内存里的由 ScanVMs 移除，这里同步删除数据库记录，
+	// 否则进程重启后会从库里重新恢复出这些虚拟机。
+	removedRecords := 0
+	if prefix != "" {
+		if raws, err := app.DB.GetVMSaving(hsName); err == nil {
+			for uuid, raw := range raws {
+				vm, decodeErr := service.DecodeVMConfig(raw)
+				if decodeErr != nil || vm == nil || driver.MatchFilterPrefix(prefix, vm) {
+					continue
+				}
+				if err := app.DB.DeleteVMConfig(hsName, uuid); err != nil {
+					app.Logger.Log(hsName, "WARNING", "扫描虚拟机",
+						fmt.Sprintf("清理前缀不匹配记录 %s 失败: %v", uuid, err), false)
+					continue
+				}
+				_ = app.DB.DeleteVMStatus(hsName, uuid)
+				d.RemoveVMSaving(uuid)
+				removedRecords++
+			}
 		}
 	}
 
@@ -1403,13 +1502,15 @@ func (app *App) handleVMScan(c *gin.Context) {
 	}
 
 	app.Logger.Log(hsName, "INFO", "扫描虚拟机",
-		fmt.Sprintf("扫描完成：识别 %d 台，落库 %d 台，恢复 %d 台", len(platformVMs), persisted, recovered), true)
+		fmt.Sprintf("扫描完成：匹配 %d 台，落库 %d 台，恢复 %d 台，清理错前缀 %d 台",
+			matched, persisted, recovered, removedRecords), true)
 
 	utils.SuccessMsg(c, "扫描完成", gin.H{
-		"scanned":       len(platformVMs),
+		"scanned":       matched,
 		"added":         added,
 		"persisted":     persisted,
 		"recovered":     recovered,
+		"removed":       removedRecords,
 		"prefix_filter": row.FilterName,
 	})
 }

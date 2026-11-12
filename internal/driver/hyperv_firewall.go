@@ -55,10 +55,10 @@ func (d *HyperVDriver) SetFirewallOptions(vmUUID string, enabled bool, policyIn,
 // GetFirewallRules 读取 Hyper-V 扩展 ACL 并转换为统一规则模型。
 func (d *HyperVDriver) GetFirewallRules(vmUUID string) ([]FirewallRule, error) {
 	script := fmt.Sprintf(
-		"$vm = Get-VM -Id '%s' -ErrorAction Stop; "+
+		"$vm = %s; if (-not $vm) { throw '虚拟机不存在: %s' }; "+
 			"@($vm | Get-VMNetworkAdapterExtendedAcl) | Select-Object Action,Direction,Weight,"+
 			"LocalIPAddress,LocalPort,RemoteIPAddress,RemotePort,Protocol | ConvertTo-Json -Compress",
-		psEscape(vmUUID))
+		hvVMExpr(vmUUID), psEscape(vmUUID))
 
 	out, err := d.execPS(script)
 	if err != nil {
@@ -171,8 +171,9 @@ func (d *HyperVDriver) hypervAddRule(vmUUID string, weight int, rule FirewallRul
 	localIP, remoteIP, localPort, remotePort := hypervRuleFields(rule)
 
 	script := fmt.Sprintf(
-		"Get-VM -Id '%s' -ErrorAction Stop | Add-VMNetworkAdapterExtendedAcl -Action %s -Direction %s -Weight %d",
-		psEscape(vmUUID), hypervAction(rule.Action), hypervDirection(rule.Type), weight)
+		"$vm = %s; if (-not $vm) { throw '虚拟机不存在: %s' }; "+
+			"$vm | Add-VMNetworkAdapterExtendedAcl -Action %s -Direction %s -Weight %d",
+		hvVMExpr(vmUUID), psEscape(vmUUID), hypervAction(rule.Action), hypervDirection(rule.Type), weight)
 
 	if proto := hypervProtocol(rule.Proto); proto != "" {
 		script += " -Protocol " + proto
@@ -202,10 +203,10 @@ func (d *HyperVDriver) hypervAddRule(vmUUID string, weight int, rule FirewallRul
 // Weight 在单台虚拟机上唯一，因此最多只会命中一条，另一个方向会静默跳过。
 func (d *HyperVDriver) hypervRemoveRule(vmUUID string, weight int) error {
 	script := fmt.Sprintf(
-		"$vm = Get-VM -Id '%s' -ErrorAction Stop; "+
+		"$vm = %s; if (-not $vm) { throw '虚拟机不存在: %s' }; "+
 			"Remove-VMNetworkAdapterExtendedAcl -VM $vm -Direction Inbound -Weight %d -ErrorAction SilentlyContinue; "+
 			"Remove-VMNetworkAdapterExtendedAcl -VM $vm -Direction Outbound -Weight %d -ErrorAction SilentlyContinue",
-		psEscape(vmUUID), weight, weight)
+		hvVMExpr(vmUUID), psEscape(vmUUID), weight, weight)
 	if out, err := d.execPS(script); err != nil {
 		return fmt.Errorf("删除防火墙规则失败: %v (%s)", err, strings.TrimSpace(out))
 	}
