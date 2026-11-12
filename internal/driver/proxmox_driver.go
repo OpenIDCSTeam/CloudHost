@@ -1034,6 +1034,11 @@ func (d *ProxmoxDriver) UpdateVM(cfg *model.VMConfig, oldCfg *model.VMConfig) (*
 }
 
 // DeleteVM 删除虚拟机
+//
+// 删除语义是「强制断电 + 直接删除」：不做 ACPI 软关机协商，避免 guest
+// 不响应关机请求时把删除一起拖死。PVE 的 destroy 只接受停机实例
+// （运行中的会直接报错），所以先发 status/stop 强杀 qemu，确认平台状态
+// 变为 stopped 后立刻删除。
 func (d *ProxmoxDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMessage, error) {
 	ctx := d.Ctx(vmUUID)
 
@@ -1042,12 +1047,10 @@ func (d *ProxmoxDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMess
 		return &model.ZMessage{Success: false, Action: "VMDelete", Message: err.Error()}, nil
 	}
 
-	// 先关机：优先 PVE 软关机（ACPI），让 guest 有机会落盘，超时才强制断电。
-	// 仍关不掉就放弃删除，避免把运行中的虚拟机直接抹掉。
-	if vm.Status == "running" {
-		if err := d.StopGracefully(vmUUID, gracefulStopWait); err != nil {
+	if vm.Status != proxmox.StatusVirtualMachineStopped {
+		if !d.forceStopVM(ctx, vmUUID, vm) {
 			return &model.ZMessage{Success: false, Action: "VMDelete",
-				Message: "删除前关机失败: " + err.Error()}, nil
+				Message: "删除前强制关机失败: 虚拟机未在 " + forceStopWait.String() + " 内关机"}, nil
 		}
 	}
 
@@ -1065,6 +1068,30 @@ func (d *ProxmoxDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMess
 	d.mu.Unlock()
 
 	return &model.ZMessage{Success: true, Action: "VMDelete", Message: "虚拟机已删除"}, nil
+}
+
+// forceStopVM 直接强杀 PVE 实例（status/stop，等价 qm stop）并等待状态收敛。
+//
+// 与 StopGracefully 的区别：不走 ACPI 协商，qemu 进程被直接终止，不依赖
+// guest 配合。返回 false 表示请求失败或超时后平台仍报告运行中。
+func (d *ProxmoxDriver) forceStopVM(ctx context.Context, vmUUID string, vm *proxmox.VirtualMachine) bool {
+	task, err := vm.Stop(ctx)
+	if err != nil {
+		// 状态缓存滞后时实例可能已经停机，PVE 会回 "VM xxx is not running"，
+		// 这种情况按已关机处理，删除可直接继续。
+		if strings.Contains(strings.ToLower(err.Error()), "not running") {
+			return true
+		}
+		log.Printf("[proxmox] %d 强制关机请求失败: %v", vm.VMID, err)
+		return false
+	}
+	if task != nil {
+		// 等待超时不等于关机失败，最终以平台实际状态为准。
+		if err := task.WaitFor(ctx, int(forceStopWait/time.Second)); err != nil {
+			log.Printf("[proxmox] %d 强制关机任务未在 %s 内结束: %v", vm.VMID, forceStopWait, err)
+		}
+	}
+	return d.waitPowerStopped(d, vmUUID, forceStopWait)
 }
 
 // SupportsGracefulShutdown PVE 自带软关机：/status/shutdown 由平台向 guest
