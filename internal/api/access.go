@@ -123,6 +123,10 @@ func (app *App) checkQuotaForUser(uc *auth.UserContext, cfg *model.VMConfig) err
 	if app.QuotaSvc == nil {
 		return nil
 	}
+	// 全局配额开关关闭时不做任何配额校验
+	if app.SystemSvc != nil && !app.SystemSvc.QuotaEnabled() {
+		return nil
+	}
 	return app.QuotaSvc.CheckQuota(uc.Username, cfg)
 }
 

@@ -24,10 +24,29 @@ func NewQuotaService(db *data.DB) *QuotaService {
 	}
 }
 
+// quotaEnabled 读取全局配额开关。
+// 设置缺失或读取失败时按开启处理，避免配置异常把配额静默放开。
+func (s *QuotaService) quotaEnabled() bool {
+	raw, err := s.DB.GetGlobal("system_settings")
+	if err != nil || raw == "" {
+		return true
+	}
+	var settings map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &settings); err != nil {
+		return true
+	}
+	return parseQuotaEnabled(settings["quota_enabled"])
+}
+
 // CheckQuota 检查用户配额是否充足
 func (s *QuotaService) CheckQuota(username string, vmCfg *model.VMConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// 全局配额关闭时不做任何校验
+	if !s.quotaEnabled() {
+		return nil
+	}
 
 	userMap, err := s.DB.GetUserByUsername(username)
 	if err != nil {
@@ -206,18 +225,20 @@ func (s *QuotaService) AdjustQuota(username string, oldCfg, newCfg *model.VMConf
 	}
 	diskDiff := newDisk - oldDisk
 
-	// 如果是增加资源,先检查配额
-	if cpuDiff > 0 && usedCPU+cpuDiff > quotaCPU {
-		return fmt.Errorf("CPU配额不足")
-	}
-	if memDiff > 0 && usedRAM+memDiff > quotaRAM {
-		return fmt.Errorf("内存配额不足")
-	}
-	if diskDiff > 0 && usedSSD+diskDiff > quotaSSD {
-		return fmt.Errorf("磁盘配额不足")
-	}
-	if gpuDiff > 0 && usedGPU+gpuDiff > quotaGPU {
-		return fmt.Errorf("GPU配额不足")
+	// 如果是增加资源,先检查配额（全局配额关闭时跳过）
+	if s.quotaEnabled() {
+		if cpuDiff > 0 && usedCPU+cpuDiff > quotaCPU {
+			return fmt.Errorf("CPU配额不足")
+		}
+		if memDiff > 0 && usedRAM+memDiff > quotaRAM {
+			return fmt.Errorf("内存配额不足")
+		}
+		if diskDiff > 0 && usedSSD+diskDiff > quotaSSD {
+			return fmt.Errorf("磁盘配额不足")
+		}
+		if gpuDiff > 0 && usedGPU+gpuDiff > quotaGPU {
+			return fmt.Errorf("GPU配额不足")
+		}
 	}
 
 	// 更新资源使用量

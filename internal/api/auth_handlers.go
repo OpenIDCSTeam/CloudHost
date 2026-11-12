@@ -187,9 +187,12 @@ func (app *App) handleLogin(c *gin.Context) {
 	}
 
 	// 构建响应数据
+	loginUser := sanitizeUser(userInfo)
+	// 全局配额开关：前端据此隐藏配额相关的录入与展示
+	loginUser["quota_enabled"] = app.SystemSvc.QuotaEnabled()
 	respData := gin.H{
 		"redirect":  redirect,
-		"user_info": sanitizeUser(userInfo),
+		"user_info": loginUser,
 		"is_token":  isTokenLogin,
 	}
 	// Token登录时，将Bearer Token返回给前端存入localStorage，用于后续认证
@@ -597,10 +600,14 @@ func (app *App) handleUserCurrent(c *gin.Context) {
 		utils.Unauthorized(c)
 		return
 	}
+	// 全局配额开关：前端据此隐藏配额相关的录入与展示
+	quotaEnabled := app.SystemSvc.QuotaEnabled()
 	// 受限身份（临时凭据 / 访问密钥登录）不对应数据库用户，
 	// 直接返回受限用户信息，否则前端刷新页面时会因「用户不存在」而整体不可用。
 	if uc.TempLogin {
-		utils.Success(c, tempLoginUserInfo(uc.Username, uc.TempHsName, uc.TempVMUUID))
+		info := tempLoginUserInfo(uc.Username, uc.TempHsName, uc.TempVMUUID)
+		info["quota_enabled"] = quotaEnabled
+		utils.Success(c, info)
 		return
 	}
 	user, err := app.DB.GetUserByUsername(uc.Username)
@@ -608,13 +615,17 @@ func (app *App) handleUserCurrent(c *gin.Context) {
 		// Token 登录（或管理员账号被重命名）时回退到合成信息，
 		// 避免前端因拿不到当前用户而整体不可用。
 		if uc.IsToken {
-			utils.Success(c, adminTokenUserInfo())
+			info := adminTokenUserInfo()
+			info["quota_enabled"] = quotaEnabled
+			utils.Success(c, info)
 			return
 		}
 		utils.NotFound(c, "用户不存在")
 		return
 	}
-	utils.Success(c, sanitizeUser(user))
+	info := sanitizeUser(user)
+	info["quota_enabled"] = quotaEnabled
+	utils.Success(c, info)
 }
 
 // handleUserList GET /api/users
