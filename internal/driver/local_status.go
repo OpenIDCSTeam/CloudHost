@@ -27,30 +27,42 @@ import (
 // （Windows 下 PowerShell 单次约 3 秒），因此缓存 30 秒以降低开销。
 const localStatusCacheTTL = 30 * time.Second
 
+// localStatusEntry 单条本机状态缓存。
+// 磁盘统计依赖「系统存储路径」，同一台机器上不同主机可能配置不同目录，
+// 因此缓存按路径分桶，避免 A 主机的磁盘读数被 B 主机复用。
+type localStatusEntry struct {
+	hw     *model.HWStatus
+	cached time.Time
+}
+
 var (
-	localStatusMu     sync.Mutex
-	localStatusCache  *model.HWStatus
-	localStatusCached time.Time
+	localStatusMu    sync.Mutex
+	localStatusCache = map[string]*localStatusEntry{}
 )
 
-// localHWStatus 采集本机硬件状态（带短缓存）
-func localHWStatus() *model.HWStatus {
+// localHWStatus 采集本机硬件状态（带短缓存）。
+//
+// systemPath 为系统存储路径：只有填写时才采集该路径所在磁盘的容量，
+// 未填写则磁盘字段留空，避免把宿主机其它盘（如系统盘 C:）误显示为可用空间。
+func localHWStatus(systemPath string) *model.HWStatus {
+	path := strings.TrimSpace(systemPath)
+
 	localStatusMu.Lock()
 	defer localStatusMu.Unlock()
 
-	if localStatusCache != nil && time.Since(localStatusCached) < localStatusCacheTTL {
-		snapshot := *localStatusCache
+	if entry, ok := localStatusCache[path]; ok && entry != nil && time.Since(entry.cached) < localStatusCacheTTL {
+		snapshot := *entry.hw
 		return &snapshot
 	}
 
 	hw := &model.HWStatus{OnUpdate: time.Now().Unix()}
 	switch runtime.GOOS {
 	case "windows":
-		fillLocalStatusWindows(hw)
+		fillLocalStatusWindows(hw, path)
 	case "linux":
-		fillLocalStatusLinux(hw)
+		fillLocalStatusLinux(hw, path)
 	case "darwin":
-		fillLocalStatusDarwin(hw)
+		fillLocalStatusDarwin(hw, path)
 	}
 	if hw.ExtUsage == nil {
 		hw.ExtUsage = map[string][]int{}
@@ -59,10 +71,17 @@ func localHWStatus() *model.HWStatus {
 		hw.GpuUsage = map[string]float64{}
 	}
 
-	localStatusCache = hw
-	localStatusCached = time.Now()
+	localStatusCache[path] = &localStatusEntry{hw: hw, cached: time.Now()}
 	snapshot := *hw
 	return &snapshot
+}
+
+// systemPathOf 返回主机配置中的系统存储路径；配置为空时返回空串。
+func systemPathOf(cfg *model.HSConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.SystemPath)
 }
 
 // emptyHWStatus 返回仅带时间戳的空状态。
@@ -78,7 +97,7 @@ func emptyHWStatus() *model.HWStatus {
 }
 
 // fillLocalStatusLinux 通过 /proc 与 statfs 采集（无外部依赖）
-func fillLocalStatusLinux(hw *model.HWStatus) {
+func fillLocalStatusLinux(hw *model.HWStatus, systemPath string) {
 	// CPU 使用率
 	if data, err := os.ReadFile("/proc/stat"); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
@@ -141,13 +160,18 @@ func fillLocalStatusLinux(hw *model.HWStatus) {
 		}
 	}
 
-	// 根分区（使用 df，避免依赖平台相关的 syscall 结构体）
-	fillDiskViaDF(hw)
+	// 系统存储路径所在分区（未配置路径时不采集磁盘）
+	fillDiskViaDF(hw, systemPath)
 }
 
-// fillDiskViaDF 通过 `df -k /` 采集根分区用量（Linux / macOS 通用）
-func fillDiskViaDF(hw *model.HWStatus) {
-	out, _, err := security.SafeExecWithTimeout([]string{"df", "-k", "/"}, 5*time.Second)
+// fillDiskViaDF 通过 `df -k <path>` 采集系统存储路径所在分区用量（Linux / macOS 通用）。
+// path 为空时不采集，避免退回根分区把不相关的系统盘当成虚拟机可用空间。
+func fillDiskViaDF(hw *model.HWStatus, systemPath string) {
+	path := strings.TrimSpace(systemPath)
+	if path == "" {
+		return
+	}
+	out, _, err := security.SafeExecWithTimeout([]string{"df", "-k", path}, 5*time.Second)
 	if err != nil {
 		return
 	}
@@ -166,20 +190,27 @@ func fillDiskViaDF(hw *model.HWStatus) {
 	hw.HddUsage = int(usedKB / 1024)
 }
 
-// fillLocalStatusWindows 通过 PowerShell + CIM 采集
-func fillLocalStatusWindows(hw *model.HWStatus) {
+// fillLocalStatusWindows 通过 PowerShell + CIM 采集。
+// 磁盘只看系统存储路径所在的逻辑盘（如 D:\vms → D:）；未配置路径则不采集。
+func fillLocalStatusWindows(hw *model.HWStatus, systemPath string) {
+	diskQuery := `$disk = $null; `
+	if drive := windowsDriveForPath(systemPath); drive != "" {
+		diskQuery = fmt.Sprintf(`$disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='%s'"; `, drive)
+	}
 	script := `$ErrorActionPreference='SilentlyContinue'; ` +
 		`$os = Get-CimInstance Win32_OperatingSystem; ` +
 		`$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1; ` +
-		`$disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"; ` +
+		diskQuery +
+		`$hddTotal = if ($disk) { [math]::Round($disk.Size/1MB) } else { 0 }; ` +
+		`$hddUsage = if ($disk) { [math]::Round(($disk.Size-$disk.FreeSpace)/1MB) } else { 0 }; ` +
 		`[pscustomobject]@{ ` +
 		`cpu_total=$cpu.NumberOfLogicalProcessors; ` +
 		`cpu_model=$cpu.Name; ` +
 		`cpu_usage=$cpu.LoadPercentage; ` +
 		`mem_total=[math]::Round($os.TotalVisibleMemorySize/1024); ` +
 		`mem_usage=[math]::Round(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/1024); ` +
-		`hdd_total=[math]::Round($disk.Size/1MB); ` +
-		`hdd_usage=[math]::Round(($disk.Size-$disk.FreeSpace)/1MB) ` +
+		`hdd_total=$hddTotal; ` +
+		`hdd_usage=$hddUsage ` +
 		`} | ConvertTo-Json -Compress`
 
 	out, _, err := security.SafeExecWithTimeout(
@@ -214,8 +245,22 @@ func fillLocalStatusWindows(hw *model.HWStatus) {
 	hw.HddUsage = parsed.HddUsage
 }
 
+// windowsDriveForPath 返回路径所在逻辑盘（如 "D:"）。
+// 空路径、相对路径与 UNC 路径无法定位逻辑盘，返回空字符串表示不采集磁盘。
+func windowsDriveForPath(path string) string {
+	p := strings.TrimSpace(path)
+	if len(p) < 2 || p[1] != ':' {
+		return ""
+	}
+	drive := strings.ToUpper(p[:1])
+	if drive < "A" || drive > "Z" {
+		return ""
+	}
+	return drive + ":"
+}
+
 // fillLocalStatusDarwin 通过 sysctl 与 df 采集
-func fillLocalStatusDarwin(hw *model.HWStatus) {
+func fillLocalStatusDarwin(hw *model.HWStatus, systemPath string) {
 	if out, _, err := security.SafeExecWithTimeout([]string{"sysctl", "-n", "hw.ncpu"}, 5*time.Second); err == nil {
 		fmt.Sscanf(strings.TrimSpace(out), "%d", &hw.CpuTotal)
 	}
@@ -229,5 +274,5 @@ func fillLocalStatusDarwin(hw *model.HWStatus) {
 			hw.MemTotal = int(bytes / 1024 / 1024)
 		}
 	}
-	fillDiskViaDF(hw)
+	fillDiskViaDF(hw, systemPath)
 }

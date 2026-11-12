@@ -156,17 +156,20 @@ func (b *BaseDriver) remoteHWStatus() *model.HWStatus {
 		}
 	}
 
-	// 根分区
-	if res, err := RunSSHCommand(sshCfg, "df -k /"); err == nil && res != nil {
-		lines := strings.Split(strings.TrimSpace(res.Stdout), "\n")
-		if len(lines) >= 2 {
-			fields := strings.Fields(lines[len(lines)-1])
-			if len(fields) >= 3 {
-				var totalKB, usedKB int64
-				fmt.Sscanf(fields[1], "%d", &totalKB)
-				fmt.Sscanf(fields[2], "%d", &usedKB)
-				hw.HddTotal = int(totalKB / 1024)
-				hw.HddUsage = int(usedKB / 1024)
+	// 系统存储路径所在分区（未配置路径则不采集磁盘，避免误报根分区容量）
+	if path := strings.TrimSpace(cfg.SystemPath); path != "" {
+		res, err := RunSSHCommand(sshCfg, "df -k "+shellQuote(path))
+		if err == nil && res != nil && res.ExitCode == 0 {
+			lines := strings.Split(strings.TrimSpace(res.Stdout), "\n")
+			if len(lines) >= 2 {
+				fields := strings.Fields(lines[len(lines)-1])
+				if len(fields) >= 3 {
+					var totalKB, usedKB int64
+					fmt.Sscanf(fields[1], "%d", &totalKB)
+					fmt.Sscanf(fields[2], "%d", &usedKB)
+					hw.HddTotal = int(totalKB / 1024)
+					hw.HddUsage = int(usedKB / 1024)
+				}
 			}
 		}
 	}
@@ -257,5 +260,5 @@ func (b *BaseDriver) statusForPlatform() (*model.HWStatus, error) {
 	if isRemoteTarget(b.Config) {
 		return b.remoteHWStatus(), nil
 	}
-	return localHWStatus(), nil
+	return localHWStatus(systemPathOf(b.Config)), nil
 }

@@ -497,7 +497,7 @@ func (b *BaseDriver) GetPower(vmUUID string) string {
 // 远程平台（Proxmox / ESXi 等）必须覆写本方法，使用平台 API 采集，
 // 否则会把 IDCClient 本机资源误报为远程主机状态。
 func (b *BaseDriver) GetStatus() (*model.HWStatus, error) {
-	return localHWStatus(), nil
+	return localHWStatus(systemPathOf(b.Config)), nil
 }
 
 // GetScreenshot 获取截图（默认返回空，子类覆盖）

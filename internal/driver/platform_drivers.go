@@ -64,7 +64,7 @@ func (d *LXDDriver) GetStatus() (*model.HWStatus, error) {
 	hw := &model.HWStatus{OnUpdate: time.Now().Unix()}
 	out, _, err := security.SafeExecWithTimeout([]string{"lxc", "info"}, 15*time.Second)
 	if err != nil {
-		return localHWStatus(), nil
+		return localHWStatus(systemPathOf(d.Config)), nil
 	}
 
 	var inCPU, inMem bool
@@ -135,7 +135,7 @@ func (d *DockerDriver) GetStatus() (*model.HWStatus, error) {
 	}, 10*time.Second)
 	if err != nil {
 		// 本地 docker CLI 不可用时回退本机采集
-		return localHWStatus(), nil
+		return localHWStatus(systemPathOf(d.Config)), nil
 	}
 
 	parts := strings.Split(strings.TrimSpace(out), "|")
