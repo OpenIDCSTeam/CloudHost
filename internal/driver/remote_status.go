@@ -93,9 +93,10 @@ func (b *BaseDriver) remoteHWStatus() *model.HWStatus {
 	sshCfg.Host = addr
 
 	hw := &model.HWStatus{
-		OnUpdate: time.Now().Unix(),
-		ExtUsage: map[string][]int{},
-		GpuUsage: map[string]float64{},
+		OnUpdate:  time.Now().Unix(),
+		ExtUsage:  map[string][]int{},
+		DiskUsage: map[string][]int{},
+		GpuUsage:  map[string]float64{},
 	}
 
 	fail := func() *model.HWStatus {
@@ -156,21 +157,11 @@ func (b *BaseDriver) remoteHWStatus() *model.HWStatus {
 		}
 	}
 
-	// 系统存储路径所在分区（未配置路径则不采集磁盘，避免误报根分区容量）
-	if path := strings.TrimSpace(cfg.SystemPath); path != "" {
-		res, err := RunSSHCommand(sshCfg, "df -k "+shellQuote(path))
-		if err == nil && res != nil && res.ExitCode == 0 {
-			lines := strings.Split(strings.TrimSpace(res.Stdout), "\n")
-			if len(lines) >= 2 {
-				fields := strings.Fields(lines[len(lines)-1])
-				if len(fields) >= 3 {
-					var totalKB, usedKB int64
-					fmt.Sscanf(fields[1], "%d", &totalKB)
-					fmt.Sscanf(fields[2], "%d", &usedKB)
-					hw.HddTotal = int(totalKB / 1024)
-					hw.HddUsage = int(usedKB / 1024)
-				}
-			}
+	// 各存储用途所在分区（未配置的用途不采集，避免误报根分区容量）
+	if paths := hostDiskPaths(cfg); len(paths) > 0 {
+		hw.DiskUsage = remoteDiskUsage(sshCfg, paths)
+		if usage, ok := hw.DiskUsage["system"]; ok {
+			hw.HddTotal, hw.HddUsage = usage[0], usage[1]
 		}
 	}
 
@@ -260,5 +251,73 @@ func (b *BaseDriver) statusForPlatform() (*model.HWStatus, error) {
 	if isRemoteTarget(b.Config) {
 		return b.remoteHWStatus(), nil
 	}
-	return localHWStatus(systemPathOf(b.Config)), nil
+	return localHWStatus(b.Config), nil
+}
+
+// remoteDiskUsage 通过一次 SSH 会话采集各存储路径所在分区的用量（MB）。
+//
+// 脚本为每个路径输出 "__DISK__<path>" 标记行，再跟一行 df 结果：
+// 某个路径不存在时 df 静默失败，不会让后续路径的读数错位。
+func remoteDiskUsage(cfg SSHExecConfig, paths map[string]string) map[string][]int {
+	usage := make(map[string][]int, len(paths))
+
+	unique := make([]string, 0, len(paths))
+	seen := make(map[string]bool, len(paths))
+	for _, role := range hostDiskRoles {
+		p, ok := paths[role]
+		if !ok || seen[p] {
+			continue
+		}
+		seen[p] = true
+		unique = append(unique, p)
+	}
+	if len(unique) == 0 {
+		return usage
+	}
+
+	var script strings.Builder
+	script.WriteString("for p in")
+	for _, p := range unique {
+		script.WriteString(" ")
+		script.WriteString(shellQuote(p))
+	}
+	script.WriteString(`; do echo "__DISK__$p"; df -kP "$p" 2>/dev/null | tail -n 1; done`)
+
+	res, err := RunSSHCommand(cfg, script.String())
+	if err != nil || res == nil {
+		return usage
+	}
+
+	byPath := make(map[string][]int, len(unique))
+	current := ""
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "__DISK__") {
+			current = strings.TrimPrefix(line, "__DISK__")
+			continue
+		}
+		if current == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 3 {
+			var totalKB, usedKB int64
+			if _, errTotal := fmt.Sscanf(fields[1], "%d", &totalKB); errTotal == nil {
+				if _, errUsed := fmt.Sscanf(fields[2], "%d", &usedKB); errUsed == nil {
+					byPath[current] = []int{int(totalKB / 1024), int(usedKB / 1024)}
+				}
+			}
+		}
+		current = ""
+	}
+
+	for role, p := range paths {
+		if u, ok := byPath[p]; ok {
+			usage[role] = u
+		}
+	}
+	return usage
 }

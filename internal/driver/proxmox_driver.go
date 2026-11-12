@@ -561,46 +561,37 @@ func (d *ProxmoxDriver) GetStatus() (*model.HWStatus, error) {
 		hw.MemTotal = int(node.Memory.Total / 1024 / 1024)
 		hw.MemUsage = int(node.Memory.Used / 1024 / 1024)
 	}
-	// 系统盘所在存储的容量：只统计配置的 system_path（PVE 存储名）；
-	// 未配置时不填磁盘数据，避免把 PVE 根分区误当成虚拟机可用空间。
-	if storage := strings.TrimSpace(d.Config.SystemPath); storage != "" {
-		if total, used, ok := d.storageUsage(storage); ok {
-			hw.HddTotal = int(total / 1024 / 1024)
-			hw.HddUsage = int(used / 1024 / 1024)
+	// 各存储用途的容量：system_path / extern_path 等均为 PVE 存储名；
+	// 未配置的用途不填，避免把 PVE 根分区误当成虚拟机可用空间。
+	paths := hostDiskPaths(d.Config)
+	if len(paths) > 0 {
+		if storages, err := node.Storages(d.Ctx("")); err == nil {
+			byName := make(map[string][]int, len(storages))
+			for _, s := range storages {
+				if s == nil || s.Total == 0 {
+					continue
+				}
+				used := s.Used
+				if used == 0 && s.Avail > 0 {
+					used = s.Total - s.Avail
+				}
+				byName[strings.TrimSpace(s.Name)] = []int{int(s.Total / 1024 / 1024), int(used / 1024 / 1024)}
+			}
+			hw.DiskUsage = make(map[string][]int, len(paths))
+			for role, name := range paths {
+				if usage, ok := byName[name]; ok {
+					hw.DiskUsage[role] = usage
+				}
+			}
+			if usage, ok := hw.DiskUsage["system"]; ok {
+				hw.HddTotal, hw.HddUsage = usage[0], usage[1]
+			}
 		}
 	}
 	hw.CpuTotal = int(node.CPUInfo.CPUs)
 	hw.CpuModel = node.CPUInfo.Model
 
 	return hw, nil
-}
-
-// storageUsage 读取 PVE 存储（system_path）的总量与已用量（字节）。
-func (d *ProxmoxDriver) storageUsage(storage string) (int64, int64, bool) {
-	client, err := d.apiConn()
-	if err != nil {
-		return 0, 0, false
-	}
-	var status struct {
-		Total int64 `json:"total"`
-		Used  int64 `json:"used"`
-		Avail int64 `json:"avail"`
-	}
-	path := fmt.Sprintf("/nodes/%s/storage/%s/status", d.nodeName(), url.PathEscape(storage))
-	if err := client.Get(d.Ctx(""), path, &status); err != nil {
-		return 0, 0, false
-	}
-	if status.Total <= 0 {
-		return 0, 0, false
-	}
-	used := status.Used
-	if used <= 0 && status.Avail > 0 {
-		used = status.Total - status.Avail
-	}
-	if used < 0 {
-		used = 0
-	}
-	return status.Total, used, true
 }
 
 // ============================================================

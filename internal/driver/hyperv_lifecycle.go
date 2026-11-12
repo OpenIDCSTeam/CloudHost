@@ -38,7 +38,7 @@ func (d *HyperVDriver) hvDiskDir() string {
 // 原实现直接走基类的本机采集，缺少第 2 步的 Hyper-V 覆盖。
 // 查询失败时保留本机数据，不阻断状态上报。
 func (d *HyperVDriver) GetStatus() (*model.HWStatus, error) {
-	hw := localHWStatus(systemPathOf(d.Config))
+	hw := localHWStatus(d.Config)
 
 	// 内存单位：MemoryCapacity 为字节；CPU 取逻辑处理器数
 	script := `$ErrorActionPreference='SilentlyContinue'; ` +

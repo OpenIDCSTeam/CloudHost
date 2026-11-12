@@ -130,6 +130,8 @@ type HWStatus struct {
 	HddTotal  int                `json:"hdd_total"`  // 主盘总量(MB)
 	HddUsage  int                `json:"hdd_usage"`  // 主盘使用(MB)
 	ExtUsage  map[string][]int   `json:"ext_usage"`  // 数据盘 {挂载点:[总MB,已用MB]}
+	// DiskUsage 按用途统计的磁盘容量（MB），键：system/data/images/iso/backup
+	DiskUsage map[string][]int   `json:"disk_usage"`
 	FluTotal  int                `json:"flu_total"`  // 流量总额(MB)
 	FluUsage  int                `json:"flu_usage"`  // 流量使用(MB)
 	NetworkU  int                `json:"network_u"`  // 上行带宽(KB/s)
