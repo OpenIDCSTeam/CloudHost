@@ -22,6 +22,34 @@ import (
 // 30 秒新鲜度窗口一致）。
 const statusCacheTTL = 30 * time.Second
 
+// hostStatusTimeout 单次主机状态采集的等待上限。
+// 采集要走平台 API（PVE / ESXi / Hyper-V PowerShell），平台无响应时会一直等；
+// 超过该上限直接回退到数据库里的上一次结果，接口不再被拖住。
+const hostStatusTimeout = 5 * time.Second
+
+// statusWithTimeout 带超时地采集一次主机状态。
+//
+// 结果通道缓冲 1：超时返回后 goroutine 仍能写入并退出，不会泄漏。
+func statusWithTimeout(d driver.HostDriver, timeout time.Duration) (*model.HWStatus, error) {
+	type result struct {
+		hw  *model.HWStatus
+		err error
+	}
+
+	ch := make(chan result, 1)
+	go func() {
+		hw, err := d.GetStatus()
+		ch <- result{hw: hw, err: err}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.hw, r.err
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("采集主机状态超时（%s）", timeout)
+	}
+}
+
 // hostStatusCacheEntry 主机状态缓存条目
 type hostStatusCacheEntry struct {
 	status   *model.HWStatus
@@ -40,7 +68,20 @@ type HostService struct {
 	statusCache map[string]*hostStatusCacheEntry
 	// refreshing 标记正在后台刷新状态的主机，避免并发重复采集
 	refreshing map[string]bool
+	// vmSnapMu/vmSnapCache 驱动侧虚拟机快照缓存（按主机）。
+	// 列表类接口只读快照，不能因为某台主机的驱动锁被占而挂住。
+	vmSnapMu    sync.Mutex
+	vmSnapCache map[string]*staleValue[map[string]*model.VMConfig]
 }
+
+// 列表类接口读取驱动快照的策略：
+//   - vmSnapshotTTL 内直接复用，不重复读取
+//   - 超过 TTL 仍返回旧快照，刷新放后台
+//   - 首次无缓存时最多等 vmSnapshotTimeout，超时由调用方回退数据库
+const (
+	vmSnapshotTTL     = 10 * time.Second
+	vmSnapshotTimeout = 3 * time.Second
+)
 
 // NewHostService 创建主机管理服务
 func NewHostService(db *data.DB) *HostService {
@@ -109,6 +150,48 @@ func (s *HostService) UpdateHost(cfg *model.HSConfig) error {
 	}
 	// 重新初始化驱动
 	s.initDriver(cfg)
+	return nil
+}
+
+// UpdateImageMaps 只更新主机镜像清单（system_maps / images_maps）。
+//
+// 与 UpdateHost 的区别：不重建驱动。镜像绑定/解绑属于轻量配置变更，
+// 重建驱动会中断该主机上正在执行的平台操作（创建虚拟机、备份等）；
+// 这里直接落库，并把新清单同步给已加载驱动，避免后续读档读到旧值。
+func (s *HostService) UpdateImageMaps(hsName string, systemMaps, imagesMaps []model.OSConfig) error {
+	cfg, err := s.GetHost(hsName)
+	if err != nil {
+		return err
+	}
+	if cfg == nil {
+		return fmt.Errorf("主机不存在: %s", hsName)
+	}
+	if systemMaps == nil {
+		systemMaps = []model.OSConfig{}
+	}
+	if imagesMaps == nil {
+		imagesMaps = []model.OSConfig{}
+	}
+	cfg.SystemMaps = systemMaps
+	cfg.ImagesMaps = imagesMaps
+
+	row, err := hsConfigToRow(cfg)
+	if err != nil {
+		return fmt.Errorf("序列化主机配置失败: %w", err)
+	}
+	if err := s.db.UpdateHost(row); err != nil {
+		return fmt.Errorf("更新镜像清单失败: %w", err)
+	}
+
+	s.mu.RLock()
+	d := s.drivers[hsName]
+	s.mu.RUnlock()
+	if d != nil {
+		if live := d.GetConfig(); live != nil {
+			live.SystemMaps = append([]model.OSConfig(nil), systemMaps...)
+			live.ImagesMaps = append([]model.OSConfig(nil), imagesMaps...)
+		}
+	}
 	return nil
 }
 
@@ -229,7 +312,7 @@ func (s *HostService) GetHostStatusPayload(hsName string, refresh bool) (map[str
 		return s.statusFromDB(hsName, now), nil
 	}
 
-	hw, statusErr := d.GetStatus()
+	hw, statusErr := statusWithTimeout(d, hostStatusTimeout)
 	if statusErr != nil || hw == nil {
 		return s.statusFromDB(hsName, now), nil
 	}
@@ -302,7 +385,8 @@ func (s *HostService) refreshHostStatusAsync(hsName string) {
 		if d == nil {
 			return
 		}
-		hw, err := d.GetStatus()
+		// 带超时：采集卡住时及时释放 refreshing 标记，避免该主机永久不再刷新
+		hw, err := statusWithTimeout(d, hostStatusTimeout)
 		if err != nil || hw == nil {
 			return
 		}
@@ -380,6 +464,33 @@ func (s *HostService) GetHostPlans(hsName string) (map[string]interface{}, error
 		return make(map[string]interface{}), nil
 	}
 	return plans, nil
+}
+
+// GetHostPlanConfig 取主机上指定套餐的资源配置，套餐不存在时返回 nil。
+//
+// 套餐在数据库里是 JSON，读出来是 map，这里统一还原成 VMConfig，
+// 供创建流程按套餐规格补齐资源字段。
+func (s *HostService) GetHostPlanConfig(hsName, planName string) *model.VMConfig {
+	if strings.TrimSpace(planName) == "" {
+		return nil
+	}
+	plans, err := s.GetHostPlans(hsName)
+	if err != nil || plans == nil {
+		return nil
+	}
+	raw, ok := plans[planName]
+	if !ok || raw == nil {
+		return nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	cfg, err := DecodeVMConfig(string(data))
+	if err != nil || cfg == nil {
+		return nil
+	}
+	return cfg
 }
 
 // SetHostPlan 设置主机套餐
@@ -544,6 +655,61 @@ func (s *HostService) GetDriver(hsName string) driver.HostDriver {
 	return s.GetOrCreateDriver(hsName)
 }
 
+// PeekDriver 只读取已加载的驱动，不触发惰性创建。
+//
+// 列表 / 统计类接口必须用它：GetDriver 会在驱动缺失时同步构造并初始化，
+// 一旦某台主机的初始化阻塞（平台不可达、构造卡住），遍历主机的请求会被
+// 整体卡死，前端所有页面都停在 /api/server/detail 上；
+// 而这类接口本身只需要配置与运行时快照，缺驱动时回退数据库即可。
+func (s *HostService) PeekDriver(hsName string) driver.HostDriver {
+	return s.getDriver(hsName)
+}
+
+// VMDriverSnapshot 返回驱动内存中的虚拟机快照（带缓存、并发合并与超时）。
+//
+// 列表类接口必须走这里，而不是直接 d.GetVMSaving()：
+// 驱动内部的读写锁可能被某个平台调用长期持有（vmrest 无响应、
+// 命令执行等待等），直接调用会把整个列表接口一起拖死 ——
+// 表现为 /api/server/detail 挂起、前端所有页面卡住。
+//
+// 返回 nil 表示本次拿不到快照，调用方应回退到数据库中的配置。
+func (s *HostService) VMDriverSnapshot(hsName string) map[string]*model.VMConfig {
+	s.vmSnapMu.Lock()
+	if s.vmSnapCache == nil {
+		s.vmSnapCache = make(map[string]*staleValue[map[string]*model.VMConfig])
+	}
+	c := s.vmSnapCache[hsName]
+	if c == nil {
+		c = &staleValue[map[string]*model.VMConfig]{}
+		s.vmSnapCache[hsName] = c
+	}
+	s.vmSnapMu.Unlock()
+
+	v, ok := c.Get(vmSnapshotTTL, vmSnapshotTimeout, func() (map[string]*model.VMConfig, error) {
+		// 只读已加载的驱动，不触发惰性创建
+		d := s.getDriver(hsName)
+		if d == nil {
+			return nil, nil
+		}
+		return d.GetVMSaving(), nil
+	})
+	if !ok || v == nil {
+		return nil
+	}
+	return v
+}
+
+// InvalidateVMSnapshot 让某主机的驱动快照缓存立即过期。
+// 创建 / 删除 / 电源 / 改配等写操作完成后调用，保证下一次列表读取拿到新状态。
+func (s *HostService) InvalidateVMSnapshot(hsName string) {
+	s.vmSnapMu.Lock()
+	c := s.vmSnapCache[hsName]
+	s.vmSnapMu.Unlock()
+	if c != nil {
+		c.Invalidate()
+	}
+}
+
 // GetOrCreateDriver 获取驱动，未加载时按数据库配置惰性创建（仅限已启用主机）。
 //
 // 使用独立的初始化锁并二次检查：原实现是「检查不存在 → 构造 → 覆盖」，
@@ -553,7 +719,14 @@ func (s *HostService) GetOrCreateDriver(hsName string) driver.HostDriver {
 		return d
 	}
 
-	s.initMu.Lock()
+	// 已有初始化在飞时立即返回，不排队等锁。
+	// 初始化要连平台、读配置，平台不可达时会长时间阻塞；此前用阻塞式 Lock，
+	// 一个主机初始化卡住会让所有「未加载主机」的请求永久排队，
+	// 表现为 /api/server/detail 挂起、前端整页无响应。
+	// 这里降级为「本次不可用」，下一个请求会复用最终创建好的驱动。
+	if !s.initMu.TryLock() {
+		return nil
+	}
 	defer s.initMu.Unlock()
 
 	// 二次检查：可能已被其它协程创建

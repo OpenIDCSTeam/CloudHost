@@ -340,6 +340,14 @@ func (app *App) registerRoutes() {
 		api.GET("/server/ports/:hs_name", app.handleHostPorts)
 		api.POST("/server/backup/scan/:hs_name", app.handleHostBackupScan)
 
+		// 主机镜像/文件管理（系统模板 + ISO 目录）
+		api.GET("/server/images/:hs_name", adminMW, app.handleHostImageList)
+		api.POST("/server/images/:hs_name/upload", adminMW, app.handleHostImageUpload)
+		api.POST("/server/images/:hs_name/rename", adminMW, app.handleHostImageRename)
+		api.DELETE("/server/images/:hs_name", adminMW, app.handleHostImageDelete)
+		api.POST("/server/images/:hs_name/bind", adminMW, app.handleHostImageBind)
+		api.DELETE("/server/images/:hs_name/bind", adminMW, app.handleHostImageUnbind)
+
 		// 虚拟机管理
 		api.GET("/client/detail/:hs_name", app.handleVMList)
 		api.GET("/client/detail/:hs_name/:vm_uuid", app.handleVMDetail)
