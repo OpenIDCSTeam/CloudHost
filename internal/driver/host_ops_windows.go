@@ -35,16 +35,81 @@ func (o *windowsHostOps) ps(script string, timeout time.Duration) (string, error
 	out, stderr, err := security.SafeExecWithTimeout(
 		[]string{"powershell", "-NoProfile", "-NonInteractive", "-Command", full}, timeout)
 	if err != nil {
-		msg := strings.TrimSpace(stderr)
-		if msg == "" {
-			msg = strings.TrimSpace(out)
+		raw := strings.TrimSpace(stderr)
+		if raw == "" {
+			raw = strings.TrimSpace(out)
 		}
-		if msg == "" {
-			msg = err.Error()
+		if raw == "" {
+			raw = err.Error()
 		}
-		return out, fmt.Errorf("%s", msg)
+		return out, fmt.Errorf("%s", compactPowerShellError(raw))
 	}
 	return out, nil
+}
+
+// compactPowerShellError 把 PowerShell 的多行错误压成一行可读文本。
+//
+// 原始错误形如：
+//
+//	Get-NetFirewallRule : There are no more endpoints available from the endpoint mapper.
+//	At line:1 char:57
+//	+ ... [Console]::OutputEncoding=...
+//	    + CategoryInfo          : NotSpecified: ...
+//	    + FullyQualifiedErrorId : Windows System Error 1753,Get-NetFirewallRule
+//
+// 直接抛给前端会把整段堆栈铺满提示框，这里只保留核心原因。
+func compactPowerShellError(raw string) string {
+	noise := []string{"At line:", "+ CategoryInfo", "CategoryInfo", "FullyQualifiedErrorId", "+ ...", "    +"}
+	for _, line := range strings.Split(strings.ReplaceAll(raw, "\r", ""), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "+") {
+			continue
+		}
+		skip := false
+		for _, prefix := range noise {
+			if strings.HasPrefix(line, prefix) {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+		// "Cmdlet : 原因" → 只留原因
+		if idx := strings.Index(line, " : "); idx > 0 && idx < 64 {
+			line = strings.TrimSpace(line[idx+3:])
+		}
+		runes := []rune(line)
+		if len(runes) > 300 {
+			line = string(runes[:300]) + "…"
+		}
+		return line
+	}
+	runes := []rune(strings.TrimSpace(raw))
+	if len(runes) > 300 {
+		return string(runes[:300]) + "…"
+	}
+	return strings.TrimSpace(raw)
+}
+
+// firewallServiceRunning 判断 Windows 防火墙服务（MpsSvc）是否运行。
+//
+// 该服务停止时 Get-NetFirewallRule 会报
+// "There are no more endpoints available from the endpoint mapper"（错误 1753），
+// 直接把这个英文错误抛给用户没有意义，需要先定位到服务状态。
+func (o *windowsHostOps) firewallServiceRunning() bool {
+	out, err := o.ps("(Get-Service -Name MpsSvc -ErrorAction SilentlyContinue).Status", 20*time.Second)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(out), "running")
+}
+
+// firewallServiceHint 防火墙服务未运行时返回可操作的排查提示
+func (o *windowsHostOps) firewallServiceHint() string {
+	return "Windows 防火墙服务（MpsSvc）未运行，无法读取或修改防火墙规则。" +
+		"可在「服务」页签启动 MpsSvc，或在主机上以管理员身份执行：" +
+		"sc config MpsSvc start= auto && sc start MpsSvc"
 }
 
 func (o *windowsHostOps) ListProcesses() ([]HostProcessItem, error) {
@@ -147,6 +212,10 @@ func (o *windowsHostOps) ControlService(name, action string) error {
 func (o *windowsHostOps) ListFirewallRules() ([]HostFirewallRule, error) {
 	out, err := o.ps("Get-NetFirewallRule -Direction Inbound | Select-Object -First 200 Name,DisplayName,Action,Enabled,Profile | ConvertTo-Json -Compress", 60*time.Second)
 	if err != nil {
+		// 服务未运行时 CIM 提供程序不可用，给出可操作的提示而不是原始 1753 错误
+		if !o.firewallServiceRunning() {
+			return nil, fmt.Errorf("%s", o.firewallServiceHint())
+		}
 		return nil, fmt.Errorf("读取防火墙规则失败: %w", err)
 	}
 	raw, parseErr := parsePowerShellJSONList(strings.TrimSpace(out))
@@ -214,6 +283,9 @@ func (o *windowsHostOps) AddFirewallRule(rule HostFirewallRule) error {
 		parts = append(parts, "-RemoteAddress", psQuote(source))
 	}
 	if _, err := o.ps(strings.Join(parts, " "), 60*time.Second); err != nil {
+		if !o.firewallServiceRunning() {
+			return fmt.Errorf("%s", o.firewallServiceHint())
+		}
 		return fmt.Errorf("添加防火墙规则失败: %w", err)
 	}
 	return nil
@@ -225,6 +297,9 @@ func (o *windowsHostOps) DeleteFirewallRule(id string) error {
 		return fmt.Errorf("规则标识不合法")
 	}
 	if _, err := o.ps(fmt.Sprintf("Remove-NetFirewallRule -Name %s", psQuote(id)), 60*time.Second); err != nil {
+		if !o.firewallServiceRunning() {
+			return fmt.Errorf("%s", o.firewallServiceHint())
+		}
 		return fmt.Errorf("删除防火墙规则失败: %w", err)
 	}
 	return nil
