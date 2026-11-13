@@ -95,10 +95,33 @@ type HostOps interface {
 // Hyper-V / VMware Workstation / 逍遥模拟器只能在控制端本机执行 PowerShell；
 // 其余平台（PVE、QEMU、ESXi、容器）按 Linux shell 处理，远程时走 SSH。
 func NewHostOps(cfg *model.HSConfig) HostOps {
-	if cfg != nil && hostOSFor(cfg.ServerType) == "windows" {
-		return &windowsHostOps{cfg: cfg}
+	if cfg != nil {
+		if hostOSFor(cfg.ServerType) == "windows" {
+			return &windowsHostOps{cfg: cfg}
+		}
+		// ESXi 的 server_port 是 vSphere API 的 443，SSH 需走 22，且系统命令用 esxcli
+		if cfg.ServerType == "vSphereESXi" {
+			return newESXiHostOps(cfg)
+		}
 	}
 	return &linuxHostOps{cfg: cfg}
+}
+
+// SSHPortForHost 返回该主机 SSH 实际使用的端口。
+//
+// 大多数平台的 server_port 就是 SSH 端口；ESXi 例外：
+// 443 是 vSphere API，SSH 固定 22（或 server_addr 中显式指定的端口）。
+func SSHPortForHost(cfg *model.HSConfig) int {
+	if cfg == nil {
+		return 22
+	}
+	if cfg.ServerType == "vSphereESXi" {
+		return esxiSSHPort(cfg)
+	}
+	if cfg.ServerPort > 0 {
+		return cfg.ServerPort
+	}
+	return 22
 }
 
 // hostOSFor 判断主机目标操作系统
@@ -159,12 +182,37 @@ func hostFileName(name string) error {
 
 type linuxHostOps struct {
 	cfg *model.HSConfig
+	// sshPort 非 0 时覆盖 SSH 端口。
+	// ESXi 的 server_port 是 vSphere API 的 443，SSH 实际走 22。
+	sshPort int
 }
 
 func (o *linuxHostOps) HostOS() string { return "linux" }
 
+// runner 返回命令执行器（带 SSH 端口覆盖）
+func (o *linuxHostOps) runner() *hostCommandRunner {
+	cfg := o.cfg
+	if o.sshPort > 0 && o.cfg != nil {
+		copyCfg := *o.cfg
+		copyCfg.ServerPort = o.sshPort
+		cfg = &copyCfg
+	}
+	return newHostCommandRunner(cfg)
+}
+
+// sshConfig 返回 SSH 连接配置（带端口覆盖）
+func (o *linuxHostOps) sshConfig() SSHExecConfig {
+	cfg := o.cfg
+	if o.sshPort > 0 && o.cfg != nil {
+		copyCfg := *o.cfg
+		copyCfg.ServerPort = o.sshPort
+		cfg = &copyCfg
+	}
+	return sshConfigFromHS(cfg)
+}
+
 func (o *linuxHostOps) run(cmd string, timeout time.Duration) (string, error) {
-	return newHostCommandRunner(o.cfg).runShell(cmd, timeout)
+	return o.runner().runShell(cmd, timeout)
 }
 
 func (o *linuxHostOps) ListProcesses() ([]HostProcessItem, error) {
@@ -471,7 +519,7 @@ func (o *linuxHostOps) UploadHostFile(dir, name string, r io.Reader) (int64, err
 	}
 	base := path.Clean(dir)
 
-	if !newHostCommandRunner(o.cfg).isRemote() {
+	if !o.runner().isRemote() {
 		if err := os.MkdirAll(base, 0o755); err != nil {
 			return 0, fmt.Errorf("创建目录失败: %w", err)
 		}
@@ -502,7 +550,7 @@ func (o *linuxHostOps) UploadHostFile(dir, name string, r io.Reader) (int64, err
 	}
 	target := path.Join(base, name)
 	tmp := target + ".uploading"
-	n, stderr, err := runSSHStream(sshConfigFromHS(o.cfg), fmt.Sprintf("cat > %s", shellQuote(tmp)), r)
+	n, stderr, err := runSSHStream(o.sshConfig(), fmt.Sprintf("cat > %s", shellQuote(tmp)), r)
 	if err != nil {
 		msg := strings.TrimSpace(stderr)
 		if msg == "" {
@@ -525,7 +573,7 @@ func (o *linuxHostOps) DownloadHostFile(dir, name string) (io.ReadCloser, error)
 	}
 	target := path.Join(path.Clean(dir), name)
 
-	if !newHostCommandRunner(o.cfg).isRemote() {
+	if !o.runner().isRemote() {
 		f, err := os.Open(target)
 		if err != nil {
 			return nil, fmt.Errorf("打开文件失败: %w", err)
@@ -537,7 +585,7 @@ func (o *linuxHostOps) DownloadHostFile(dir, name string) (io.ReadCloser, error)
 		return f, nil
 	}
 
-	return openSSHReadStream(sshConfigFromHS(o.cfg), fmt.Sprintf("cat %s", shellQuote(target)))
+	return openSSHReadStream(o.sshConfig(), fmt.Sprintf("cat %s", shellQuote(target)))
 }
 
 // openSSHReadStream 通过 SSH 读取远端文件内容（流式，适合大文件下载）

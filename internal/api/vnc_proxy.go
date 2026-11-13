@@ -699,11 +699,20 @@ func (s *SSHTerminalServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer wsConn.Close()
 
-	// 配置SSH客户端
+	// 配置SSH客户端。
+	// 必须同时提供 keyboard-interactive：ESXi 的 OpenSSH 走 PAM，
+	// 只给 ssh.Password 会得到 "unable to authenticate, attempted methods [none]"。
 	sshConfig := &ssh.ClientConfig{
 		User: connInfo.User,
 		Auth: []ssh.AuthMethod{
 			ssh.Password(connInfo.Password),
+			ssh.KeyboardInteractive(func(_, _ string, questions []string, _ []bool) ([]string, error) {
+				answers := make([]string, len(questions))
+				for i := range answers {
+					answers[i] = connInfo.Password
+				}
+				return answers, nil
+			}),
 		},
 		HostKeyCallback: s.hostKeyCallback(),
 		Timeout:         15 * time.Second,

@@ -389,10 +389,8 @@ func (app *App) handleHostTerminal(c *gin.Context) {
 	if strings.HasPrefix(host, "ssh://") || host == "" || isLocalHostAddr(host) {
 		host = "127.0.0.1"
 	}
-	port := cfg.ServerPort
-	if port <= 0 {
-		port = 22
-	}
+	// ESXi 的 server_port 是 vSphere API 的 443，SSH 需走 22
+	port := driver.SSHPortForHost(cfg)
 	user := strings.TrimSpace(cfg.ServerUser)
 	if user == "" {
 		user = "root"
