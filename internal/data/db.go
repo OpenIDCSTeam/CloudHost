@@ -1820,6 +1820,22 @@ func (d *DB) CleanupDeletedVMStatus() (int64, error) {
 	return n, nil
 }
 
+// CleanupUnreportedVMStatus 清理「只有电源态、没有资源指标」的状态历史。
+//
+// 这类记录由旧版调度器每分钟为每台虚拟机写入（形如
+// {"ac_status":"STARTED","vm_state":"运行中","on_update":...}），
+// 会占满 GetVMStatus 的读取窗口（最近 100 条），把虚拟机内 Agent 的真实上报
+// 挤到窗口之外，表现为「上报了但系统看不到状态」。新版调度器已不再写入，
+// 这里负责清掉存量数据。
+func (d *DB) CleanupUnreportedVMStatus() (int64, error) {
+	result, err := d.db.Exec(`DELETE FROM vm_status WHERE status_data NOT LIKE '%"cpu_total"%'`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := result.RowsAffected()
+	return n, nil
+}
+
 // CleanupVMStatusHistory 清理虚拟机状态历史记录
 // 每个 (hs_name, vm_uuid) 仅保留最近 keep 条，更早的记录被删除
 // 对应 Python 版 HostManage._cleanup_vm_status_history（默认保留 43200 条）

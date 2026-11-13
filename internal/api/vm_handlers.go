@@ -1106,6 +1106,48 @@ func normalizeScreenshot(raw string) string {
 	return raw
 }
 
+// handleVMDiskBus POST /api/client/diskbus/:hs_name/:vm_uuid
+//
+// 切换系统盘控制器（sata/scsi/ide）。镜像与控制器不匹配时 Windows 会在开机
+// 阶段报 INACCESSIBLE_BOOT_DEVICE(0x7B) 蓝屏；该接口会关机 → 改写 VMX →
+// 重新注册 → 开机，虚拟机数据与其它配置保持不变，无需重建。
+func (app *App) handleVMDiskBus(c *gin.Context) {
+	hsName := c.Param("hs_name")
+	vmUUID := c.Param("vm_uuid")
+
+	var req struct {
+		Bus string `json:"bus"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, "无效的请求数据")
+		return
+	}
+
+	d := app.HostSvc.GetDriver(hsName)
+	if d == nil {
+		utils.NotFound(c, "主机不存在或未启用")
+		return
+	}
+
+	release := app.bindRequestContext(c, hsName, vmUUID)
+	defer release()
+
+	res, err := d.SetDiskBus(vmUUID, req.Bus)
+	if err != nil {
+		app.Logger.Log(hsName, "ERROR", "磁盘控制器", "切换失败: "+err.Error(), false)
+		utils.InternalErrorf(c, "切换磁盘控制器失败", err)
+		return
+	}
+	if res != nil && !res.Success {
+		utils.Fail(c, 400, res.Message)
+		return
+	}
+
+	app.Logger.Log(hsName, "INFO", "磁盘控制器",
+		fmt.Sprintf("虚拟机 %s 系统盘控制器切换为 %s", vmUUID, req.Bus), true)
+	utils.SuccessMsg(c, res.Message, gin.H{"vm_uuid": vmUUID, "bus": req.Bus})
+}
+
 // handleVMPassword POST /api/client/password/:hs_name/:vm_uuid
 //
 // 前端按 type 区分三类修改：os_password（默认）、vnc_password、vnc_port。
@@ -1259,42 +1301,22 @@ func (app *App) handleVMStatus(c *gin.Context) {
 		return
 	}
 
-	// 只保留「上报数据」：调度器每轮采集也会写一条
-	// {"vm_state":"running","on_update":...} 到同一张表，
-	// 这类记录没有任何资源指标，混进来会让前端的「最新状态」取到空值，
-	// 看起来像「上报了但后端看不到」。
-	history := make([]interface{}, 0, len(statusList))
-	for _, s := range statusList {
-		var data interface{}
-		if err := json.Unmarshal([]byte(s), &data); err != nil {
-			continue
-		}
-		if m, ok := data.(map[string]interface{}); ok {
-			_, hasCPU := m["cpu_total"]
-			_, hasMem := m["mem_total"]
-			_, hasAC := m["ac_status"]
-			if !hasCPU && !hasMem && !hasAC {
-				continue
-			}
-		}
-		history = append(history, data)
-	}
+	// history 只保留「上报数据」（带资源指标的记录）：调度器每轮采集也会写一条
+	// 只含电源态的合成记录（旧版），混进来会让监控图表出现大量 0 值点。
+	// 电源态与 history 分开取，避免被过滤规则影响。
+	historyPower, history := splitVMStatusHistory(statusList)
 
-	// DB 查询按 on_update DESC 取最近 100 条，但前端与图表都按升序消费：
-	//   - DockDetail 用 status[length-1] 当作「最新状态」；
-	//   - 监控图表按数组顺序绘制时间轴。
-	// 不反转会出现「最新状态取到最旧的一条」「曲线左右颠倒」。
-	for i, j := 0, len(history)-1; i < j; i, j = i+1, j-1 {
-		history[i], history[j] = history[j], history[i]
-	}
-
-	// 最新电源状态取自 VMConfig.vm_flag（与 Python 一致）
+	// 电源态以驱动内存为准：调度器每 60 秒从平台读回真实状态并写回（VmFlag）。
+	// 状态历史里的 ac_status 是 Agent 采样时刻的值，虚拟机关机后不再上报，
+	// 会永远停在「运行中」。历史值仅在驱动侧也未知时兜底。
 	powerStatus := string(model.VMPowerUnknown)
 	if vmCfg := app.HostSvc.MustGetVMConfig(hsName, vmUUID); vmCfg != nil && vmCfg.VmFlag != "" {
 		powerStatus = string(vmCfg.VmFlag)
 	}
-	// 驱动内存里的状态由调度器每 60 秒刷新一次：agent 刚启动、虚拟机刚纳管时
-	// 仍是「未知」，详情页会先显示未知再跳变。这里未知时实时问一次平台并写回。
+	if powerStatus == string(model.VMPowerUnknown) {
+		powerStatus = historyPower
+	}
+	// 仍然未知时实时问一次平台并写回，避免详情页先显示未知再跳变
 	if powerStatus == string(model.VMPowerUnknown) {
 		if d := app.HostSvc.GetDriver(hsName); d != nil {
 			if state, ok := driver.PowerStatusMap[d.GetPower(vmUUID)]; ok && state != model.VMPowerUnknown {

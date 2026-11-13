@@ -10,7 +10,6 @@ import (
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/data"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/driver"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/logger"
-	"github.com/OpenIDCSTeam/HostAgent-Go/internal/model"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/service"
 )
 
@@ -205,7 +204,6 @@ func (s *Scheduler) syncHost(hsName string, d driver.HostDriver) {
 
 	// 2. 同步所有虚拟机电源状态
 	vms := d.GetVMSaving()
-	now := time.Now().Unix()
 	for vmUUID, vmCfg := range vms {
 		func() {
 			defer func() {
@@ -218,26 +216,19 @@ func (s *Scheduler) syncHost(hsName string, d driver.HostDriver) {
 			actualStatus := d.GetPower(vmUUID)
 			// 通过驱动锁内方法写回：快照对象是复制品，
 			// 直接修改不会生效，且与其它请求并发时会形成数据竞争。
-			powerState := model.VMPowerUnknown
 			if newState, ok := driver.PowerStatusMap[actualStatus]; ok {
-				powerState = newState
 				d.SetVMPowerState(vmUUID, newState)
 			}
 			_ = vmCfg
 
-			// 状态历史必须带 ac_status：
-			//  1) 前端按 ac_status（STARTED/STOPPED/PAUSED）判断电源态；
-			//  2) handleVMStatus 会丢弃既无 ac_status 也无资源指标的记录，
-			//     只写 vm_state 会让状态历史永久为空，表现为「拿不到虚拟机状态」。
-			statusData := map[string]interface{}{
-				"ac_status": string(powerState),
-				"vm_state":  actualStatus,
-				"on_update": now,
-			}
-			if err := s.db.AddVMStatus(hsName, vmUUID, statusData, string(powerState), now, 0); err != nil {
-				s.log.Event("scheduler", "状态采集").Host(hsName).VM(vmUUID, "").Err(err).
-					Warn("保存虚拟机 %s 状态失败: %v", vmUUID, err)
-			}
+			// 电源态只写回驱动内存，不写 vm_status。
+			//
+			// vm_status 是「虚拟机内 Agent 上报」的状态历史，列表与监控都按其中
+			// 最新的若干条消费（GetVMStatus 只取最近 100 条）。调度器每分钟给每台
+			// 虚拟机补一条只有电源态、没有资源指标的记录，会把这些读取窗口全部
+			// 占满，Agent 的真实上报被挤到窗口之外，表现为「上报了但看不到状态」。
+			// 电源态另有来源：buildVMView / handleVMStatus 会读取驱动内存中的
+			// VmFlag（即这里的 SetVMPowerState 写回值）。
 		}()
 	}
 
@@ -307,7 +298,16 @@ func (s *Scheduler) runMaintenance() {
 			detail["deleted_vm_status_cleaned"] = n
 		}
 
-		// 3. 清理虚拟机状态历史记录（每个VM保留最近 N 条）。
+		// 3. 清理旧版调度器写入的「无资源指标」状态记录。
+		// 这类记录会占满状态读取窗口，把 Agent 的真实上报挤出去。
+		if n, err := s.db.CleanupUnreportedVMStatus(); err != nil {
+			s.log.Event("scheduler", "清理状态历史").Err(err).
+				Warn("清理无指标状态记录失败: %v", err)
+		} else if n > 0 {
+			detail["unreported_vm_status_cleaned"] = n
+		}
+
+		// 4. 清理虚拟机状态历史记录（每个VM保留最近 N 条）。
 		// 分批执行：单次全表窗口排名删除会长时间持有写锁，
 		// 与状态上报和业务写入互相阻塞。
 		var totalCleaned int64
@@ -328,7 +328,7 @@ func (s *Scheduler) runMaintenance() {
 		}
 	}
 
-	// 4. 全量重算用户资源配额
+	// 5. 全量重算用户资源配额
 	if s.quotaSvc != nil {
 		if err := s.quotaSvc.RecalculateAll(); err != nil {
 			s.log.Event("scheduler", "配额重算").Err(err).
@@ -336,7 +336,7 @@ func (s *Scheduler) runMaintenance() {
 		}
 	}
 
-	// 5. 主机间自动同步（pull / push / both，按系统设置与间隔自行判断）
+	// 6. 主机间自动同步（pull / push / both，按系统设置与间隔自行判断）
 	if s.syncSvc != nil {
 		if err := s.syncSvc.CheckAndExecute(); err != nil {
 			s.log.Event("scheduler", "主机自动同步").Err(err).
@@ -344,7 +344,7 @@ func (s *Scheduler) runMaintenance() {
 		}
 	}
 
-	// 6. 继续未完成的虚拟机删除（进程在删除中途退出后的断点续做）
+	// 7. 继续未完成的虚拟机删除（进程在删除中途退出后的断点续做）
 	if s.deleteFlow != nil {
 		resumed, failed := s.deleteFlow.SweepIncomplete(20)
 		if resumed > 0 || failed > 0 {
@@ -359,7 +359,7 @@ func (s *Scheduler) runMaintenance() {
 		}
 	}
 
-	// 7. 外部资源补偿（路由器销账、代理重新下发等）
+	// 8. 外部资源补偿（路由器销账、代理重新下发等）
 	if s.reconcileSvc != nil {
 		done, retried := s.reconcileSvc.ProcessOutbox(50)
 		if done > 0 || retried > 0 {
