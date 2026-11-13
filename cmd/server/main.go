@@ -172,6 +172,10 @@ func run(cmd *cobra.Command, args []string) error {
 	sshTerminal.SetHostKeyStore(hostKeyStore)
 	sshTerminal.Start()
 
+	// 注入到 API 层：主机终端接口据此签发票据并拼装 ws 地址
+	app.SSHTerminal = sshTerminal
+	app.SSHPort = cfg.Server.SSHPort
+
 	// 启动定时任务
 	sched := scheduler.NewScheduler(db, func() map[string]driver.HostDriver {
 		drivers := make(map[string]driver.HostDriver)

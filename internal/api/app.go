@@ -120,7 +120,11 @@ type App struct {
 	ReconcileSvc *service.ReconcileService
 	// DeleteWorkflow 带墓碑的幂等删除流程
 	DeleteWorkflow *service.DeleteVMWorkflow
-	Router         *gin.Engine
+	// SSHTerminal 主机终端 WebSocket 服务（由 main 注入，未注入时终端接口不可用）
+	SSHTerminal *SSHTerminalServer
+	// SSHPort 终端服务端口，用于拼装 ws 地址
+	SSHPort int
+	Router  *gin.Engine
 }
 
 // NewApp 创建应用容器并注册所有路由
@@ -349,6 +353,22 @@ func (app *App) registerRoutes() {
 		api.DELETE("/server/images/:hs_name/bind", adminMW, app.handleHostImageUnbind)
 		// 按平台展示的配置项目（虚拟交换机 / 存储池等）
 		api.GET("/server/platform/:hs_name", adminMW, app.handleHostPlatformInfo)
+
+		// 主机运维：终端 / 文件 / 防火墙 / 进程 / 服务
+		api.POST("/server/ops/:hs_name/terminal", adminMW, app.handleHostTerminal)
+		api.GET("/server/ops/:hs_name/processes", adminMW, app.handleHostProcessList)
+		api.POST("/server/ops/:hs_name/processes/kill", adminMW, app.handleHostProcessKill)
+		api.GET("/server/ops/:hs_name/services", adminMW, app.handleHostServiceList)
+		api.POST("/server/ops/:hs_name/services/control", adminMW, app.handleHostServiceControl)
+		api.GET("/server/ops/:hs_name/firewall", adminMW, app.handleHostFirewallList)
+		api.POST("/server/ops/:hs_name/firewall", adminMW, app.handleHostFirewallAdd)
+		api.DELETE("/server/ops/:hs_name/firewall", adminMW, app.handleHostFirewallDelete)
+		api.GET("/server/ops/:hs_name/files", adminMW, app.handleHostFileList)
+		api.POST("/server/ops/:hs_name/files/upload", adminMW, app.handleHostFileUpload)
+		api.GET("/server/ops/:hs_name/files/download", adminMW, app.handleHostFileDownload)
+		api.POST("/server/ops/:hs_name/files/mkdir", adminMW, app.handleHostFileMkdir)
+		api.POST("/server/ops/:hs_name/files/rename", adminMW, app.handleHostFileRename)
+		api.DELETE("/server/ops/:hs_name/files", adminMW, app.handleHostFileDelete)
 
 		// 虚拟机管理
 		api.GET("/client/detail/:hs_name", app.handleVMList)

@@ -397,6 +397,7 @@ func (app *App) handleHostPlatformInfo(c *gin.Context) {
 	payload := gin.H{
 		"host_name":   hsName,
 		"server_type": cfg.ServerType,
+		"host_os":     driver.NewHostOps(cfg).HostOS(),
 		"sections":    []driver.HostPlatformSection{},
 	}
 	if !cfg.EnableHost {
