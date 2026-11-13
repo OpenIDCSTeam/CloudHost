@@ -1924,6 +1924,7 @@ func (app *App) handleVMUpload(c *gin.Context) {
 
 	var req map[string]interface{}
 	if err := c.ShouldBindJSON(&req); err != nil {
+		app.logVMUpload(c, "", "", "请求体解析失败")
 		utils.BadRequest(c, "请求参数错误或请求体过大")
 		return
 	}
@@ -1937,12 +1938,14 @@ func (app *App) handleVMUpload(c *gin.Context) {
 	if hsName == "" || vmUUID == "" {
 		mac := strings.ToLower(strings.TrimSpace(c.Query("nic")))
 		if !looksLikeMAC(mac) {
+			app.logVMUpload(c, "", "", "MAC 参数缺失或格式无效")
 			utils.BadRequest(c, "缺少虚拟机标识（hs_name/vm_uuid 或 nic 参数）")
 			return
 		}
 		var found bool
 		hsName, vmUUID, found = app.findVMByMAC(mac)
 		if !found {
+			app.logVMUpload(c, "", "", "未找到该 MAC 对应的虚拟机")
 			utils.NotFound(c, "未找到该 MAC 对应的虚拟机")
 			return
 		}
@@ -1952,11 +1955,13 @@ func (app *App) handleVMUpload(c *gin.Context) {
 	}
 
 	if !vmUUIDLooksSafe(vmUUID) || !vmUUIDLooksSafe(hsName) {
+		app.logVMUpload(c, hsName, vmUUID, "标识格式无效")
 		utils.BadRequest(c, "标识格式无效")
 		return
 	}
 	// 仅接受已登记虚拟机的上报，拒绝为任意名称创建状态记录
 	if !app.HostSvc.VMExists(hsName, vmUUID) {
+		app.logVMUpload(c, hsName, vmUUID, "虚拟机未登记")
 		utils.NotFound(c, "虚拟机不存在")
 		return
 	}
@@ -1973,9 +1978,11 @@ func (app *App) handleVMUpload(c *gin.Context) {
 	// Python 版在 vm_upload 里同样会补这个字段。
 	req["on_update"] = now
 	if err := app.DB.AddVMStatus(hsName, vmUUID, req, acStatus, now, 0); err != nil {
+		app.logVMUpload(c, hsName, vmUUID, "状态保存失败: "+err.Error())
 		utils.InternalError(c, "状态保存失败")
 		return
 	}
+	app.logVMUpload(c, hsName, vmUUID, "")
 
 	// 上报本身可作为「虚拟机已开机/已关机」的佐证，推进尚未收敛的中间状态
 	app.advanceVMPowerFromUpload(hsName, vmUUID)
@@ -1992,6 +1999,30 @@ func (app *App) handleVMUpload(c *gin.Context) {
 		}
 	}
 	utils.SuccessMsg(c, "状态已上报", payload)
+}
+
+// logVMUpload 记录虚拟机状态上报的链路日志，便于排查「虚拟机在报、系统里看不到」。
+//
+// 该接口被每台虚拟机每分钟调用一次：成功只在 DEBUG 记录（只落文件），
+// 失败用 WARN，避免刷屏但保留证据。
+func (app *App) logVMUpload(c *gin.Context, hsName, vmUUID, reason string) {
+	if app.Logger == nil {
+		return
+	}
+	ev := app.Logger.Event("upload", "虚拟机状态上报").
+		Detail("client_ip", c.ClientIP()).
+		Detail("nic", strings.ToLower(strings.TrimSpace(c.Query("nic"))))
+	if hsName != "" {
+		ev = ev.Host(hsName)
+	}
+	if vmUUID != "" {
+		ev = ev.VM(vmUUID, "")
+	}
+	if reason == "" {
+		ev.Debug("已接收虚拟机状态上报")
+		return
+	}
+	ev.Warn("拒绝虚拟机状态上报：%s", reason)
 }
 
 // looksLikeMAC 校验 MAC 是否形如 aa:bb:cc:dd:ee:ff
