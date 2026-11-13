@@ -330,6 +330,50 @@ func (d *HyperVDriver) hvConnectNics(vmName string, nics map[string]model.NCConf
 	return ""
 }
 
+// hvSyncRealMACs 读取 Hyper-V 为网卡实际分配的 MAC，并按网卡顺序回写配置。
+//
+// Hyper-V 的网卡默认使用动态 MAC（00:15:5D 前缀），与 IP 池按 IP 推导出来的
+// MAC 不一致。创建任务结束前必须把真实 MAC 写回 vm_saving：
+//   - 虚拟机内 CloudInit 用真实 MAC 上报状态，findVMByMAC 才能匹配到本机；
+//   - 上下行限速按 MAC 下发，用错的 MAC 会限速到不存在的网卡上。
+//
+// 读取失败只影响状态展示与限速，不阻断创建，因此不返回错误。
+func (d *HyperVDriver) hvSyncRealMACs(vmName string, nics map[string]model.NCConfig) {
+	if len(nics) == 0 {
+		return
+	}
+	out, err := d.execPS(fmt.Sprintf(
+		"Get-VMNetworkAdapter -VMName '%s' | Select-Object -ExpandProperty MacAddress",
+		psEscape(vmName)))
+	if err != nil {
+		return
+	}
+	macs := strings.Fields(strings.TrimSpace(out))
+	if len(macs) == 0 {
+		return
+	}
+
+	// cfg.NicAll 以 map 存放，遍历顺序随机；排序后与适配器创建顺序一一对应。
+	names := make([]string, 0, len(nics))
+	for name := range nics {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for i, name := range names {
+		if i >= len(macs) {
+			break
+		}
+		mac := normalizeVMac(macs[i])
+		if mac == "" {
+			continue
+		}
+		nic := nics[name]
+		nic.MacAddr = mac
+		nics[name] = nic
+	}
+}
+
 // CreateVM 创建虚拟机
 //
 // 与旧实现的差异：
@@ -391,6 +435,9 @@ func (d *HyperVDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	}
 
 	cfg.VmFlag = model.VMPowerStarted
+	// 回写平台实际分配的 MAC，必须在下发限速与落库之前：Hyper-V 动态网卡的
+	// MAC（00:15:5D 前缀）与 IP 池按 IP 推导出来的 MAC 并不相同。
+	d.hvSyncRealMACs(vmName, cfg.NicAll)
 	d.mu.Lock()
 	d.VmSaving[vmName] = cfg
 	d.mu.Unlock()

@@ -197,7 +197,8 @@ func (d *WorkstationDriver) GetVMList() (map[string]*model.VMConfig, error) {
 		}
 
 		var flag model.VMPowers = model.VMPowerUnknown
-		if s, ok := PowerStatusMap[d.wsGetPower(item.ID)]; ok {
+		// 走 powerOf（含 vmrun 复核），与调度器的 GetPower 保持一致
+		if s, ok := PowerStatusMap[d.powerOf(item.ID, name)]; ok {
 			flag = s
 		}
 
@@ -229,6 +230,14 @@ func (d *WorkstationDriver) wsGetPower(vmID string) string {
 		return "已关机"
 	case "suspended", "paused":
 		return "已暂停"
+	case "poweringon":
+		return "启动中"
+	case "poweringoff":
+		return "关闭中"
+	case "suspending":
+		return "暂停中"
+	case "resetting":
+		return "重启中"
 	default:
 		return "未知"
 	}
@@ -377,7 +386,7 @@ func (d *WorkstationDriver) PowerControl(vmUUID string, action model.VMPowers) (
 			Message: fmt.Sprintf("电源操作失败: HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(body)))}, nil
 	}
 
-	if s, ok := PowerStatusMap[d.wsGetPower(vmID)]; ok {
+	if s, ok := PowerStatusMap[d.powerOf(vmID, vmUUID)]; ok {
 		d.mu.Lock()
 		if cfg, exists := d.VmSaving[vmUUID]; exists {
 			cfg.VmFlag = s
@@ -464,7 +473,65 @@ func (d *WorkstationDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, erro
 	} else {
 		msg += "，已自动开机"
 	}
+
+	// VMware 在首次开机时才会把 generatedAddress 写进 vmx，因此回写必须放在开机之后。
+	d.wsSyncRealMACs(vmxPath, cfg.NicAll)
+
 	return &model.ZMessage{Success: true, Action: "VMCreate", Message: msg}, nil
+}
+
+// wsSyncRealMACs 读取 .vmx 里 VMware 实际生成的 MAC 并回写配置。
+//
+// 与 Hyper-V 同理：VMware 默认使用动态 MAC（00:0C:29 前缀），与 IP 池按 IP
+// 推导出来的 MAC 不一致。不回写的话，虚拟机内 CloudInit 上报状态时
+// findVMByMAC 永远匹配不到，表现为「上报了但系统里看不到状态」。
+//
+// 读取失败只影响状态展示，不阻断创建，因此不返回错误。
+func (d *WorkstationDriver) wsSyncRealMACs(vmxPath string, nics map[string]model.NCConfig) {
+	if len(nics) == 0 || strings.TrimSpace(vmxPath) == "" {
+		return
+	}
+	raw, err := os.ReadFile(vmxPath)
+	if err != nil {
+		return
+	}
+
+	// vmx 里按网卡下标存放：ethernet0.address / ethernet0.generatedAddress
+	real := make(map[string]string, len(nics))
+	for _, line := range strings.Split(string(raw), "\n") {
+		kv := strings.SplitN(strings.TrimSpace(line), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(kv[0]))
+		dot := strings.Index(key, ".")
+		if dot <= 0 {
+			continue
+		}
+		nicName, field := key[:dot], key[dot+1:]
+		mac := normalizeVMac(kv[1])
+		if mac == "" {
+			continue
+		}
+		switch field {
+		case "address":
+			real[nicName] = mac // 显式指定优先
+		case "generatedaddress":
+			if _, exists := real[nicName]; !exists {
+				real[nicName] = mac
+			}
+		}
+	}
+
+	for name := range nics {
+		mac, ok := real[strings.ToLower(name)]
+		if !ok {
+			continue
+		}
+		nic := nics[name]
+		nic.MacAddr = mac
+		nics[name] = nic
+	}
 }
 
 // buildVMX 生成最小可用的 VMX 配置。
@@ -496,6 +563,10 @@ func (d *WorkstationDriver) buildVMX(cfg *model.VMConfig, diskName, isoPath stri
 			"ide1:0.startConnected = \"TRUE\"\n", isoPath)
 	}
 
+	// 系统盘控制器按镜像来源选择（vhd → SATA，vmdk → SCSI）：
+	// Windows 精简镜像只保留制作时使用的存储驱动，选错会 0x7B 蓝屏。
+	controller := diskControllerLines(d.diskBus(cfg, diskName), diskName)
+
 	// UEFI 引导：云镜像（win-10-lite / debian cloud）均按 UEFI 构建，
 	// 传统 BIOS 引导会停在 "no bootable device"。
 	// Secure Boot 关闭：这些自制镜像没有微软签名，开启后会被固件拒绝引导。
@@ -511,19 +582,14 @@ guestOS = "%s"
 firmware = "efi"
 uefi.secureBoot.enabled = "FALSE"
 ulm.disableMitigations = "TRUE"
-scsi0.present = "TRUE"
-scsi0.virtualDev = "lsilogic"
-scsi0:0.present = "TRUE"
-scsi0:0.fileName = "%s"
-scsi0:0.deviceType = "scsi-hardDisk"
-ethernet0.present = "TRUE"
+%sethernet0.present = "TRUE"
 ethernet0.connectionType = "nat"
 ethernet0.virtualDev = "e1000"
 ethernet0.startConnected = "TRUE"
 floppy0.present = "FALSE"
 %sRemoteDisplay.vnc.enabled = "TRUE"
 RemoteDisplay.vnc.port = "%s"
-`, cfg.VmUUID, mem, cpu, guestOS, diskName, cdrom, vncPort)
+`, cfg.VmUUID, mem, cpu, guestOS, controller, cdrom, vncPort)
 }
 
 // guestOS 将系统名映射为 VMware guestOS 标识（与 Python create_vmx 的映射思路一致）
