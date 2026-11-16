@@ -12,6 +12,7 @@ import (
 	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/property"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
 )
@@ -371,6 +372,7 @@ func (d *ESXiDriver) GetStatus() (*model.HWStatus, error) {
 		"summary.hardware",
 		"summary.quickStats",
 		"summary.config",
+		"datastore",
 	}, &hs)
 	if err != nil {
 		return &model.HWStatus{OnUpdate: time.Now().Unix()}, nil
@@ -387,15 +389,118 @@ func (d *ESXiDriver) GetStatus() (*model.HWStatus, error) {
 		}
 	}
 
-	return &model.HWStatus{
+	status := &model.HWStatus{
 		CpuModel: hw.CpuModel,
 		CpuTotal: int(hw.NumCpuCores),
 		CpuUsage: cpuUsagePercent,
 		MemTotal: int(hw.MemorySize / 1024 / 1024),
 		MemUsage: int(qs.OverallMemoryUsage),
+		ExtUsage: map[string][]int{},
+		GpuUsage: map[string]float64{},
 		VmState:  "运行中",
 		OnUpdate: time.Now().Unix(),
-	}, nil
+	}
+
+	// 磁盘容量来自 vSphere 数据存储（datastore summary），
+	// 此前只采集 CPU/内存，前端「系统磁盘 / 数据磁盘」永远是「未配置」。
+	if usage := d.esxiDatastoreUsage(hs.Datastore); len(usage) > 0 {
+		status.DiskUsage = usage
+		if u, ok := usage["system"]; ok {
+			status.HddTotal, status.HddUsage = u[0], u[1]
+		}
+	}
+
+	return status, nil
+}
+
+// esxiDatastoreUsage 采集主机配置的各存储用途对应的数据存储容量（MB）。
+//
+// 用途路径按数据存储名解析（`datastore1`、`[datastore1]`、`[datastore1] images/`
+// 都指向 datastore1）。system 未配置时回退到平台默认数据存储：
+// ESXi 的虚拟机磁盘正是创建在默认数据存储上，不回退会让主机卡片始终显示
+// 「未填写系统存储路径」。
+//
+// hostDatastores 为该主机已挂载的数据存储引用（vCenter 下可能存在其它集群的
+// 数据存储，按主机挂载列表过滤后才不会读到不属于本机的容量）。
+func (d *ESXiDriver) esxiDatastoreUsage(hostDatastores []types.ManagedObjectReference) map[string][]int {
+	ctx, cancel := context.WithTimeout(d.Ctx(""), 10*time.Second)
+	defer cancel()
+
+	refs := hostDatastores
+	if len(refs) == 0 {
+		// 主机属性未返回数据存储列表时退回数据存储查找
+		dss, err := d.finder.DatastoreList(ctx, "*")
+		if err != nil || len(dss) == 0 {
+			return nil
+		}
+		refs = make([]types.ManagedObjectReference, 0, len(dss))
+		for _, ds := range dss {
+			if ds != nil {
+				refs = append(refs, ds.Reference())
+			}
+		}
+	}
+
+	// 一次批量读取全部数据存储的名称与容量，避免每个数据存储一次往返
+	var objs []mo.Datastore
+	if err := property.DefaultCollector(d.client.Client).Retrieve(ctx, refs, []string{"name", "summary"}, &objs); err != nil {
+		return nil
+	}
+
+	byName := make(map[string][]int, len(objs))
+	for _, ds := range objs {
+		capacity, free := ds.Summary.Capacity, ds.Summary.FreeSpace
+		name := strings.TrimSpace(ds.Name)
+		if capacity <= 0 || name == "" {
+			continue
+		}
+		used := capacity - free
+		if used < 0 {
+			used = 0
+		}
+		byName[name] = []int{
+			int(capacity / 1024 / 1024),
+			int(used / 1024 / 1024),
+		}
+	}
+	if len(byName) == 0 {
+		return nil
+	}
+
+	usage := esxiMapDatastoreUsage(esxiRoleDatastores(d.Config), byName)
+	if _, ok := usage["system"]; !ok {
+		if def, err := d.finder.DefaultDatastore(ctx); err == nil && def != nil {
+			if u, ok := byName[strings.TrimSpace(def.Name())]; ok {
+				usage["system"] = u
+			}
+		}
+	}
+	if len(usage) == 0 {
+		return nil
+	}
+	return usage
+}
+
+// esxiRoleDatastores 把主机配置里的存储用途解析成数据存储名。
+func esxiRoleDatastores(cfg *model.HSConfig) map[string]string {
+	roles := make(map[string]string, len(hostDiskRoles))
+	for role, p := range hostDiskPaths(cfg) {
+		if name := esxiDatastoreName(p); name != "" {
+			roles[role] = name
+		}
+	}
+	return roles
+}
+
+// esxiMapDatastoreUsage 将「数据存储名 → [总量MB, 已用MB]」映射到各存储用途。
+func esxiMapDatastoreUsage(roles map[string]string, byName map[string][]int) map[string][]int {
+	usage := make(map[string][]int, len(roles))
+	for role, name := range roles {
+		if u, ok := byName[name]; ok {
+			usage[role] = u
+		}
+	}
+	return usage
 }
 
 // GetVMList 获取虚拟机列表

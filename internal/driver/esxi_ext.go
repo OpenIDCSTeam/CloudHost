@@ -65,6 +65,24 @@ func esxiSplitDatastore(v string) (ds, sub string, ok bool) {
 	return ds, sub, true
 }
 
+// esxiDatastoreName 从主机配置的存储路径中解析数据存储名。
+//
+// 表单允许 `datastore1`、`[datastore1]`、`[datastore1] images/` 三种写法，
+// 也兼容 ESXi Shell 下的绝对路径 `/vmfs/volumes/datastore1/...`。
+// 无法解析时返回空字符串，由调用方跳过该用途。
+func esxiDatastoreName(p string) string {
+	ds, _, _ := esxiSplitDatastore(p)
+	ds = strings.TrimSpace(ds)
+	if strings.HasPrefix(ds, "/vmfs/volumes/") {
+		rest := strings.Trim(strings.TrimPrefix(ds, "/vmfs/volumes/"), "/")
+		if rest == "" {
+			return ""
+		}
+		return strings.SplitN(rest, "/", 2)[0]
+	}
+	return ds
+}
+
 // esxiDatastorePath 把「存储目录配置」与「文件名」拼成 `[ds] dir/name`。
 //
 // 主机表单里的存储路径按目录语义填写，支持三种写法：
