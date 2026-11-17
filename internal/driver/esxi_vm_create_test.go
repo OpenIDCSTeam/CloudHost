@@ -12,7 +12,7 @@ import (
 // vSphere「编辑设置」里只剩 CPU/内存/显卡，客户根本装不了系统。
 func TestESXiSystemDiskDevices(t *testing.T) {
 	dsRef := types.ManagedObjectReference{Type: "Datastore", Value: "datastore-1"}
-	devices, err := esxiSystemDiskDevices(dsRef, "[datastore1] vm-1/vm-1.vmdk", 40960)
+	devices, err := esxiCreateDevices(dsRef, "[datastore1] vm-1/vm-1.vmdk", 40960)
 	if err != nil {
 		t.Fatalf("构建系统盘设备失败: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestESXiSystemDiskDevices(t *testing.T) {
 // TestESXiSystemDiskDefaultSize 未配置磁盘大小时按 8GB 创建，避免 0 容量盘。
 func TestESXiSystemDiskDefaultSize(t *testing.T) {
 	dsRef := types.ManagedObjectReference{Type: "Datastore", Value: "datastore-1"}
-	devices, err := esxiSystemDiskDevices(dsRef, "[datastore1] vm-1/vm-1.vmdk", 0)
+	devices, err := esxiCreateDevices(dsRef, "[datastore1] vm-1/vm-1.vmdk", 0)
 	if err != nil {
 		t.Fatalf("构建系统盘设备失败: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestESXiSystemDiskDefaultSize(t *testing.T) {
 // 否则 vSphere 只登记设备而不落 VMDK。
 func TestESXiSystemDiskConfigSpec(t *testing.T) {
 	dsRef := types.ManagedObjectReference{Type: "Datastore", Value: "datastore-1"}
-	devices, err := esxiSystemDiskDevices(dsRef, "[datastore1] vm-1/vm-1.vmdk", 10240)
+	devices, err := esxiCreateDevices(dsRef, "[datastore1] vm-1/vm-1.vmdk", 10240)
 	if err != nil {
 		t.Fatalf("构建系统盘设备失败: %v", err)
 	}
@@ -102,5 +102,50 @@ func TestESXiSystemDiskConfigSpec(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("创建规范里没有系统盘")
+	}
+}
+
+// TestESXiCreateDevicesHardware 创建时必须带 IDE 控制器、空光驱与虚拟声卡。
+//
+// vSphere 的 CD/DVD 驱动器只能挂在 IDE/SATA 控制器上，声卡则是独立 PCI 设备；
+// 三者缺任何一个，客户机里都会少一项硬件。
+func TestESXiCreateDevicesHardware(t *testing.T) {
+	dsRef := types.ManagedObjectReference{Type: "Datastore", Value: "datastore-1"}
+	devices, err := esxiCreateDevices(dsRef, "[datastore1] vm-1/vm-1.vmdk", 8192)
+	if err != nil {
+		t.Fatalf("构建虚拟硬件失败: %v", err)
+	}
+
+	var ide *types.VirtualIDEController
+	var cdrom *types.VirtualCdrom
+	var sound *types.VirtualHdAudioCard
+	for _, dev := range devices {
+		switch d := dev.(type) {
+		case *types.VirtualIDEController:
+			ide = d
+		case *types.VirtualCdrom:
+			cdrom = d
+		case *types.VirtualHdAudioCard:
+			sound = d
+		}
+	}
+
+	if ide == nil {
+		t.Fatal("缺少 IDE 控制器：光驱没有可挂载的控制器")
+	}
+	if cdrom == nil {
+		t.Fatal("缺少虚拟光驱：无法挂载 ISO")
+	}
+	if cdrom.ControllerKey != ide.Key {
+		t.Fatalf("光驱未挂到 IDE 控制器: ControllerKey=%d, want %d", cdrom.ControllerKey, ide.Key)
+	}
+	if _, ok := cdrom.Backing.(*types.VirtualCdromAtapiBackingInfo); !ok {
+		t.Fatalf("光驱 backing 类型异常: %T", cdrom.Backing)
+	}
+	if sound == nil {
+		t.Fatal("缺少虚拟声卡")
+	}
+	if sound.Key >= 0 {
+		t.Fatalf("声卡设备 key 必须为负数（由 vSphere 分配），实际 %d", sound.Key)
 	}
 }

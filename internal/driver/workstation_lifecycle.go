@@ -555,7 +555,12 @@ func (d *WorkstationDriver) buildVMX(cfg *model.VMConfig, diskName, isoPath stri
 		diskName = cfg.VmUUID + ".vmdk"
 	}
 
-	cdrom := ""
+	// 光驱：VMX 里常驻一个 CD/DVD 驱动器。有安装 ISO 时直接挂盘，
+	// 否则挂一个空托盘（cdrom-raw + 自动探测），换盘不必再改虚拟硬件。
+	cdrom := "ide1:0.present = \"TRUE\"\n" +
+		"ide1:0.deviceType = \"cdrom-raw\"\n" +
+		"ide1:0.autodetect = \"TRUE\"\n" +
+		"ide1:0.startConnected = \"FALSE\"\n"
 	if isoPath != "" {
 		cdrom = fmt.Sprintf("ide1:0.present = \"TRUE\"\n"+
 			"ide1:0.deviceType = \"cdrom-image\"\n"+
@@ -582,6 +587,10 @@ guestOS = "%s"
 firmware = "efi"
 uefi.secureBoot.enabled = "FALSE"
 ulm.disableMitigations = "TRUE"
+sound.present = "TRUE"
+sound.virtualDev = "hdaudio"
+sound.autodetect = "TRUE"
+sound.startConnected = "TRUE"
 %sethernet0.present = "TRUE"
 ethernet0.connectionType = "nat"
 ethernet0.virtualDev = "e1000"

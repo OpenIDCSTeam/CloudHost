@@ -139,10 +139,10 @@ func (d *ESXiDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 
 	// 构建虚拟机配置规范
 	//
-	// 只下发 CPU/内存会得到一台没有任何磁盘控制器的空虚拟机，
+	// 只下发 CPU/内存会得到一台没有磁盘控制器、没有光驱、没有声卡的空虚拟机，
 	// vSphere 里表现为「创建成功但虚拟硬件里没有硬盘」。
-	// 这里在创建规范里一并带上 SCSI 控制器与系统盘（与 ReinstallVM 的目录/文件名一致）。
-	diskDevices, err := esxiSystemDiskDevices(
+	// 这里在创建规范里一并带上基础设备（与 ReinstallVM 的目录/文件名一致）。
+	diskDevices, err := esxiCreateDevices(
 		ds.Reference(),
 		fmt.Sprintf("[%s] %s/%s.vmdk", ds.Name(), cfg.VmUUID, cfg.VmUUID),
 		cfg.HddNum,
@@ -151,7 +151,7 @@ func (d *ESXiDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 		return &model.ZMessage{
 			Success: false,
 			Action:  "VMCreate",
-			Message: fmt.Sprintf("构建系统盘失败: %v", err),
+			Message: fmt.Sprintf("构建虚拟硬件失败: %v", err),
 		}, nil
 	}
 	deviceChange, err := diskDevices.ConfigSpec(types.VirtualDeviceConfigSpecOperationAdd)
@@ -159,7 +159,7 @@ func (d *ESXiDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 		return &model.ZMessage{
 			Success: false,
 			Action:  "VMCreate",
-			Message: fmt.Sprintf("构建系统盘失败: %v", err),
+			Message: fmt.Sprintf("构建虚拟硬件失败: %v", err),
 		}, nil
 	}
 
@@ -235,11 +235,14 @@ func (d *ESXiDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	}, nil
 }
 
-// esxiSystemDiskDevices 生成创建虚拟机所需的 SCSI 控制器与系统盘。
+// esxiCreateDevices 生成创建虚拟机所需的基础虚拟硬件：
+// SCSI 控制器 + 系统盘 + IDE 控制器 + 空光驱 + 高清声卡。
 //
 // lsilogic 控制器在 Linux / Windows 安装镜像里都有内置驱动，兼容性最好；
 // 系统盘按 HddNum（MB）分配容量，未配置时与 ReinstallVM 一致按 8GB 处理。
-func esxiSystemDiskDevices(dsRef types.ManagedObjectReference, diskPath string, sizeMB int) (object.VirtualDeviceList, error) {
+// 光驱必须挂在 IDE 控制器上：vSphere 不允许 CD/DVD 驱动器直接挂在 SCSI 控制器，
+// 预置空光驱后挂载 ISO 只需换介质，不必再给虚拟机加设备。
+func esxiCreateDevices(dsRef types.ManagedObjectReference, diskPath string, sizeMB int) (object.VirtualDeviceList, error) {
 	devices := object.VirtualDeviceList{}
 
 	scsi, err := devices.CreateSCSIController("lsilogic")
@@ -258,8 +261,35 @@ func esxiSystemDiskDevices(dsRef types.ManagedObjectReference, diskPath string, 
 	}
 	disk := devices.CreateDisk(controller, dsRef, diskPath)
 	disk.CapacityInKB = int64(sizeMB) * 1024
+	devices = append(devices, disk)
 
-	return append(devices, disk), nil
+	ide, err := devices.CreateIDEController()
+	if err != nil {
+		return nil, err
+	}
+	devices = append(devices, ide)
+	ideController, ok := ide.(types.BaseVirtualController)
+	if !ok {
+		return nil, fmt.Errorf("IDE 控制器类型无效: %T", ide)
+	}
+	cdrom, err := devices.CreateCdrom(ideController)
+	if err != nil {
+		return nil, err
+	}
+	devices = append(devices, cdrom)
+
+	// 声卡：HD Audio，Windows 7+ 与主流 Linux 均自带驱动
+	sound := &types.VirtualHdAudioCard{
+		VirtualSoundCard: types.VirtualSoundCard{
+			VirtualDevice: types.VirtualDevice{
+				Key:     devices.NewKey(),
+				Backing: &types.VirtualSoundCardDeviceBackingInfo{},
+			},
+		},
+	}
+	devices = append(devices, sound)
+
+	return devices, nil
 }
 
 // DeleteVM 删除虚拟机

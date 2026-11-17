@@ -407,6 +407,8 @@ func (d *HyperVDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 			"Set-VMKeyProtector -VMName '%s' -NewLocalKeyProtector -ErrorAction Stop; "+
 			"Enable-VMTPM -VMName '%s' -ErrorAction Stop; "+
 			"Add-VMHardDiskDrive -VMName '%s' -Path '%s' -ErrorAction Stop; "+
+			// 预置空光驱：挂载 ISO 时只换介质，不必现场添加设备
+			"Add-VMDvdDrive -VMName '%s' -ErrorAction SilentlyContinue; "+
 			"Set-VMProcessor -VMName '%s' -Count %d -ErrorAction Stop; "+
 			"$disk = Get-VMHardDiskDrive -VMName '%s' | Select-Object -First 1; "+
 			"Set-VMFirmware -VMName '%s' -FirstBootDevice $disk -ErrorAction SilentlyContinue",
@@ -417,6 +419,7 @@ func (d *HyperVDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 		psEscape(vmName),
 		psEscape(vmName),
 		psEscape(vmName), psEscape(diskPath),
+		psEscape(vmName),
 		psEscape(vmName), cpu,
 		psEscape(vmName),
 		psEscape(vmName))
@@ -634,8 +637,13 @@ func (d *HyperVDriver) MountISO(vmUUID string, iso *model.IMConfig, mount bool) 
 			}
 			path = filepath.Join(dir, iso.IsoFile)
 		}
-		script := fmt.Sprintf("Add-VMDvdDrive -VMName '%s' -Path '%s' -ErrorAction Stop",
-			psEscape(vmUUID), psEscape(path))
+		// 创建时已预置空光驱：优先给已有光驱换盘，旧虚拟机没有光驱时再新建
+		script := fmt.Sprintf(
+			"$dvd = Get-VMDvdDrive -VMName '%s' | Select-Object -First 1; "+
+				"if ($dvd) { Set-VMDvdDrive -VMName '%s' -ControllerNumber $dvd.ControllerNumber "+
+				"-ControllerLocation $dvd.ControllerLocation -Path '%s' -ErrorAction Stop } "+
+				"else { Add-VMDvdDrive -VMName '%s' -Path '%s' -ErrorAction Stop }",
+			psEscape(vmUUID), psEscape(vmUUID), psEscape(path), psEscape(vmUUID), psEscape(path))
 		if out, err := d.execPS(script); err != nil {
 			return &model.ZMessage{Success: false, Action: "ISOMount",
 				Message: fmt.Sprintf("挂载ISO失败: %v (%s)", err, strings.TrimSpace(out))}, nil
@@ -648,8 +656,13 @@ func (d *HyperVDriver) MountISO(vmUUID string, iso *model.IMConfig, mount bool) 
 		return &model.ZMessage{Success: true, Action: "ISOMount", Message: "ISO挂载成功"}, nil
 	}
 
+	// 卸载：移除盘片后立刻补回空光驱，保持虚拟硬件里始终有 CD/DVD 驱动器
 	script := fmt.Sprintf(
-		"Get-VMDvdDrive -VMName '%s' | Remove-VMDvdDrive -ErrorAction SilentlyContinue", psEscape(vmUUID))
+		"$dvd = Get-VMDvdDrive -VMName '%s' | Select-Object -First 1; "+
+			"if ($dvd) { Remove-VMDvdDrive -VMName '%s' -ControllerNumber $dvd.ControllerNumber "+
+			"-ControllerLocation $dvd.ControllerLocation -ErrorAction SilentlyContinue; "+
+			"Add-VMDvdDrive -VMName '%s' -ErrorAction SilentlyContinue }",
+		psEscape(vmUUID), psEscape(vmUUID), psEscape(vmUUID))
 	_, _ = d.execPS(script)
 	d.mu.Lock()
 	if cfg, ok := d.VmSaving[vmUUID]; ok {
