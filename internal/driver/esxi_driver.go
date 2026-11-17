@@ -289,6 +289,17 @@ func esxiCreateDevices(dsRef types.ManagedObjectReference, diskPath string, size
 	}
 	devices = append(devices, sound)
 
+	// USB 控制器：USB 直通下发的 VirtualUSB 设备必须有控制器承载，
+	// 否则 Reconfigure 会被 vSphere 拒绝。选 XHCI（USB 3.x，向下兼容 USB 2.0），
+	// 并开启热插拔，保证直通设备可以在运行中增删。
+	usb := &types.VirtualUSBXHCIController{
+		VirtualController: types.VirtualController{
+			VirtualDevice: types.VirtualDevice{Key: devices.NewKey()},
+		},
+		AutoConnectDevices: types.NewBool(true),
+	}
+	devices = append(devices, usb)
+
 	return devices, nil
 }
 

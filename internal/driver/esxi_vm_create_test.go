@@ -105,10 +105,10 @@ func TestESXiSystemDiskConfigSpec(t *testing.T) {
 	}
 }
 
-// TestESXiCreateDevicesHardware 创建时必须带 IDE 控制器、空光驱与虚拟声卡。
+// TestESXiCreateDevicesHardware 创建时必须带 IDE 控制器、空光驱、虚拟声卡与 USB 控制器。
 //
-// vSphere 的 CD/DVD 驱动器只能挂在 IDE/SATA 控制器上，声卡则是独立 PCI 设备；
-// 三者缺任何一个，客户机里都会少一项硬件。
+// vSphere 的 CD/DVD 驱动器只能挂在 IDE/SATA 控制器上，声卡是独立 PCI 设备，
+// USB 直通设备（VirtualUSB）必须有 USB 控制器承载；缺任何一个都会少一项硬件。
 func TestESXiCreateDevicesHardware(t *testing.T) {
 	dsRef := types.ManagedObjectReference{Type: "Datastore", Value: "datastore-1"}
 	devices, err := esxiCreateDevices(dsRef, "[datastore1] vm-1/vm-1.vmdk", 8192)
@@ -119,6 +119,7 @@ func TestESXiCreateDevicesHardware(t *testing.T) {
 	var ide *types.VirtualIDEController
 	var cdrom *types.VirtualCdrom
 	var sound *types.VirtualHdAudioCard
+	var usb *types.VirtualUSBXHCIController
 	for _, dev := range devices {
 		switch d := dev.(type) {
 		case *types.VirtualIDEController:
@@ -127,6 +128,8 @@ func TestESXiCreateDevicesHardware(t *testing.T) {
 			cdrom = d
 		case *types.VirtualHdAudioCard:
 			sound = d
+		case *types.VirtualUSBXHCIController:
+			usb = d
 		}
 	}
 
@@ -147,5 +150,14 @@ func TestESXiCreateDevicesHardware(t *testing.T) {
 	}
 	if sound.Key >= 0 {
 		t.Fatalf("声卡设备 key 必须为负数（由 vSphere 分配），实际 %d", sound.Key)
+	}
+	if usb == nil {
+		t.Fatal("缺少 USB 控制器：USB 直通设备无法挂载")
+	}
+	if usb.Key >= 0 {
+		t.Fatalf("USB 控制器 key 必须为负数（由 vSphere 分配），实际 %d", usb.Key)
+	}
+	if usb.AutoConnectDevices == nil || !*usb.AutoConnectDevices {
+		t.Fatal("USB 控制器未开启热插拔（AutoConnectDevices）")
 	}
 }
