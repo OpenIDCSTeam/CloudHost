@@ -519,8 +519,24 @@ func (d *ESXiDriver) ReinstallVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	}
 	controller, err := devices.FindDiskController("")
 	if err != nil {
-		return &model.ZMessage{Success: false, Action: "VMReinstall",
-			Message: "未找到磁盘控制器: " + err.Error()}, nil
+		// 历史版本创建的 ESXi 虚拟机没有任何磁盘控制器（CreateVM 当时只下发了
+		// CPU/内存）。这里补建 lsilogic 控制器，让这些虚拟机可以通过重装系统拿到硬盘。
+		scsi, cerr := devices.CreateSCSIController("lsilogic")
+		if cerr != nil {
+			return &model.ZMessage{Success: false, Action: "VMReinstall",
+				Message: "创建磁盘控制器失败: " + cerr.Error()}, nil
+		}
+		if aerr := vm.AddDevice(d.Ctx(""), scsi); aerr != nil {
+			return &model.ZMessage{Success: false, Action: "VMReinstall",
+				Message: "添加磁盘控制器失败: " + aerr.Error()}, nil
+		}
+		if devices, err = vm.Device(d.Ctx("")); err != nil {
+			return &model.ZMessage{Success: false, Action: "VMReinstall", Message: err.Error()}, nil
+		}
+		if controller, err = devices.FindDiskController(""); err != nil {
+			return &model.ZMessage{Success: false, Action: "VMReinstall",
+				Message: "未找到磁盘控制器: " + err.Error()}, nil
+		}
 	}
 	sizeMB := cfg.HddNum
 	if sizeMB <= 0 {

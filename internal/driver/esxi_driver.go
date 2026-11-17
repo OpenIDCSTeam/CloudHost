@@ -138,11 +138,37 @@ func (d *ESXiDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	}
 
 	// 构建虚拟机配置规范
+	//
+	// 只下发 CPU/内存会得到一台没有任何磁盘控制器的空虚拟机，
+	// vSphere 里表现为「创建成功但虚拟硬件里没有硬盘」。
+	// 这里在创建规范里一并带上 SCSI 控制器与系统盘（与 ReinstallVM 的目录/文件名一致）。
+	diskDevices, err := esxiSystemDiskDevices(
+		ds.Reference(),
+		fmt.Sprintf("[%s] %s/%s.vmdk", ds.Name(), cfg.VmUUID, cfg.VmUUID),
+		cfg.HddNum,
+	)
+	if err != nil {
+		return &model.ZMessage{
+			Success: false,
+			Action:  "VMCreate",
+			Message: fmt.Sprintf("构建系统盘失败: %v", err),
+		}, nil
+	}
+	deviceChange, err := diskDevices.ConfigSpec(types.VirtualDeviceConfigSpecOperationAdd)
+	if err != nil {
+		return &model.ZMessage{
+			Success: false,
+			Action:  "VMCreate",
+			Message: fmt.Sprintf("构建系统盘失败: %v", err),
+		}, nil
+	}
+
 	spec := types.VirtualMachineConfigSpec{
-		Name:     cfg.VmUUID,
-		GuestId:  "otherLinux64Guest",
-		NumCPUs:  int32(cfg.CpuNum),
-		MemoryMB: int64(cfg.MemNum),
+		Name:         cfg.VmUUID,
+		GuestId:      "otherLinux64Guest",
+		NumCPUs:      int32(cfg.CpuNum),
+		MemoryMB:     int64(cfg.MemNum),
+		DeviceChange: deviceChange,
 		Files: &types.VirtualMachineFileInfo{
 			VmPathName: fmt.Sprintf("[%s]", ds.Name()),
 		},
@@ -207,6 +233,33 @@ func (d *ESXiDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 			"vm_ref":  vmRef.Value,
 		},
 	}, nil
+}
+
+// esxiSystemDiskDevices 生成创建虚拟机所需的 SCSI 控制器与系统盘。
+//
+// lsilogic 控制器在 Linux / Windows 安装镜像里都有内置驱动，兼容性最好；
+// 系统盘按 HddNum（MB）分配容量，未配置时与 ReinstallVM 一致按 8GB 处理。
+func esxiSystemDiskDevices(dsRef types.ManagedObjectReference, diskPath string, sizeMB int) (object.VirtualDeviceList, error) {
+	devices := object.VirtualDeviceList{}
+
+	scsi, err := devices.CreateSCSIController("lsilogic")
+	if err != nil {
+		return nil, err
+	}
+	devices = append(devices, scsi)
+
+	controller, err := devices.FindDiskController("")
+	if err != nil {
+		return nil, err
+	}
+
+	if sizeMB <= 0 {
+		sizeMB = 8192
+	}
+	disk := devices.CreateDisk(controller, dsRef, diskPath)
+	disk.CapacityInKB = int64(sizeMB) * 1024
+
+	return append(devices, disk), nil
 }
 
 // DeleteVM 删除虚拟机
