@@ -73,6 +73,27 @@ func TestMemuOutputError(t *testing.T) {
 	}
 }
 
+func TestMemuArrowCursor(t *testing.T) {
+	w, h, hotX, hotY, pixels, mask := memuArrowCursor()
+	if w != 24 || h != 24 || hotX != 0 || hotY != 0 {
+		t.Fatalf("光标尺寸/热点 = %dx%d (%d,%d)", w, h, hotX, hotY)
+	}
+	if len(pixels) != w*h*4 {
+		t.Fatalf("像素长度 = %d, want %d", len(pixels), w*h*4)
+	}
+	if len(mask) != ((w+7)/8)*h {
+		t.Fatalf("掩码长度 = %d, want %d", len(mask), ((w+7)/8)*h)
+	}
+	// 热点（箭头尖端）必须可见
+	if mask[0]&0x80 == 0 {
+		t.Error("箭头尖端未设置可见掩码")
+	}
+	// 右下角远离箭头，必须透明
+	if mask[(h-1)*((w+7)/8)+(w-1)/8]&(0x80>>uint((w-1)%8)) != 0 {
+		t.Error("右下角不应可见")
+	}
+}
+
 func TestMemuIsRunningText(t *testing.T) {
 	cases := map[string]bool{
 		"Running\r\n":     true,

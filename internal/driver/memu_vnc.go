@@ -374,6 +374,8 @@ type memuVNCConn struct {
 	zrle        bool
 	hextile     bool
 	desktopSize bool
+	cursor      bool
+	cursorSent  bool
 
 	lastW, lastH int
 
@@ -513,6 +515,17 @@ func (cc *memuVNCConn) readLoop() {
 					cc.zrle = true
 				case -223: // DesktopSize
 					cc.desktopSize = true
+				case -239: // Cursor
+					cc.cursor = true
+				}
+			}
+			// 客户端声明支持光标伪编码后立即下发一次箭头光标。
+			// 不发送光标时 noVNC 会一直使用 RFB.cursors.none，
+			// 表现就是「控制台里看不到鼠标」。
+			if cc.cursor && !cc.cursorSent {
+				cc.cursorSent = true
+				if err := cc.sendCursor(); err != nil {
+					return
 				}
 			}
 		case 3: // FramebufferUpdateRequest
@@ -574,6 +587,100 @@ func (cc *memuVNCConn) readLoop() {
 			return
 		}
 	}
+}
+
+// sendCursor 下发光标形状（Cursor 伪编码 -239）。
+func (cc *memuVNCConn) sendCursor() error {
+	if cc.pf.bpp != 32 {
+		return nil
+	}
+	w, h, hotX, hotY, pixels, mask := memuArrowCursor()
+
+	var buf bytes.Buffer
+	buf.Grow(len(pixels) + len(mask) + 16)
+	buf.Write([]byte{0, 0, 0, 1})
+	buf.Write(rectHeader(hotX, hotY, w, h, -239))
+	buf.Write(pixels)
+	buf.Write(mask)
+
+	_ = cc.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	_, err := cc.conn.Write(buf.Bytes())
+	_ = cc.conn.SetWriteDeadline(time.Time{})
+	return err
+}
+
+// memuArrowCursor 生成 24x24 经典箭头光标（BGRX 像素 + 位掩码）。
+//
+// 返回的 hotX/hotY 是热点，放在箭头左上角。
+func memuArrowCursor() (w, h, hotX, hotY int, pixels, mask []byte) {
+	const size = 24
+	// 经典鼠标箭头轮廓（左上为热点）
+	poly := [][2]float64{
+		{0.5, 0.5}, {0.5, 17.5}, {5.0, 13.0}, {8.0, 20.5},
+		{11.0, 19.0}, {8.0, 12.0}, {15.5, 12.0},
+	}
+
+	fill := make([][]bool, size)
+	for y := 0; y < size; y++ {
+		fill[y] = make([]bool, size)
+		for x := 0; x < size; x++ {
+			fill[y][x] = pointInPolygon(float64(x)+0.5, float64(y)+0.5, poly)
+		}
+	}
+
+	pixels = make([]byte, size*size*4)
+	mask = make([]byte, ((size+7)/8)*size)
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			var r, g, b uint8
+			visible := false
+			switch {
+			case fill[y][x]:
+				r, g, b, visible = 255, 255, 255, true
+			case hasFilledNeighbor(fill, x, y):
+				r, g, b, visible = 0, 0, 0, true
+			}
+			if !visible {
+				continue
+			}
+			i := (y*size + x) * 4
+			// little-endian 32bpp：B,G,R,0
+			pixels[i], pixels[i+1], pixels[i+2], pixels[i+3] = b, g, r, 0
+			mask[y*((size+7)/8)+x/8] |= 0x80 >> uint(x%8)
+		}
+	}
+	return size, size, 0, 0, pixels, mask
+}
+
+// pointInPolygon 射线法判断点是否在多边形内部
+func pointInPolygon(px, py float64, poly [][2]float64) bool {
+	inside := false
+	j := len(poly) - 1
+	for i := 0; i < len(poly); i++ {
+		xi, yi := poly[i][0], poly[i][1]
+		xj, yj := poly[j][0], poly[j][1]
+		if (yi > py) != (yj > py) && px < (xj-xi)*(py-yi)/(yj-yi)+xi {
+			inside = !inside
+		}
+		j = i
+	}
+	return inside
+}
+
+// hasFilledNeighbor 判断像素周围 8 邻域是否有填充像素（用于描边）
+func hasFilledNeighbor(fill [][]bool, x, y int) bool {
+	for dy := -1; dy <= 1; dy++ {
+		for dx := -1; dx <= 1; dx++ {
+			nx, ny := x+dx, y+dy
+			if nx < 0 || ny < 0 || ny >= len(fill) || nx >= len(fill[ny]) {
+				continue
+			}
+			if fill[ny][nx] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // sendFramebufferUpdate 抓取一帧并推送（Raw 或 ZRLE）
