@@ -629,7 +629,7 @@ func (d *MemuDriver) startAndWait(index string, timeout time.Duration) (string, 
 	if err != nil {
 		valid, _ := d.runMemuc("isvmrunning", "-i", index)
 		if !memuIsRunningText(valid) {
-			return out, err
+			return out, wrapMemuStartError(err)
 		}
 	}
 	if d.waitMemuRunning(index, 8*time.Second) {
@@ -645,9 +645,23 @@ func (d *MemuDriver) startAndWait(index string, timeout time.Duration) (string, 
 		return retryOut, nil
 	}
 	if retryErr != nil {
-		return retryOut, retryErr
+		return retryOut, wrapMemuStartError(retryErr)
 	}
 	return retryOut, fmt.Errorf("%s", d.startFailureDetail(index, retryOut))
+}
+
+// wrapMemuStartError 为 exit status 5 补充可操作的排查提示。
+//
+// MEmu 需要创建窗口，Windows 服务（Session 0）或受限沙箱里运行 HostAgent 时，
+// memuc start 会直接以退出码 5 失败且不输出任何内容。
+func wrapMemuStartError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(err.Error(), "exit status 5") {
+		return fmt.Errorf("%w（exit 5：MEmu 需要登录用户的交互式桌面会话，请勿以 Windows 服务方式运行 HostAgent）", err)
+	}
+	return err
 }
 
 // startVM 启动实例，并在 Hyper-V 权限异常时自动修复后重试。
