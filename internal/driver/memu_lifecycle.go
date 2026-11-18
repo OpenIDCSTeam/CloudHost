@@ -830,12 +830,21 @@ func (d *MemuDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 		_, _ = d.runMemuc("setconfigex", "-i", newIndex, "memory", strconv.Itoa(cfg.MemNum))
 	}
 	// 主机级扩展参数（与 Python 从主机 extend_data 读取一致）
+	renderSet := false
 	if d.Config != nil && d.Config.ExtendData != nil {
 		for _, k := range []string{"graphics_render_mode", "enable_su", "enable_audio", "fps"} {
 			if v, ok := d.Config.ExtendData[k]; ok && v != nil && fmt.Sprintf("%v", v) != "" {
 				_, _ = d.runMemuc("setconfigex", "-i", newIndex, k, fmt.Sprintf("%v", v))
+				if k == "graphics_render_mode" {
+					renderSet = true
+				}
 			}
 		}
+	}
+	// 默认 DirectX 渲染（1）：部分 NVIDIA 驱动下 OpenGL（0）会让
+	// adb screencap 返回整屏白色，截图与 VNC 控制台都只剩白屏。
+	if !renderSet {
+		_, _ = d.runMemuc("setconfigex", "-i", newIndex, "graphics_render_mode", "1")
 	}
 	// 重命名为安卓版本名（与 Python 版 rename(title) 一致）
 	if _, err := d.runMemuc("rename", "-i", newIndex, label); err != nil {

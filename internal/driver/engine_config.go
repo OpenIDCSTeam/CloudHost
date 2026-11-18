@@ -194,6 +194,7 @@ var engineConfigs = []EngineMeta{
 			"3、不支持暂停/恢复操作",
 			"4、内置VNC控制台（ADB抓帧+触摸注入），同时保留ADB调试端口",
 			"5、Hyper-V模式下需管理员权限，可在主机运维页执行「修复运行环境」",
+			"6、新实例默认使用DirectX渲染；OpenGL模式下部分显卡截图/VNC会白屏，可修改graphics_render_mode切换",
 		},
 		BanInit: []string{"gpu_num", "gpu_mem", "hdd_num", "speed_u", "speed_d"},
 		BanEdit: []string{"gpu_num", "gpu_mem", "hdd_num", "speed_u", "speed_d"},
