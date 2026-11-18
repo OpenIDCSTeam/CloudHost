@@ -96,7 +96,7 @@ type HostOps interface {
 // 其余平台（PVE、QEMU、ESXi、容器）按 Linux shell 处理，远程时走 SSH。
 func NewHostOps(cfg *model.HSConfig) HostOps {
 	if cfg != nil {
-		if hostOSFor(cfg.ServerType) == "windows" {
+		if hostOSFor(cfg.ServerType) == "windows" && isWindowsRuntime() {
 			return &windowsHostOps{cfg: cfg}
 		}
 		// ESXi 的 server_port 是 vSphere API 的 443，SSH 需走 22，且系统命令用 esxcli

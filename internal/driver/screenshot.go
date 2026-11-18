@@ -166,17 +166,29 @@ func ppmBytesToBase64PNG(raw []byte) (string, error) {
 
 // captureQEMUScreenshot 通过 virsh screenshot 截图并转换为 PNG data URL
 func (d *QEMUDriver) captureQEMUScreenshot(vmUUID string) (string, error) {
-	tmp := filepath.Join(os.TempDir(),
-		fmt.Sprintf("hostagent-screen-%s-%d.ppm", vmUUID, time.Now().UnixNano()))
-	defer os.Remove(tmp)
+	tmp := fmt.Sprintf("/tmp/hostagent-screen-%s-%d.ppm", vmUUID, time.Now().UnixNano())
+	defer func() { _, _ = d.execHostArgs([]string{"rm", "-f", tmp}, 10*time.Second) }()
 
 	if out, err := d.execVirsh("screenshot", vmUUID, tmp, "--screen", "0"); err != nil {
 		return "", fmt.Errorf("virsh screenshot 失败: %v (%s)", err, strings.TrimSpace(out))
 	}
-	if _, err := os.Stat(tmp); err != nil {
+	if !d.hostFileExists(tmp) {
 		return "", fmt.Errorf("截图文件未生成")
 	}
-	return ppmToDataURL(tmp)
+	raw, err := d.readHostFileBase64(tmp)
+	if err != nil {
+		return "", fmt.Errorf("读取截图失败: %w", err)
+	}
+	// libvirt 11 的 virsh screenshot 直接输出 PNG（即使文件后缀是 .ppm），
+	// 老版本才是 PPM；按文件头判断，避免把 PNG 当 PPM 解析。
+	if len(raw) >= 8 && raw[0] == 0x89 && string(raw[1:4]) == "PNG" {
+		return "data:image/png;base64," + base64.StdEncoding.EncodeToString(raw), nil
+	}
+	b64, err := ppmBytesToBase64PNG(raw)
+	if err != nil {
+		return "", err
+	}
+	return "data:image/png;base64," + b64, nil
 }
 
 // ============================================================
@@ -202,25 +214,16 @@ func (d *VirtualBoxDriver) captureVirtualBoxScreenshot(vmUUID string) (string, e
 // MEmu Android 截图
 // ============================================================
 
-// captureMemuScreenshot 通过 adb screencap + pull 截图
+// captureMemuScreenshot 通过 adb exec-out 直接取回 PNG。
+//
+// 旧实现先 screencap 写到 /sdcard 再 pull，单次需要 1.5 秒以上并产生临时文件；
+// exec-out 由设备直接输出 PNG，VNC 抓帧与截图共用同一条链路。
 func (d *MemuDriver) captureMemuScreenshot(vmIndex string) (string, error) {
-	// 模拟器内部截图
-	if out, err := d.adb(vmIndex, "shell", "screencap", "-p", "/sdcard/screen_cap.png"); err != nil {
-		return "", fmt.Errorf("adb screencap 失败: %v (%s)", err, strings.TrimSpace(out))
+	raw, err := d.captureMemuFrame(vmIndex)
+	if err != nil {
+		return "", fmt.Errorf("adb 截图失败: %v", err)
 	}
-	time.Sleep(500 * time.Millisecond)
-
-	tmp := filepath.Join(os.TempDir(),
-		fmt.Sprintf("hostagent-screen-%s-%d.png", vmIndex, time.Now().UnixNano()))
-	defer os.Remove(tmp)
-
-	if out, err := d.adb(vmIndex, "pull", "/sdcard/screen_cap.png", tmp); err != nil {
-		return "", fmt.Errorf("adb pull 失败: %v (%s)", err, strings.TrimSpace(out))
-	}
-	if _, err := os.Stat(tmp); err != nil {
-		return "", fmt.Errorf("截图文件未生成")
-	}
-	return readFileAsDataURL(tmp)
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(raw), nil
 }
 
 // ============================================================

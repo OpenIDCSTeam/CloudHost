@@ -13,6 +13,7 @@ package driver
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
 	"regexp"
 	"strconv"
@@ -136,27 +137,81 @@ func (i *iptablesAPI) addPortMapping(containerIP string, lanPort, wanPort int, v
 }
 
 // removePortMapping 删除端口映射（三条规则，逐个删除，单条失败不阻断）
+//
+// 添加时规则携带 `-m comment --comment <ip>-<wan>-<lan>_<tips>`，而删除调用
+// 拿不到 tips（nat_tips 属于虚拟机配置，随请求变化）。用完整规格 -D 会因
+// comment 不匹配而「删除失败但返回成功」，规则长期残留并导致端口永远被占用。
+// 这里改为按 `iptables -S` 的行号删除，与注释内容无关。
 func (i *iptablesAPI) removePortMapping(containerIP string, lanPort, wanPort int) error {
 	if strings.TrimSpace(containerIP) == "" || lanPort <= 0 || wanPort <= 0 {
 		return fmt.Errorf("删除端口映射参数不完整")
 	}
 
-	// 与 Python 一致：删除时忽略单条规则的返回值（规则可能已不存在）
-	_ = i.runner.runArgs("iptables", "-t", "nat", "-D", "DOCKER",
-		"-p", "tcp", "--dport", strconv.Itoa(wanPort),
-		"-j", "DNAT", "--to-destination", fmt.Sprintf("%s:%d", containerIP, lanPort))
+	// nat 表：精确匹配本端口 DNAT 到本容器的规则
+	i.removeRuleByMatch("nat", "DOCKER", func(line string) bool {
+		return strings.Contains(line, "--dport "+strconv.Itoa(wanPort)) &&
+			strings.Contains(line, "-j DNAT") &&
+			strings.Contains(line, "--to-destination "+containerIP+":"+strconv.Itoa(lanPort))
+	})
 
-	_ = i.runner.runArgs("iptables", "-D", "DOCKER",
-		"-p", "tcp", "-d", containerIP,
-		"--dport", strconv.Itoa(lanPort),
-		"-j", "ACCEPT")
+	// filter DOCKER：目标容器的 ACCEPT
+	i.removeRuleByMatch("", "DOCKER", func(line string) bool {
+		return strings.Contains(line, "-d "+containerIP) &&
+			strings.Contains(line, "--dport "+strconv.Itoa(lanPort)) &&
+			strings.Contains(line, "-j ACCEPT")
+	})
 
-	_ = i.runner.runArgs("iptables", "-D", "FORWARD",
-		"-d", containerIP,
-		"-p", "tcp", "--dport", strconv.Itoa(lanPort),
-		"-j", "ACCEPT")
+	// filter FORWARD：DNAT 后转发放行
+	i.removeRuleByMatch("", "FORWARD", func(line string) bool {
+		return strings.Contains(line, "-d "+containerIP) &&
+			strings.Contains(line, "--dport "+strconv.Itoa(lanPort)) &&
+			strings.Contains(line, "-j ACCEPT")
+	})
 
 	return nil
+}
+
+// removeRuleByMatch 在指定表的链中删除第一条匹配规则的记录。
+//
+// `iptables -D <chain> <num>` 的 num 是 1 起始的行号；这里循环删除直到
+// 不存在匹配项，最多 4 轮（同一端口的多条历史残留一并清理）。
+func (i *iptablesAPI) removeRuleByMatch(table, chain string, match func(string) bool) {
+	for pass := 0; pass < 4; pass++ {
+		cmd := "iptables "
+		if table != "" {
+			cmd += "-t " + table + " "
+		}
+		cmd += "-S " + chain
+		out, err := i.runner.runShell(cmd, 30*time.Second)
+		if err != nil {
+			return
+		}
+		target := 0
+		num := 0
+		for _, line := range strings.Split(out, "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "-A "+chain+" ") {
+				continue
+			}
+			num++
+			if match(line) {
+				target = num
+				break
+			}
+		}
+		if target == 0 {
+			return
+		}
+		args := []string{"iptables"}
+		if table != "" {
+			args = append(args, "-t", table)
+		}
+		args = append(args, "-D", chain, strconv.Itoa(target))
+		if err := i.runner.runArgs(args...); err != nil {
+			log.Printf("[iptables] 删除 %s/%s 第 %d 条规则失败: %v", table, chain, target, err)
+			return
+		}
+	}
 }
 
 // listPorts 以 PortForwardEntry 形式返回 iptables 中已有的映射（仅含端口信息）

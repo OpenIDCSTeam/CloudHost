@@ -19,6 +19,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/ssh"
+
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/model"
 )
 
@@ -32,6 +34,9 @@ type SmolVMDriver struct {
 	sockRoot string
 	once     sync.Once
 	procMu   sync.Mutex
+	// sshMu/sshCli 远程模式下复用的 SSH 连接（用于访问对端 Firecracker UDS）
+	sshMu  sync.Mutex
+	sshCli *ssh.Client
 }
 
 // NewSmolVMDriver 创建 SmolVM 驱动
@@ -55,46 +60,27 @@ func (d *SmolVMDriver) isRemote() bool {
 	return true
 }
 
-// execHost 在宿主机上执行命令（本地直接 exec；远程通过 ssh）
+// execHost 在宿主机上执行命令（本地直接 exec；远程通过 SSH）
 func (d *SmolVMDriver) execHost(cmd string, timeout time.Duration) (bool, string, string) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(d.Ctx(""), timeout)
-	defer cancel()
 
 	if d.isRemote() {
-		addr := strings.TrimPrefix(d.Config.ServerAddr, "ssh://")
-		port := d.Config.ServerPort
-		if port <= 0 {
-			port = 22
+		cfg := sshConfigFromHS(d.Config)
+		cfg.Timeout = timeout
+		res, err := RunSSHCommand(cfg, cmd)
+		if err != nil {
+			return false, "", err.Error()
 		}
-		user := d.Config.ServerUser
-		if user == "" {
-			user = "root"
+		if res == nil {
+			return false, "", "远程命令无返回"
 		}
-		// 使用 sshpass + ssh（生产环境建议改为基于 golang.org/x/crypto/ssh）
-		target := fmt.Sprintf("%s@%s", user, addr)
-		args := []string{
-			"-o", "StrictHostKeyChecking=no",
-			"-o", "UserKnownHostsFile=/dev/null",
-			"-p", strconv.Itoa(port),
-			target, cmd,
-		}
-		sshpass, _ := exec.LookPath("sshpass")
-		var c *exec.Cmd
-		if sshpass != "" && d.Config.ServerPass != "" {
-			all := append([]string{"-p", d.Config.ServerPass, "ssh"}, args...)
-			c = exec.CommandContext(ctx, "sshpass", all...)
-		} else {
-			c = exec.CommandContext(ctx, "ssh", args...)
-		}
-		var stdout, stderr bytes.Buffer
-		c.Stdout = &stdout
-		c.Stderr = &stderr
-		err := c.Run()
-		return err == nil, stdout.String(), stderr.String()
+		return res.ExitCode == 0, res.Stdout, res.Stderr
 	}
+
+	ctx, cancel := context.WithTimeout(d.Ctx(""), timeout)
+	defer cancel()
 
 	c := exec.CommandContext(ctx, "sh", "-c", cmd)
 	var stdout, stderr bytes.Buffer
@@ -168,10 +154,60 @@ func (d *SmolVMDriver) fcClient(sock string) *http.Client {
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				dialer := &net.Dialer{Timeout: 3 * time.Second}
-				return dialer.DialContext(ctx, "unix", sock)
+				return d.dialFCSock(sock)
 			},
 		},
+	}
+}
+
+// dialFCSock 连接 Firecracker API 的 unix socket。
+//
+// 本地主机直接 net.Dial；远程主机通过 SSH 的 streamlocal（direct-streamlocal）
+// 通道访问对端 UDS —— 原实现无论本地远程都 Dial 本机路径，
+// 远程主机必然在装配阶段失败。
+func (d *SmolVMDriver) dialFCSock(sock string) (net.Conn, error) {
+	if !d.isRemote() {
+		return net.DialTimeout("unix", sock, 3*time.Second)
+	}
+	cli, err := d.remoteSSHClient()
+	if err != nil {
+		return nil, err
+	}
+	conn, err := cli.Dial("unix", sock)
+	if err == nil {
+		return conn, nil
+	}
+	// 连接可能已被对端关闭：清空缓存重连一次
+	d.resetSSHClient()
+	cli, err2 := d.remoteSSHClient()
+	if err2 != nil {
+		return nil, err2
+	}
+	return cli.Dial("unix", sock)
+}
+
+// remoteSSHClient 返回（并缓存）到远程宿主机的 SSH 连接
+func (d *SmolVMDriver) remoteSSHClient() (*ssh.Client, error) {
+	d.sshMu.Lock()
+	defer d.sshMu.Unlock()
+	if d.sshCli != nil {
+		return d.sshCli, nil
+	}
+	cli, err := dialSSHClient(sshConfigFromHS(d.Config))
+	if err != nil {
+		return nil, err
+	}
+	d.sshCli = cli
+	return cli, nil
+}
+
+// resetSSHClient 关闭并丢弃缓存的 SSH 连接
+func (d *SmolVMDriver) resetSSHClient() {
+	d.sshMu.Lock()
+	defer d.sshMu.Unlock()
+	if d.sshCli != nil {
+		_ = d.sshCli.Close()
+		d.sshCli = nil
 	}
 }
 
@@ -213,14 +249,10 @@ func (d *SmolVMDriver) waitSockReady(sock string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if ok, _, _ := d.execHost(fmt.Sprintf("test -S \"%s\" && echo YES || echo NO", sock), 3*time.Second); ok {
-			if !d.isRemote() {
-				c, err := net.DialTimeout("unix", sock, 500*time.Millisecond)
-				if err == nil {
-					_ = c.Close()
-					return true
-				}
-			} else {
-				// 远端：仅确认文件存在
+			// 本地与远程都实际连接一次：远程经 SSH streamlocal 通道，
+			// 能同时验证 socket 可用与通道放行。
+			if c, err := d.dialFCSock(sock); err == nil {
+				_ = c.Close()
 				return true
 			}
 		}
@@ -309,6 +341,9 @@ func (d *SmolVMDriver) buildRootfs(image, outRootfs string, sizeMB int, rootPass
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sys /sys 2>/dev/null
 mount -t devtmpfs dev /dev 2>/dev/null || true
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts 2>/dev/null
+[ -e /dev/ptmx ] || ln -s /dev/pts/ptmx /dev/ptmx 2>/dev/null
 ip link set lo up 2>/dev/null || true
 [ -x /sbin/udhcpc ] && udhcpc -i eth0 -q -f -n 2>/dev/null &
 if [ -x /usr/sbin/sshd ]; then
@@ -325,20 +360,9 @@ exec /bin/sh
 
 	// 生成密码哈希并写入 shadow
 	if rootPass != "" {
-		ok, out, _ := d.execHost(fmt.Sprintf("openssl passwd -6 '%s' 2>/dev/null || openssl passwd -1 '%s'",
-			shEscape(rootPass), shEscape(rootPass)), 10*time.Second)
-		if ok {
-			hash := strings.TrimSpace(out)
-			lines := strings.Split(hash, "\n")
-			if len(lines) > 0 {
-				hash = lines[len(lines)-1]
-			}
-			shadow := filepath.ToSlash(filepath.Join(workDir, "etc/shadow"))
-			escaped := strings.ReplaceAll(hash, "|", `\|`)
-			d.execHost(fmt.Sprintf(
-				"sh -c 'if [ -f \"%s\" ]; then sed -i -E \"s|^root:[^:]*:|root:%s:|\" \"%s\"; "+
-					"else echo \"root:%s:0:0:99999:7:::\" > \"%s\"; fi'",
-				shadow, escaped, shadow, escaped, shadow), 5*time.Second)
+		shadow := filepath.ToSlash(filepath.Join(workDir, "etc/shadow"))
+		if err := d.writeShadowPassword(shadow, workDir, rootPass); err != nil {
+			return fmt.Errorf("写入 root 密码失败: %v", err)
 		}
 	}
 
@@ -362,13 +386,61 @@ exec /bin/sh
 
 // writeRemoteFile 在宿主机（远程/本地）写入文本文件
 func (d *SmolVMDriver) writeRemoteFile(path, content string, mode os.FileMode) {
-	// 使用 here-doc
-	// 为防止内容中出现 EOF_SMOLVM 自身，此处不做转义（约定内容安全）
-	escaped := strings.ReplaceAll(content, "$", `\$`)
+	// 使用带引号的 here-doc：内容是字面量，不做变量展开。
+	// 注意不能把 "$" 转义成 "\$"——带引号的 heredoc 里反斜杠是普通字符，
+	// 转义会把密码哈希（$6$salt$hash）写成错误内容。
 	cmd := fmt.Sprintf(
 		"cat >\"%s\" <<'EOF_SMOLVM'\n%s\nEOF_SMOLVM\nchmod %o \"%s\"",
-		path, escaped, mode, path)
+		path, content, mode, path)
 	d.execHost(cmd, 10*time.Second)
+}
+
+// writeShadowPassword 生成 root 口令哈希并写入 rootfs 的 /etc/shadow。
+//
+// 不能直接把哈希拼进 `sh -c "... sed ..."`：哈希里的 $6$salt$hash 会被
+// 内层 shell 当作变量展开，最终写进 shadow 的是一段残缺字符串，
+// 表现为「改密成功但 SSH 登录始终拒绝」。
+func (d *SmolVMDriver) writeShadowPassword(shadowPath, tmpDir, password string) error {
+	okp, out, _ := d.execHost(fmt.Sprintf(
+		"openssl passwd -6 '%s' 2>/dev/null || openssl passwd -1 '%s'",
+		shEscape(password), shEscape(password)), 10*time.Second)
+	if !okp {
+		return fmt.Errorf("openssl 生成密文失败")
+	}
+	hash := strings.TrimSpace(out)
+	lines := strings.Split(hash, "\n")
+	if len(lines) > 0 {
+		hash = lines[len(lines)-1]
+	}
+	if hash == "" {
+		return fmt.Errorf("openssl 未返回密文")
+	}
+
+	linePath := filepath.ToSlash(filepath.Join(tmpDir, ".root-shadow-line"))
+	restPath := filepath.ToSlash(filepath.Join(tmpDir, ".root-shadow-rest"))
+	hashPath := filepath.ToSlash(filepath.Join(tmpDir, ".root-shadow-hash"))
+	d.writeRemoteFile(hashPath, hash+"\n", 0600)
+	// lastchg 必须写「今天」（epoch 天数）：写 0 会被 PAM/sshd 判为
+	// 「密码已过期，必须先改密」，SSH 登录直接报 Password change required。
+	genCmd := fmt.Sprintf(
+		"sh -c 'H=$(cat \"%s\"); D=$(( $(date +%%s) / 86400 )); "+
+			"printf \"root:%%s:%%s:0:99999:7:::\\n\" \"$H\" \"$D\" > \"%s\"; rm -f \"%s\"'",
+		hashPath, linePath, hashPath)
+	if ok, _, err := d.execHost(genCmd, 10*time.Second); !ok {
+		return fmt.Errorf("生成 shadow 行失败: %s", err)
+	}
+
+	cmd := fmt.Sprintf(
+		"sh -c 'if [ -f \"%s\" ]; then grep -v \"^root:\" \"%s\" > \"%s\"; cat \"%s\" \"%s\" > \"%s\"; rm -f \"%s\"; "+
+			"else cp \"%s\" \"%s\"; fi; rm -f \"%s\"'",
+		shadowPath, shadowPath, restPath,
+		linePath, restPath, shadowPath, restPath,
+		linePath, shadowPath, linePath)
+	ok, _, err := d.execHost(cmd, 10*time.Second)
+	if !ok {
+		return fmt.Errorf("写入 shadow 失败: %s", err)
+	}
+	return nil
 }
 
 // ============================================================
@@ -379,9 +451,15 @@ func (d *SmolVMDriver) bindTap(cfg *model.VMConfig, up bool) error {
 	tap := d.tapName(cfg.VmUUID)
 	if !up {
 		d.execHost(fmt.Sprintf("ip link set %s down 2>/dev/null || true", tap), 5*time.Second)
-		d.execHost(fmt.Sprintf("ip tuntap del dev %s mode tap 2>/dev/null || true", tap), 5*time.Second)
+		d.execHost(fmt.Sprintf("for i in 1 2 3 4 5 6; do ip tuntap del dev %s mode tap 2>/dev/null && break; "+
+			"ip link del %s 2>/dev/null && break; sleep 0.3; done", tap, tap), 10*time.Second)
 		return nil
 	}
+	// 先清理同名残留 tap：Firecracker 自己也会 open tap，若上一次停止时未删除，
+	// TUNSETIFF 会返回 EBUSY（Resource busy），装配阶段 400 而虚拟机实际未启动。
+	d.execHost(fmt.Sprintf("ip link set %s down 2>/dev/null || true", tap), 5*time.Second)
+	d.execHost(fmt.Sprintf("for i in 1 2 3 4 5 6; do ip tuntap del dev %s mode tap 2>/dev/null && break; "+
+		"ip link del %s 2>/dev/null && break; sleep 0.3; done", tap, tap), 10*time.Second)
 	d.execHost(fmt.Sprintf("ip tuntap add dev %s mode tap 2>/dev/null || true", tap), 5*time.Second)
 	d.execHost(fmt.Sprintf("ip link set %s up", tap), 5*time.Second)
 
@@ -409,20 +487,20 @@ func (d *SmolVMDriver) GetPower(vmUUID string) string {
 	if pid <= 0 || !d.pidAlive(pid) {
 		return "已关机"
 	}
-	if !d.isRemote() {
-		code, resp, err := d.fcDo(d.vmSock(vmUUID), "GET", "/", nil)
-		if err == nil && code == 200 {
-			state, _ := resp["state"].(string)
-			switch strings.ToLower(state) {
-			case "running":
-				return "运行中"
-			case "paused":
-				return "已暂停"
-			case "not started":
-				return "已关机"
-			case "restarting":
-				return "重启中"
-			}
+	// 以 Firecracker 实例状态为准：仅凭 pid 存活会把「进程在但未 InstanceStart」
+	// 的失败实例误报为运行中。远程模式经 SSH streamlocal 访问对端 UDS。
+	code, resp, err := d.fcDo(d.vmSock(vmUUID), "GET", "/", nil)
+	if err == nil && code == 200 {
+		state, _ := resp["state"].(string)
+		switch strings.ToLower(state) {
+		case "running":
+			return "运行中"
+		case "paused":
+			return "已暂停"
+		case "not started":
+			return "已关机"
+		case "restarting":
+			return "重启中"
 		}
 	}
 	return "运行中"
@@ -446,6 +524,34 @@ func (d *SmolVMDriver) pidAlive(pid int) bool {
 	return ok && strings.Contains(out, "YES")
 }
 
+// GuestIP 从实例串口日志中解析 guest 的 DHCP 地址。
+//
+// Firecracker 没有 guest 网络查询接口，内核启动时的 IP-Config 会把
+// `ipaddr=10.x.x.x` 打到串口（即 fc.log），这是唯一可靠的地址来源。
+func (d *SmolVMDriver) GuestIP(vmUUID string) string {
+	logPath := filepath.ToSlash(filepath.Join(d.vmDir(vmUUID), "fc.log"))
+	// 不能只 tail 固定行数：串口日志会被 Firecracker 的 API 访问日志迅速撑大，
+	// 启动阶段的 ipaddr 行会被挤出窗口。取最后一条 ipaddr 记录（最后一次启动）。
+	ok, out, _ := d.execHost(fmt.Sprintf("grep -h 'ipaddr=' \"%s\" 2>/dev/null | tail -n 1", logPath), 10*time.Second)
+	if !ok {
+		return ""
+	}
+	idx := strings.LastIndex(out, "ipaddr=")
+	if idx < 0 {
+		return ""
+	}
+	fields := strings.Fields(out[idx+len("ipaddr="):])
+	if len(fields) == 0 {
+		return ""
+	}
+	ip := strings.Trim(fields[0], ",")
+	if net.ParseIP(ip) == nil {
+		return ""
+	}
+	return ip
+}
+
+// killPid 终止指定进程
 func (d *SmolVMDriver) killPid(pid int, force bool) {
 	if pid <= 0 {
 		return
@@ -455,6 +561,17 @@ func (d *SmolVMDriver) killPid(pid int, force bool) {
 		sig = "-9"
 	}
 	d.execHost(fmt.Sprintf("kill %s %d 2>/dev/null || true", sig, pid), 5*time.Second)
+}
+
+// killOrphan 按 socket 路径回收遗留的 firecracker 进程。
+//
+// 启动失败（装配 400）或 pid 文件被清理后，进程可能仍在运行并持有 tap，
+// 后续启动会因 TUNSETIFF EBUSY 永久失败。pid 文件不可靠，必须按命令行兜底。
+func (d *SmolVMDriver) killOrphan(sock string) {
+	// 注意 "[f]irecracker"：pkill -f 会匹配到远程 shell 自身的命令行，
+	// 直接写 firecracker 会让它把自己（以及当前 SSH 会话）一起杀掉。
+	pattern := shellQuote("[f]irecracker --api-sock " + sock)
+	d.execHost(fmt.Sprintf("pkill -9 -f %s 2>/dev/null || true; sleep 0.3", pattern), 10*time.Second)
 }
 
 // CreateVM 创建 microVM
@@ -478,7 +595,8 @@ func (d *SmolVMDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 			Message: fmt.Sprintf("rootfs 构建失败: %v", err)}, nil
 	}
 
-	// 2) tap 设备
+	// 2) tap 设备（先回收可能遗留的实例，避免 tap 被占用）
+	d.killOrphan(sock)
 	d.bindTap(cfg, true)
 
 	// 3) 启动 firecracker
@@ -522,7 +640,10 @@ func (d *SmolVMDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 
 // assembleVM 通过 FC API 装配虚拟机
 func (d *SmolVMDriver) assembleVM(cfg *model.VMConfig, sock, rootfs string) error {
-	bootArgs := "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=dhcp"
+	// init 指向 buildRootfs 注入的 /init：Docker 基础镜像通常没有可用的
+	// /sbin/init（alpine 的 /sbin/init 依赖 openrc，debian 基础镜像无 systemd），
+	// 继续按 /sbin/init 引导会出现「内核能启动、guest 无网无控制台」的假运行。
+	bootArgs := "console=ttyS0 reboot=k panic=1 pci=off init=/init ip=dhcp"
 	if code, _, err := d.fcDo(sock, "PUT", "/boot-source", map[string]interface{}{
 		"kernel_image_path": d.kernelPath(), "boot_args": bootArgs}); err != nil || code >= 400 {
 		return fmt.Errorf("/boot-source code=%d err=%v", code, err)
@@ -668,6 +789,7 @@ func (d *SmolVMDriver) PowerControl(vmUUID string, action model.VMPowers) (*mode
 			d.fcDo(sock, "PATCH", "/vm", map[string]interface{}{"state": "Resumed"})
 		} else {
 			d.ensureDirs()
+			d.killOrphan(sock)
 			d.bindTap(cfg, true)
 			d.execHost(fmt.Sprintf("rm -f \"%s\"", sock), 3*time.Second)
 			startCmd := fmt.Sprintf("setsid %s --api-sock \"%s\" >\"%s/fc.log\" 2>&1 & echo $! > \"%s\"",
@@ -679,6 +801,10 @@ func (d *SmolVMDriver) PowerControl(vmUUID string, action model.VMPowers) (*mode
 					Message: "socket 未就绪"}, nil
 			}
 			if err := d.assembleVM(cfg, sock, filepath.ToSlash(filepath.Join(d.vmDir(vmUUID), "rootfs.ext4"))); err != nil {
+				// 装配失败必须回收 firecracker 进程：否则 pid 存活会让
+				// GetPower 误报「运行中」，而实例实际从未 InstanceStart。
+				d.killPid(d.readPid(vmUUID), true)
+				d.execHost(fmt.Sprintf("rm -f \"%s\" \"%s\"", sock, d.vmPidFile(vmUUID)), 5*time.Second)
 				return &model.ZMessage{Success: false, Action: "VMPowers",
 					Message: fmt.Sprintf("启动失败: %v", err)}, nil
 			}
@@ -688,6 +814,7 @@ func (d *SmolVMDriver) PowerControl(vmUUID string, action model.VMPowers) (*mode
 			d.killPid(pid, true)
 		}
 		d.execHost(fmt.Sprintf("rm -f \"%s\" \"%s\"", sock, d.vmPidFile(vmUUID)), 5*time.Second)
+		d.bindTap(cfg, false)
 	case model.VMPowerSClose:
 		d.fcDo(sock, "PUT", "/actions", map[string]interface{}{"action_type": "SendCtrlAltDel"})
 		deadline := time.Now().Add(30 * time.Second)
@@ -701,6 +828,8 @@ func (d *SmolVMDriver) PowerControl(vmUUID string, action model.VMPowers) (*mode
 			d.killPid(pid, true)
 		}
 		d.execHost(fmt.Sprintf("rm -f \"%s\" \"%s\"", sock, d.vmPidFile(vmUUID)), 5*time.Second)
+		// 关机后删除 tap，避免下次启动时 TUNSETIFF 冲突
+		d.bindTap(cfg, false)
 	case model.VMPowerSReset, model.VMPowerHReset:
 		if action == model.VMPowerSReset {
 			d.PowerControl(vmUUID, model.VMPowerSClose)
@@ -713,6 +842,17 @@ func (d *SmolVMDriver) PowerControl(vmUUID string, action model.VMPowers) (*mode
 		d.fcDo(sock, "PATCH", "/vm", map[string]interface{}{"state": "Paused"})
 	case model.VMPowerAWaked:
 		d.fcDo(sock, "PATCH", "/vm", map[string]interface{}{"state": "Resumed"})
+	}
+
+	// 操作成功后同步最终状态：只写中间态（ON_OPEN 等）会让前端与状态接口
+	// 在下一次 60 秒调度前一直显示「启动中/关机中」。
+	switch action {
+	case model.VMPowerSStart, model.VMPowerAWaked:
+		cfg.VmFlag = model.VMPowerStarted
+	case model.VMPowerAPause:
+		cfg.VmFlag = model.VMPowerSuspend
+	case model.VMPowerSClose, model.VMPowerHClose:
+		cfg.VmFlag = model.VMPowerStopped
 	}
 
 	return &model.ZMessage{Success: true, Action: "VMPowers",
@@ -757,8 +897,10 @@ func (d *SmolVMDriver) ScanVMs() (*model.ZMessage, error) {
 
 		vmCfg := d.loadVMJSON(name)
 		if vmCfg == nil {
-			vmCfg = model.NewVMConfig()
-			vmCfg.VmUUID = name
+			// 目录下没有 vm.json 的（如 ExternPath 内的 backup / images 子目录）
+			// 不是虚拟机。原实现会为其凭空创建一条配置，导致实例列表出现
+			// "backup"/"images" 假实例，误点删除还会删掉备份/镜像目录。
+			continue
 		}
 		d.mu.Lock()
 		d.VmSaving[name] = vmCfg
@@ -794,62 +936,59 @@ func (d *SmolVMDriver) SetPassword(vmUUID string, password string) (*model.ZMess
 				break
 			}
 		}
-		if vmIP == "" {
-			return &model.ZMessage{Success: false, Action: "Password",
-				Message: "microVM 未分配 IP"}, nil
+		if vmIP != "" && net.ParseIP(strings.TrimSpace(vmIP)) != nil {
+			// 口令进入本地 shell 命令串，必须转义；
+			// IP 只接受合法地址，避免被拼成主机名或附加参数。
+			cmd := fmt.Sprintf(
+				"sshpass -p '%s' ssh -o StrictHostKeyChecking=no root@%s \"echo 'root:%s' | chpasswd\"",
+				shEscape(password), vmIP, shEscape(password))
+			if ok2, _, _ := d.execHost(cmd, 30*time.Second); ok2 {
+				cfg.OsPass = password
+				return &model.ZMessage{Success: true, Action: "Password",
+					Message: "密码已更新（在线）"}, nil
+			}
 		}
-		// 口令进入本地 shell 命令串，必须转义；
-		// IP 只接受合法地址，避免被拼成主机名或附加参数。
-		if net.ParseIP(strings.TrimSpace(vmIP)) == nil {
-			return &model.ZMessage{Success: false, Action: "Password",
-				Message: "microVM 的 IP 地址无效"}, nil
+		// 在线不可用（未分配 IP / 分配的 IP 与 DHCP 实际地址不一致 / sshd 未启动）
+		// 时回退离线改密：停止实例 → loop 挂载 rootfs 改 shadow → 重新启动。
+		// microVM 的地址由 guest DHCP 获取，控制面分配的 IP 未必等于实际地址，
+		// 只做在线改密会让「有 IP 但改不了密码」变成常态。
+		_, _ = d.PowerControl(vmUUID, model.VMPowerSClose)
+		if msg := d.setPasswordOffline(vmUUID, password); msg != nil {
+			_, _ = d.PowerControl(vmUUID, model.VMPowerSStart)
+			return msg, nil
 		}
-		cmd := fmt.Sprintf(
-			"sshpass -p '%s' ssh -o StrictHostKeyChecking=no root@%s \"echo 'root:%s' | chpasswd\"",
-			shEscape(password), vmIP, shEscape(password))
-		if ok2, _, err := d.execHost(cmd, 30*time.Second); !ok2 {
-			return &model.ZMessage{Success: false, Action: "Password",
-				Message: fmt.Sprintf("在线改密失败: %s", err)}, nil
-		}
+		_, _ = d.PowerControl(vmUUID, model.VMPowerSStart)
 		cfg.OsPass = password
 		return &model.ZMessage{Success: true, Action: "Password",
-			Message: "密码已更新（在线）"}, nil
+			Message: "密码已更新（离线，实例已重新启动）"}, nil
 	}
 
-	// 离线改密
+	if msg := d.setPasswordOffline(vmUUID, password); msg != nil {
+		return msg, nil
+	}
+	cfg.OsPass = password
+	return &model.ZMessage{Success: true, Action: "Password",
+		Message: "密码已更新（离线）"}, nil
+}
+
+// setPasswordOffline 挂载 rootfs 直接改写 /etc/shadow（实例必须处于停止状态）
+func (d *SmolVMDriver) setPasswordOffline(vmUUID, password string) *model.ZMessage {
 	rootfs := filepath.ToSlash(filepath.Join(d.vmDir(vmUUID), "rootfs.ext4"))
 	mnt := filepath.ToSlash(filepath.Join(d.vmDir(vmUUID), ".mnt-passwd"))
 	d.execHost(fmt.Sprintf("mkdir -p \"%s\"", mnt), 5*time.Second)
 	if ok2, _, err := d.execHost(fmt.Sprintf("mount -o loop \"%s\" \"%s\"", rootfs, mnt), 10*time.Second); !ok2 {
 		return &model.ZMessage{Success: false, Action: "Password",
-			Message: fmt.Sprintf("挂载 rootfs 失败: %s", err)}, nil
+			Message: fmt.Sprintf("挂载 rootfs 失败: %s", err)}
 	}
 	defer func() {
 		d.execHost(fmt.Sprintf("sync && umount \"%s\" || umount -l \"%s\"; rmdir \"%s\" 2>/dev/null || true",
 			mnt, mnt, mnt), 10*time.Second)
 	}()
-	okp, out, _ := d.execHost(fmt.Sprintf(
-		"openssl passwd -6 '%s' 2>/dev/null || openssl passwd -1 '%s'",
-		shEscape(password), shEscape(password)), 10*time.Second)
-	if !okp {
-		return &model.ZMessage{Success: false, Action: "Password",
-			Message: "openssl 生成密文失败"}, nil
-	}
-	hash := strings.TrimSpace(out)
-	lines := strings.Split(hash, "\n")
-	if len(lines) > 0 {
-		hash = lines[len(lines)-1]
-	}
 	shadow := filepath.ToSlash(filepath.Join(mnt, "etc/shadow"))
-	escaped := strings.ReplaceAll(hash, "|", `\|`)
-	d.execHost(fmt.Sprintf(
-		"sh -c 'if [ -f \"%s\" ]; then sed -i -E \"s|^root:[^:]*:|root:%s:|\" \"%s\"; "+
-			"else echo \"root:%s:0:0:99999:7:::\" > \"%s\"; fi'",
-		shadow, escaped, shadow, escaped, shadow), 10*time.Second)
-
-	cfg.OsPass = password
-	return &model.ZMessage{Success: true, Action: "Password",
-		Message: "密码已更新（离线）"}, nil
+	if err := d.writeShadowPassword(shadow, d.vmDir(vmUUID), password); err != nil {
+		return &model.ZMessage{Success: false, Action: "Password", Message: err.Error()}
+	}
+	return nil
 }
 
 // CreateBackup 备份（tar -czf extern_path/<vm>）
@@ -872,7 +1011,9 @@ func (d *SmolVMDriver) CreateBackup(vmUUID string, tips string) (*model.ZMessage
 		wasRunning = true
 		d.PowerControl(vmUUID, model.VMPowerSClose)
 	}
-	bakFile := fmt.Sprintf("%s_%s.tar.gz", vmUUID, time.Now().Format("20060102_150405"))
+	// 备份名必须使用 <vm_uuid>-<时间戳>：DeleteBackup 与基类 ScanBackups
+	// 都以该前缀识别归属，原实现用下划线拼接导致备份无法被列出/删除。
+	bakFile := fmt.Sprintf("%s-%s.tar.gz", vmUUID, time.Now().Format("20060102_150405"))
 	bakPath := filepath.ToSlash(filepath.Join(d.Config.BackupPath, bakFile))
 	d.execHost(fmt.Sprintf("mkdir -p \"%s\"", d.Config.BackupPath), 5*time.Second)
 	cmd := fmt.Sprintf("tar -C \"%s\" -czf \"%s\" \"%s\"", d.Config.ExternPath, bakPath, vmUUID)
@@ -883,9 +1024,62 @@ func (d *SmolVMDriver) CreateBackup(vmUUID string, tips string) (*model.ZMessage
 	if wasRunning {
 		d.PowerControl(vmUUID, model.VMPowerSStart)
 	}
+	// 记录到虚拟机配置：备份列表接口直接返回 cfg.Backups，
+	// 原实现只返回文件名、不落记录，导致备份成功但列表始终为空。
+	entry := model.VMBackup{BackupName: bakFile, BackupTime: time.Now(), BackupTips: tips}
+	d.mu.Lock()
+	if cur, exists := d.VmSaving[vmUUID]; exists {
+		cur.Backups = append(cur.Backups, entry)
+		d.saveVMJSON(cur)
+	}
+	d.mu.Unlock()
 	return &model.ZMessage{Success: true, Action: "VMBackup",
 		Message: fmt.Sprintf("microVM 备份成功: %s", bakFile),
 		Results: map[string]string{"backup_file": bakFile, "backup_path": bakPath, "tips": tips}}, nil
+}
+
+// SyncBackups 以宿主机备份目录为准重建备份列表。
+//
+// 基类 ScanBackups 用 os.ReadDir 读本机目录，远程主机永远读不到；
+// 备份列表接口会优先调用该方法（存在时）。
+func (d *SmolVMDriver) SyncBackups(vmUUID string) {
+	dir := strings.TrimSpace(d.Config.BackupPath)
+	if dir == "" {
+		return
+	}
+	pattern := shellQuote(vmUUID + "-*")
+	cmd := fmt.Sprintf("find %s -maxdepth 1 -type f -name %s -printf '%%f\\t%%T@\\n'",
+		shellQuote(dir), pattern)
+	ok, out, _ := d.execHost(cmd, 20*time.Second)
+	if !ok {
+		return
+	}
+	backups := []model.VMBackup{}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(strings.TrimSpace(line), "\r")
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		name := strings.TrimSpace(parts[0])
+		if name == "" || !strings.HasPrefix(name, vmUUID+"-") {
+			continue
+		}
+		bt := time.Now()
+		if len(parts) == 2 {
+			var sec float64
+			if _, err := fmt.Sscanf(strings.TrimSpace(parts[1]), "%f", &sec); err == nil && sec > 0 {
+				bt = time.Unix(int64(sec), 0)
+			}
+		}
+		backups = append(backups, model.VMBackup{BackupName: name, BackupTime: bt})
+	}
+	d.mu.Lock()
+	if cur, exists := d.VmSaving[vmUUID]; exists {
+		cur.Backups = backups
+		d.saveVMJSON(cur)
+	}
+	d.mu.Unlock()
 }
 
 // RestoreBackup 恢复

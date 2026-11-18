@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -22,24 +23,74 @@ import (
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/security"
 )
 
-// vmrunBin 解析 vmrun 可执行文件路径（优先取 launch_path 配置）
+// vmrunBin 解析 vmrun 可执行文件路径：优先 launch_path，其次 PATH，
+// 最后 VMware Workstation 默认安装目录。
+//
+// launch_path 通常配置的是 vmrest.exe（同目录下还有 vmrun.exe），
+// 不能直接当成 vmrun 使用。
 func (d *WorkstationDriver) vmrunBin() string {
-	launch := strings.TrimSpace(d.Config.LaunchPath)
-	if launch != "" {
-		if info, err := os.Stat(launch); err == nil {
-			if info.IsDir() {
-				for _, name := range []string{"vmrun.exe", "vmrun"} {
-					candidate := filepath.Join(launch, name)
-					if _, err := os.Stat(candidate); err == nil {
-						return candidate
-					}
+	for _, name := range []string{"vmrun.exe", "vmrun"} {
+		launch := strings.TrimSpace(d.Config.LaunchPath)
+		if launch != "" {
+			if info, err := os.Stat(launch); err == nil {
+				dir := launch
+				if !info.IsDir() {
+					dir = filepath.Dir(launch)
 				}
-			} else {
-				return launch
+				if p := filepath.Join(dir, name); fileExists(p) {
+					return p
+				}
 			}
 		}
 	}
+	if p, err := exec.LookPath("vmrun"); err == nil {
+		return p
+	}
+	for _, dir := range vmwareInstallDirs() {
+		if p := findExecutable(dir, "vmrun"); p != "" {
+			return p
+		}
+	}
 	return "vmrun"
+}
+
+// fileExists 判断路径是否为已存在的文件
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+// vmrunIsRunning 用 vmrun list 复核虚拟机是否真的在运行。
+//
+// vmrest 的电源状态来自它自己维护的 VM 通道：虚拟机在 Workstation GUI 里
+// 启动/重启后可能长时间报 resetting 或未知。vmrun list 直接向本机 VMware
+// 进程要运行列表，作为状态兜底更可靠。
+func (d *WorkstationDriver) vmrunIsRunning(vmUUID string) bool {
+	vmx := d.wsVMXPath(vmUUID)
+	if vmx == "" {
+		vmx = d.vmxPath(vmUUID)
+	}
+	if strings.TrimSpace(vmx) == "" {
+		return false
+	}
+
+	out, _, err := security.SafeExecWithTimeout(
+		[]string{d.vmrunBin(), "-T", "ws", "list"}, 15*time.Second)
+	if err != nil {
+		return false
+	}
+
+	target := filepath.Clean(vmx)
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(strings.ToLower(line), "total running") {
+			continue
+		}
+		if strings.EqualFold(filepath.Clean(line), target) {
+			return true
+		}
+	}
+	return false
 }
 
 // vmxPath 返回虚拟机的 VMX 配置文件路径

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/OpenIDCSTeam/HostAgent-Go/internal/model"
 )
 
 // SupportsSnapshot VirtualBox 提供原生快照
@@ -120,10 +122,34 @@ func (d *VirtualBoxDriver) CreateSnapshot(vmUUID, name, description string) erro
 	return nil
 }
 
-// RestoreSnapshot 恢复 VirtualBox 快照
+// RestoreSnapshot 恢复 VirtualBox 快照。
+//
+// VirtualBox 要求虚拟机处于关机（或已保存）状态才能回滚快照：
+// 对运行中的虚拟机直接 restore 会报
+// 「Cannot delete the current state of the running machine」。
+// 这里先强制关机，回滚完成后按原状态重启，避免「点恢复没反应」。
 func (d *VirtualBoxDriver) RestoreSnapshot(vmUUID, name string) error {
+	wasRunning := d.GetPower(vmUUID) == "运行中"
+	if wasRunning {
+		if msg, _ := d.PowerControl(vmUUID, model.VMPowerHClose); msg == nil || !msg.Success {
+			return fmt.Errorf("恢复快照前关闭虚拟机失败")
+		}
+		if !d.vboxWaitPowerOff(vmUUID, 30*time.Second) {
+			return fmt.Errorf("虚拟机仍在运行，无法恢复快照")
+		}
+	}
+
 	if out, err := d.execVBox("snapshot", vmUUID, "restore", name); err != nil {
+		if wasRunning {
+			_, _ = d.PowerControl(vmUUID, model.VMPowerSStart)
+		}
 		return fmt.Errorf("恢复快照失败: %v (%s)", err, strings.TrimSpace(out))
+	}
+
+	if wasRunning {
+		if msg, _ := d.PowerControl(vmUUID, model.VMPowerSStart); msg == nil || !msg.Success {
+			return fmt.Errorf("快照已恢复，但虚拟机启动失败")
+		}
 	}
 	return nil
 }

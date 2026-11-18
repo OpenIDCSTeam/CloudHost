@@ -31,13 +31,21 @@ func portsMapTTY(cfg *model.HSConfig, nat *model.PortData, add bool) (*model.ZMe
 	pf := newPortForward(cfg)
 
 	// 端口分配 / 占用校验
+	//
+	// 占用校验只对「添加」有意义：删除时该端口必然被待删除的规则占用，
+	// 若也走占用判断，删除会被误判为端口冲突而永不执行（表现为
+	// 接口返回成功、iptables 规则残留、端口永久被占）。
 	if nat.WanPort <= 0 {
+		if !add {
+			return &model.ZMessage{Success: false, Action: "PortsMap",
+				Message: "删除端口映射需要指定外网端口"}, nil
+		}
 		nat.WanPort = pf.allocatePort()
 		if nat.WanPort <= 0 {
 			return &model.ZMessage{Success: false, Action: "PortsMap",
 				Message: "无法分配可用外网端口"}, nil
 		}
-	} else if pf.hostPortsFirewall()[nat.WanPort] {
+	} else if add && pf.hostPortsFirewall()[nat.WanPort] {
 		return &model.ZMessage{Success: false, Action: "PortsMap",
 			Message: fmt.Sprintf("端口 %d 已被占用", nat.WanPort)}, nil
 	}
@@ -75,6 +83,49 @@ func (d *DockerDriver) PortsMap(nat *model.PortData, add bool) (*model.ZMessage,
 // PortsMap 端口映射下发（宿主机 iptables）
 func (d *LXDDriver) PortsMap(nat *model.PortData, add bool) (*model.ZMessage, error) {
 	return portsMapTTY(d.Config, nat, add)
+}
+
+// ============================================================
+// QEMU / KVM
+// ============================================================
+
+// PortsMap 端口映射下发（KVM 宿主机 socat 转发）
+//
+// QEMU 虚拟机位于宿主机的 virbr0 NAT 网络，外部无法直接访问；
+// 与容器平台一致，用宿主机的 socat 把 WAN 端口转发到 guest 的 LAN 地址。
+func (d *QEMUDriver) PortsMap(nat *model.PortData, add bool) (*model.ZMessage, error) {
+	if nat == nil || nat.LanPort <= 0 || nat.LanAddr == "" {
+		return &model.ZMessage{Success: false, Action: "PortsMap",
+			Message: "端口映射参数不完整（需要内网地址与内网端口）"}, nil
+	}
+	pf := newPortForward(d.Config)
+	if nat.WanPort <= 0 {
+		if !add {
+			return &model.ZMessage{Success: false, Action: "PortsMap",
+				Message: "删除端口映射需要指定外网端口"}, nil
+		}
+		nat.WanPort = pf.allocatePort()
+		if nat.WanPort <= 0 {
+			return &model.ZMessage{Success: false, Action: "PortsMap",
+				Message: "无法分配可用外网端口"}, nil
+		}
+	} else if add && pf.hostPorts()[nat.WanPort] {
+		return &model.ZMessage{Success: false, Action: "PortsMap",
+			Message: fmt.Sprintf("端口 %d 已被占用", nat.WanPort)}, nil
+	}
+	if add {
+		if err := pf.addPortForward(nat.LanAddr, nat.LanPort, nat.WanPort, "tcp", nat.NatTips); err != nil {
+			return &model.ZMessage{Success: false, Action: "PortsMap",
+				Message: fmt.Sprintf("端口映射失败: %v", err)}, nil
+		}
+		return &model.ZMessage{Success: true, Action: "PortsMap",
+			Message: fmt.Sprintf("端口 %d 已映射到 %s:%d", nat.WanPort, nat.LanAddr, nat.LanPort)}, nil
+	}
+	if err := pf.removePortForward(nat.WanPort, "tcp"); err != nil {
+		return &model.ZMessage{Success: false, Action: "PortsMap",
+			Message: fmt.Sprintf("端口映射删除失败: %v", err)}, nil
+	}
+	return &model.ZMessage{Success: true, Action: "PortsMap", Message: "端口映射已删除"}, nil
 }
 
 // ============================================================

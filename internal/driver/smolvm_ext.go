@@ -30,9 +30,10 @@ func (d *SmolVMDriver) smolvmRestart(cfg *model.VMConfig) error {
 	sock := d.vmSock(vmUUID)
 	pidFile := d.vmPidFile(vmUUID)
 
+	d.killPid(d.readPid(vmUUID), true)
+	d.killOrphan(sock)
 	d.bindTap(cfg, true)
 	d.execHost(fmt.Sprintf("rm -f \"%s\"", sock), 5*time.Second)
-
 	hv := d.hypervisorBin()
 	startCmd := fmt.Sprintf("setsid %s --api-sock \"%s\" >>\"%s/fc.log\" 2>&1 & echo $! > \"%s\"",
 		hv, sock, vmDir, pidFile)
@@ -161,14 +162,23 @@ func (d *SmolVMDriver) GetVNCInfo(vmUUID string, ipAddr string) (*model.ZMessage
 			Message: "microVM 未运行，无法连接控制台"}, nil
 	}
 	sock := d.vmSock(vmUUID)
+	logPath := filepath.ToSlash(filepath.Join(d.vmDir(vmUUID), "fc.log"))
 	return &model.ZMessage{Success: true, Action: "VCRemote",
 		Message: "串口控制台信息获取成功",
 		Results: map[string]interface{}{
-			"type":     "tty",
-			"vm_uuid":  vmUUID,
-			"socket":   sock,
-			"connect":  fmt.Sprintf("socat -,raw,echo=0 UNIX-CONNECT:%s", sock),
-			"password": "",
+			"type":    "tty",
+			"vm_uuid": vmUUID,
+			"socket":  sock,
+			// Firecracker 没有 VNC 帧缓冲，也没有可连接的串口 socket：
+			// 串口输出写入实例目录下的 fc.log（启动时 stdout/stderr 重定向）。
+			// 原实现返回 socat UNIX-CONNECT:<api sock>，连上去只是 Firecracker
+			// REST API，敲命令不会有任何响应，属于不可用入口。
+			"connect":       fmt.Sprintf("tail -f %s", shellQuote(logPath)),
+			"console_log":   logPath,
+			"guest_ip":      d.GuestIP(vmUUID),
+			"read_only":     true,
+			"console_error": "Firecracker 串口为只读日志；交互式访问请通过实例 SSH（或使用主机终端）",
+			"password":      "",
 		}}, nil
 }
 

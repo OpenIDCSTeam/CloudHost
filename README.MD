@@ -52,7 +52,7 @@ OpenIDC-Client是一个开源的IDC（Internet Data Center）虚拟化统一管�
 | Windows Hypervisor | ✅ 已实现 | Windows               | x86_64        |
 | Oracle Virtual Box | 🚧 开发中 | Windows, Linux        | x86_64, ARM64 |
 | QEMU & KVM Machine | 🚧 开发中 | Windows, Linux, macOS | x86_64, ARM64 |
-| MEmu Game Emulator | 🚧 开发中 | Windows               | x86_64        |
+| MEmu Game Emulator | ✅ 已实现 | Windows               | x86_64        |
 
 #### 功能支持
 
@@ -153,15 +153,16 @@ sudo installer -pkg BuildCache/OpenIDCS-HostAgent-1.0.0-macos-arm64.pkg -target 
 
 ### 访问后端
 
-1. **登录系统**: 打开浏览器访问: http://localhost:1881
-2. **添加主机**: 进入"主机管理"添加VMware Workstation等主机
-3. **配置网络**: 设置IP地址池和NAT规则
-4. **创建用户**: 为团队成员创建账户并分配权限
-5. **开始管理**: 创建和管理您的虚拟机
+1. **初始化系统**: 打开浏览器访问 http://localhost:1881，首次访问会进入初始化页面，设置系统标题与管理员密码
+2. **登录系统**: 使用用户名 `admin` 与刚设置的密码登录
+3. **添加主机**: 进入"主机管理"添加VMware Workstation等主机
+4. **配置网络**: 设置IP地址池和NAT规则
+5. **创建用户**: 为团队成员创建账户并分配权限
+6. **开始管理**: 创建和管理您的虚拟机
 
 注意：
-- 首次启动会自动生成访问Token，请查看控制台输出
-- 使用Token登录或创建管理员账户
+- 首次启动会自动生成 API Token，请查看控制台输出；该 Token 仅用于 API / CLI / 插件调用，Web 登录请使用账号密码
+- 系统标题与管理员密码在初始化页面设置
 
 ---
 

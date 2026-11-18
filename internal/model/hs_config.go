@@ -10,6 +10,11 @@ type OSConfig struct {
 	SysSize string `json:"sys_size"` // 允许最低磁盘值(GB)
 	SysType string `json:"sys_type"` // WinNT/Linux/macOS
 	SysFlag bool   `json:"sys_flag"` // 是否启用此镜像
+	// DiskBus 系统盘控制器（sata/scsi/ide），留空按镜像扩展名推断：
+	// .vhd/.vhdx → sata，.vmdk → scsi。
+	// 必须与镜像制作时使用的控制器一致：Windows 精简镜像通常只保留安装时的
+	// 存储驱动，控制器选错会在开机时报 INACCESSIBLE_BOOT_DEVICE(0x7B) 蓝屏。
+	DiskBus string `json:"disk_bus,omitempty"`
 }
 
 // HSConfig 主机配置
@@ -57,26 +62,73 @@ type HSConfig struct {
 	RelayAddr string `json:"relay_addr" db:"relay_addr"` // 中转地址，留空取 public_addr[0]
 	VncIP     string `json:"vnc_ip" db:"vnc_ip"`         // VNC 连接目标 IP，留空取平台地址
 	VncWan    string `json:"vnc_wan" db:"vnc_wan"`       // VNC 对外地址（如 vnc.example.com:6080）
+	// 允许改配：allow=允许（默认），deny=禁止。
+	// 禁止后该主机下所有虚拟机不接受配置变更（CPU/内存/带宽/网卡等），
+	// 仅管理操作（开机、关机、重装、改密）不受影响。
+	AllowReconfigure string `json:"allow_reconfigure" db:"allow_reconfigure"`
+	// DisabledTabs 功能控制：被禁用的虚拟机详情选项卡 key。
+	//
+	// 这里只记录「管理员显式关闭」的项，平台本身不支持的能力由
+	// driver.EngineMeta.TabLock 决定，两者取并集后才是前端实际隐藏的选项卡。
+	DisabledTabs []string `json:"disabled_tabs"`
+	// LinkPermission 链接权限：生成访问密钥 / 访问链接时的默认权限掩码（16 位）。
+	//
+	// 0 表示使用内置默认（model.VirtualUserMask，35287）。
+	// 权限管理（用户权限）永远不开放给链接，避免用链接自建用户绕过限制。
+	LinkPermission int `json:"link_permission" db:"link_permission"`
 	// 套餐划分
 	ServerPlan map[string]*VMConfig `json:"server_plan"` // 套餐配置
 	// 售价配置
 	NCpuPrice float64 `json:"n_cpu_price" db:"n_cpu_price"` // 处理器核心单价
 	NMemPrice float64 `json:"n_mem_price" db:"n_mem_price"` // 虚拟机内存单价
-	NHddPrice float64 `json:"n_hdd_price" db:"n_hdd_price"` // 虚拟机硬盘单价
-	NNetPrice float64 `json:"n_net_price" db:"n_net_price"` // 虚拟机带宽单价
+	NHddPrice float64 `json:"n_hdd_price" db:"n_hdd_price"` // 虚拟机系统盘单价
+	// NDatPrice 数据盘单价（按容量）
+	NDatPrice float64 `json:"n_dat_price" db:"n_dat_price"`
+	// NSpeedUPrice / NSpeedDPrice 上/下行带宽单价（按 Mbps）。
+	// 旧字段 NNetPrice 仅作历史兼容保留，界面已拆成上下行两项。
+	NSpeedUPrice float64 `json:"n_speed_u_price" db:"n_speed_u_price"`
+	NSpeedDPrice float64 `json:"n_speed_d_price" db:"n_speed_d_price"`
+	// NFluPrice 流量单价（每 GB）
+	NFluPrice float64 `json:"n_flu_price" db:"n_flu_price"`
+	// NNatPrice NAT 端口单价（按个）
+	NNatPrice float64 `json:"n_nat_price" db:"n_nat_price"`
+	// NWebPrice 反向代理单价（按个）
+	NWebPrice float64 `json:"n_web_price" db:"n_web_price"`
+	// NBakPrice 备份单价（按个）
+	NBakPrice float64 `json:"n_bak_price" db:"n_bak_price"`
+	// NIp4Price / NIp6Price 公网 IPv4 / IPv6 单价（按个）
+	NIp4Price float64 `json:"n_ip4_price" db:"n_ip4_price"`
+	NIp6Price float64 `json:"n_ip6_price" db:"n_ip6_price"`
+	// NNetPrice 旧版「虚拟机带宽单价」，已由上下行拆分替代；保留仅用于兼容历史配置
+	NNetPrice float64 `json:"n_net_price" db:"n_net_price"`
+}
+
+// 允许改配取值
+const (
+	AllowReconfigureYes = "allow" // 允许改配（默认）
+	AllowReconfigureNo  = "deny"  // 禁止改配
+)
+
+// VMTabKeys 虚拟机详情中可被「功能控制」关闭的选项卡。
+// 顺序与前端 VM_DETAIL_TAB_OPTIONS 保持一致。
+var VMTabKeys = []string{
+	"ip", "hdd", "iso", "nat", "firewall", "proxy",
+	"pci", "usb", "snapshot", "backup", "efi", "owners",
 }
 
 // NewHSConfig 创建默认主机配置
 func NewHSConfig() *HSConfig {
 	return &HSConfig{
-		ServerPort: 22,
-		IPAddrDDNS: []string{"119.29.29.29", "223.5.5.5"},
-		SystemMaps: []OSConfig{},
-		ImagesMaps: []OSConfig{},
-		IPAddrMaps: make(map[string]map[string]interface{}),
-		PublicAddr: []string{},
-		ExtendData: make(map[string]interface{}),
-		ServerPlan: make(map[string]*VMConfig),
+		ServerPort:       22,
+		IPAddrDDNS:       []string{"119.29.29.29", "223.5.5.5"},
+		SystemMaps:       []OSConfig{},
+		ImagesMaps:       []OSConfig{},
+		IPAddrMaps:       make(map[string]map[string]interface{}),
+		PublicAddr:       []string{},
+		ExtendData:       make(map[string]interface{}),
+		ServerPlan:       make(map[string]*VMConfig),
+		AllowReconfigure: AllowReconfigureYes,
+		DisabledTabs:     []string{},
 	}
 }
 
@@ -107,7 +159,52 @@ func HSConfigFromJSON(data []byte) (*HSConfig, error) {
 	if cfg.ServerPlan == nil {
 		cfg.ServerPlan = make(map[string]*VMConfig)
 	}
+	if cfg.DisabledTabs == nil {
+		cfg.DisabledTabs = []string{}
+	}
+	// 只保留已知的选项卡 key，避免脏数据/拼写错误导致「关了但没生效」
+	if len(cfg.DisabledTabs) > 0 {
+		known := make(map[string]bool, len(VMTabKeys))
+		for _, key := range VMTabKeys {
+			known[key] = true
+		}
+		cleaned := make([]string, 0, len(cfg.DisabledTabs))
+		seen := make(map[string]bool, len(cfg.DisabledTabs))
+		for _, key := range cfg.DisabledTabs {
+			if known[key] && !seen[key] {
+				seen[key] = true
+				cleaned = append(cleaned, key)
+			}
+		}
+		cfg.DisabledTabs = cleaned
+	}
+	switch cfg.AllowReconfigure {
+	case AllowReconfigureYes, AllowReconfigureNo:
+	default:
+		cfg.AllowReconfigure = AllowReconfigureYes
+	}
+	// 链接权限属于受限凭据：非法值（越界/负数）一律回落到内置默认，
+	// 避免脏数据把链接权限放大到全量。
+	if cfg.LinkPermission < 0 || cfg.LinkPermission > 0xFFFF {
+		cfg.LinkPermission = 0
+	}
 	return cfg, nil
+}
+
+// ReconfigureAllowed 主机是否允许修改虚拟机配置
+func (c *HSConfig) ReconfigureAllowed() bool {
+	return c == nil || c.AllowReconfigure != AllowReconfigureNo
+}
+
+// LinkUserMask 返回访问密钥 / 访问链接使用的权限掩码。
+//
+// 未配置（0）时使用内置 VirtualUserMask；配置后强制剔除「用户权限管理」——
+// 链接一旦能管理用户，就等于可以再签发新凭据，绕过链接权限本身。
+func (c *HSConfig) LinkUserMask() UserMask {
+	if c == nil || c.LinkPermission == 0 {
+		return VirtualUserMask()
+	}
+	return UserMaskFromBits(c.LinkPermission)
 }
 
 // HWStatus 硬件状态。

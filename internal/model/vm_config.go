@@ -589,12 +589,39 @@ type VMConfig struct {
 	HddPrc float64 `json:"hdd_prc"` // 虚拟机硬盘单位价格
 	NetPrc float64 `json:"net_prc"` // 虚拟机双向带宽价格
 	// 网络配置
-	SpeedU int   `json:"speed_u"` // 上行带宽(Mbps)
-	SpeedD int   `json:"speed_d"` // 下行带宽(Mbps)
-	NatNum int   `json:"nat_num"` // 分配端口数
-	WebNum int   `json:"web_num"` // 分配代理数
-	FluNum int   `json:"flu_num"` // 分配流量(MB)
-	FluRst []int `json:"flu_rst"` // 流量重置配置[天数,超限MB,上次重置时间戳]
+	SpeedU int `json:"speed_u"` // 上行带宽(Mbps)
+	SpeedD int `json:"speed_d"` // 下行带宽(Mbps)
+	NatNum int `json:"nat_num"` // 分配端口数
+	WebNum int `json:"web_num"` // 分配代理数
+	// ===== 网络配额 =====
+	//
+	// 用指针区分「未配置」与「配置为 0」：
+	//   nil → 未配置，不限制（历史数据、自由配置的虚拟机）
+	//   0   → 明确不允许（例如不允许公网 IPv6）
+	//   >0  → 数量上限
+	//
+	// 一个地址占用一张同侧网卡：公网网卡数 = max(公网V4, 公网V6)，内网同理，
+	// 因此 NicNum 必须覆盖两侧网卡数之和，由 CheckNetQuota 统一校验。
+	NicNum *int `json:"nic_num,omitempty"` // 最大网卡数量（公网 + 内网）
+	Ip4Pub *int `json:"ip4_pub,omitempty"` // 公网 IPv4 地址数量上限
+	Ip4Pri *int `json:"ip4_pri,omitempty"` // 内网 IPv4 地址数量上限
+	Ip6Pub *int `json:"ip6_pub,omitempty"` // 公网 IPv6 地址数量上限
+	Ip6Pri *int `json:"ip6_pri,omitempty"` // 内网 IPv6 地址数量上限
+	// ===== 流量控制 =====
+	//
+	// 计费方向、重置规则、超限后带宽属于「套餐/虚拟机」本身的策略；
+	// 上次重置时间戳则跟随单台虚拟机（FluLastRst），主机套餐里不设置它。
+	FluNum     int    `json:"flu_num"`     // 分配流量(MB)
+	FluBillDir string `json:"flu_bill_dir"` // 计费方向：up=上行 down=下行 both=上下行（默认）
+	FluRstMode string `json:"flu_rst_mode"` // 重置模式：interval=每隔N天/周/月/年 calendar=每月X号/每周周X/每天X时
+	FluRstUnit string `json:"flu_rst_unit"` // 重置单位：interval 取 day/week/month/year；calendar 取 month/week/day
+	FluRstNum  int    `json:"flu_rst_num"`  // interval 的间隔数量；calendar 的日期(1-31)/周几(1-7)/小时(0-23)
+	FluOverU   int    `json:"flu_over_u"`   // 超限后上行带宽(Mbps)，0 表示不额外限速
+	FluOverD   int    `json:"flu_over_d"`   // 超限后下行带宽(Mbps)，0 表示不额外限速
+	FluLastRst int64  `json:"flu_last_rst"` // 上次流量重置时间戳（Unix 秒），跟随虚拟机
+	// FluRst 旧版流量配置[重置天数,超限阈值MB,上次重置时间戳]，仅用于兼容历史数据。
+	// 新数据请使用 FluRstMode/FluRstUnit/FluRstNum/FluOverU/FluOverD/FluLastRst。
+	FluRst []int `json:"flu_rst,omitempty"`
 	// 附加配置
 	NicAll  map[string]NCConfig `json:"nic_all"` // 网卡配置
 	HddAll  map[string]SDConfig `json:"hdd_all"` // 数据盘配置
@@ -617,38 +644,169 @@ type VMConfig struct {
 	ExtData map[string]interface{} `json:"-"` // 驱动扩展数据
 }
 
+// 流量计费方向
+const (
+	FluBillDirUp   = "up"   // 只计上行
+	FluBillDirDown = "down" // 只计下行
+	FluBillDirBoth = "both" // 上下行合计（默认）
+)
+
+// 流量重置模式
+const (
+	// FluRstModeInterval 每隔 N 天/周/月/年重置一次
+	FluRstModeInterval = "interval"
+	// FluRstModeCalendar 每月 X 号 / 每周周 X / 每天 X 时重置一次
+	FluRstModeCalendar = "calendar"
+)
+
+// 流量重置单位
+const (
+	FluUnitHour  = "hour"  // calendar 专用：每天 X 时
+	FluUnitDay   = "day"   // interval 的「天」；calendar 的「每天」
+	FluUnitWeek  = "week"  // interval 的「周」；calendar 的「每周」
+	FluUnitMonth = "month" // interval 的「月」；calendar 的「每月」
+	FluUnitYear  = "year"  // interval 的「年」
+)
+
 // NewVMConfig 创建默认虚拟机配置
 func NewVMConfig() *VMConfig {
 	return &VMConfig{
-		VmFlag:  VMPowerUnknown,
-		VcPort:  randomVNCPort(),
-		CpuNum:  2,
-		MemNum:  2048,
-		HddNum:  8192,
-		HddIop:  1000,
-		BakNum:  1,
-		IsoNum:  1,
-		DatNum:  1,
-		SpeedU:  100,
-		SpeedD:  100,
-		NatNum:  100,
-		WebNum:  100,
-		FluNum:  102400,
-		FluRst:  []int{31, 10, 10},
-		NicAll:  make(map[string]NCConfig),
-		HddAll:  make(map[string]SDConfig),
-		IsoAll:  make(map[string]IMConfig),
-		PciAll:  make(map[string]VFConfig),
-		UsbAll:  make(map[string]USBInfos),
-		EfiAll:  []BootOpts{},
-		NatAll:  []PortData{},
-		WebAll:  []WebProxy{},
-		Backups: []VMBackup{},
+		VmFlag:     VMPowerUnknown,
+		VcPort:     randomVNCPort(),
+		CpuNum:     2,
+		MemNum:     2048,
+		HddNum:     8192,
+		HddIop:     1000,
+		BakNum:     1,
+		IsoNum:     1,
+		DatNum:     1,
+		SpeedU:     100,
+		SpeedD:     100,
+		NatNum:     100,
+		WebNum:     100,
+		FluNum:     102400,
+		FluBillDir: FluBillDirBoth,
+		// 默认每月 1 号重置，与前端「添加套餐」的默认值一致
+		FluRstMode: FluRstModeCalendar,
+		FluRstUnit: FluUnitMonth,
+		FluRstNum:  1,
+		NicAll:     make(map[string]NCConfig),
+		HddAll:     make(map[string]SDConfig),
+		IsoAll:     make(map[string]IMConfig),
+		PciAll:     make(map[string]VFConfig),
+		UsbAll:     make(map[string]USBInfos),
+		EfiAll:     []BootOpts{},
+		NatAll:     []PortData{},
+		WebAll:     []WebProxy{},
+		Backups:    []VMBackup{},
 		OwnAll: map[string]UserMask{
 			"admin": FullUserMask(),
 		},
 		ExtData: make(map[string]interface{}),
 	}
+}
+
+// NormalizeTraffic 补齐流量控制字段的默认值。
+//
+// legacyOnly 为 true 表示配置来自旧版数据（没有 flu_rst_mode 等新字段），
+// 此时按旧版 flu_rst = [重置天数, 超限阈值MB, 上次重置时间戳] 迁移：
+// 重置天数 → 每 N 天；上次重置时间戳 → FluLastRst（跟随虚拟机）。
+func (c *VMConfig) NormalizeTraffic(legacyOnly bool) {
+	if c == nil {
+		return
+	}
+	switch c.FluBillDir {
+	case FluBillDirUp, FluBillDirDown, FluBillDirBoth:
+	default:
+		c.FluBillDir = FluBillDirBoth
+	}
+
+	if legacyOnly {
+		if len(c.FluRst) >= 3 && c.FluRst[0] > 0 {
+			// 旧版只有重置天数，迁移成「每 N 天重置」
+			c.FluRstMode = FluRstModeInterval
+			c.FluRstUnit = FluUnitDay
+			c.FluRstNum = c.FluRst[0]
+			if c.FluLastRst == 0 && c.FluRst[2] > 0 {
+				c.FluLastRst = int64(c.FluRst[2])
+			}
+		} else {
+			// 完全没有流量配置：用新默认（每月 1 号重置）
+			c.FluRstMode = FluRstModeCalendar
+			c.FluRstUnit = FluUnitMonth
+			c.FluRstNum = 1
+		}
+	}
+
+	switch c.FluRstMode {
+	case FluRstModeCalendar:
+		switch c.FluRstUnit {
+		case FluUnitDay: // 每天 X 时
+			if c.FluRstNum < 0 || c.FluRstNum > 23 {
+				c.FluRstNum = 0
+			}
+		case FluUnitWeek: // 每周周 X
+			if c.FluRstNum < 1 || c.FluRstNum > 7 {
+				c.FluRstNum = 1
+			}
+		default: // 每月 X 号
+			c.FluRstUnit = FluUnitMonth
+			if c.FluRstNum < 1 || c.FluRstNum > 31 {
+				c.FluRstNum = 1
+			}
+		}
+	case FluRstModeInterval:
+		switch c.FluRstUnit {
+		case FluUnitDay, FluUnitWeek, FluUnitMonth, FluUnitYear:
+		default:
+			c.FluRstUnit = FluUnitDay
+		}
+		if c.FluRstNum < 1 {
+			c.FluRstNum = 1
+		}
+	default:
+		c.FluRstMode = FluRstModeInterval
+		if c.FluRstUnit != FluUnitWeek && c.FluRstUnit != FluUnitMonth && c.FluRstUnit != FluUnitYear {
+			c.FluRstUnit = FluUnitDay
+		}
+		if c.FluRstNum < 1 {
+			c.FluRstNum = 1
+		}
+	}
+
+	if c.FluOverU < 0 {
+		c.FluOverU = 0
+	}
+	if c.FluOverD < 0 {
+		c.FluOverD = 0
+	}
+}
+
+// TrafficResetDesc 返回人类可读的重置规则描述，供日志/审计使用。
+func (c *VMConfig) TrafficResetDesc() string {
+	if c == nil {
+		return ""
+	}
+	if c.FluRstMode == FluRstModeCalendar {
+		switch c.FluRstUnit {
+		case FluUnitDay:
+			return fmt.Sprintf("每天 %d 时重置", c.FluRstNum)
+		case FluUnitWeek:
+			return fmt.Sprintf("每周周%s重置", []string{"", "一", "二", "三", "四", "五", "六", "日"}[min(max(c.FluRstNum, 1), 7)])
+		default:
+			return fmt.Sprintf("每月 %d 号重置", c.FluRstNum)
+		}
+	}
+	unit := map[string]string{
+		FluUnitDay:   "天",
+		FluUnitWeek:  "周",
+		FluUnitMonth: "月",
+		FluUnitYear:  "年",
+	}[c.FluRstUnit]
+	if unit == "" {
+		unit = "天"
+	}
+	return fmt.Sprintf("每 %d %s重置", c.FluRstNum, unit)
 }
 
 // randomVNCPort 生成随机VNC端口 5900-6999
@@ -697,9 +855,15 @@ func VMConfigFromJSON(data []byte) (*VMConfig, error) {
 	if cfg.Backups == nil {
 		cfg.Backups = []VMBackup{}
 	}
-	if cfg.FluRst == nil {
-		cfg.FluRst = []int{31, 10, 10}
+	// 判断是否为旧版流量配置：旧数据没有 flu_rst_mode 字段
+	legacyTraffic := true
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err == nil {
+		if _, ok := probe["flu_rst_mode"]; ok {
+			legacyTraffic = false
+		}
 	}
+	cfg.NormalizeTraffic(legacyTraffic)
 	if cfg.ExtData == nil {
 		cfg.ExtData = make(map[string]interface{})
 	}

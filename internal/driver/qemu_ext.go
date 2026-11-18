@@ -10,7 +10,7 @@ package driver
 
 import (
 	"fmt"
-	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -161,7 +161,7 @@ func (d *QEMUDriver) locateHDD(vmUUID string, hdd *model.SDConfig) (target strin
 	if name == "" {
 		return "", ""
 	}
-	return "", filepath.Join(dir, name+".qcow2")
+	return "", pathpkg.Join(dir, name+".qcow2")
 }
 
 // nextFreeVdLetter 返回下一个可用的 vdX 目标名（vdb 起，跳过已占用）
@@ -214,7 +214,7 @@ func (d *QEMUDriver) DeleteHDD(vmUUID string, hddName string) (*model.ZMessage, 
 
 	// 删除真实卷文件（跳过网络/块设备路径）
 	if path != "" && !strings.Contains(path, "://") && !strings.HasPrefix(path, "/dev/") {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		if _, err := d.execHostArgs([]string{"rm", "-f", path}, 15*time.Second); err != nil {
 			return &model.ZMessage{Success: false, Action: "RMMounts",
 				Message: "删除卷文件失败: " + err.Error()}, nil
 		}
@@ -429,12 +429,11 @@ func (d *QEMUDriver) SetupPCI(vmUUID string, cfg *model.VFConfig, pciKey string,
 
 // applyDeviceXML 把设备 XML 写到临时文件后 attach/detach
 func (d *QEMUDriver) applyDeviceXML(vmUUID, kind, xml string, add bool) error {
-	xmlPath := filepath.Join(os.TempDir(),
-		fmt.Sprintf("hostagent-%s-%s-%d.xml", kind, vmUUID, time.Now().UnixNano()))
-	if err := os.WriteFile(xmlPath, []byte(xml), 0644); err != nil {
+	xmlPath := fmt.Sprintf("/tmp/hostagent-%s-%s-%d.xml", kind, vmUUID, time.Now().UnixNano())
+	if err := d.writeHostFile(xmlPath, xml, 0644); err != nil {
 		return fmt.Errorf("写入设备XML失败: %w", err)
 	}
-	defer os.Remove(xmlPath)
+	defer func() { _, _ = d.execHostArgs([]string{"rm", "-f", xmlPath}, 10*time.Second) }()
 
 	action := "attach-device"
 	if !add {

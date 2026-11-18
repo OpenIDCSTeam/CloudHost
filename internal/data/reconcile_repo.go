@@ -262,7 +262,17 @@ type Tombstone struct {
 }
 
 // CreateTombstone 创建删除墓碑（幂等：已存在则保留原有进度）
+//
+// 例外：状态为 done 的墓碑表示上一轮删除已结束。同名虚拟机被重新创建后再删除时，
+// 若沿用这条墓碑（steps 全为 true），整个删除流程会被直接跳过——
+// 平台上明明还在运行，系统却报告删除成功。因此先清掉已完成的墓碑。
 func (d *DB) CreateTombstone(hsName, vmUUID, quotaUser, vmConfig string) error {
+	if prev, err := d.GetTombstone(hsName, vmUUID); err == nil && prev != nil && prev.Status == TombstoneDone {
+		if delErr := d.DeleteTombstone(hsName, vmUUID); delErr != nil {
+			return delErr
+		}
+	}
+
 	now := time.Now().Unix()
 	_, err := d.db.Exec(`INSERT INTO vm_tombstones
 		(hs_name, vm_uuid, status, quota_user, steps, vm_config, last_error, created_at, updated_at)
@@ -272,6 +282,12 @@ func (d *DB) CreateTombstone(hsName, vmUUID, quotaUser, vmConfig string) error {
 			vm_config  = CASE WHEN excluded.vm_config != '' THEN excluded.vm_config ELSE vm_tombstones.vm_config END,
 			updated_at = excluded.updated_at`,
 		hsName, vmUUID, TombstonePending, quotaUser, "{}", vmConfig, now, now)
+	return err
+}
+
+// DeleteTombstone 删除墓碑记录（虚拟机被重新创建时调用）。
+func (d *DB) DeleteTombstone(hsName, vmUUID string) error {
+	_, err := d.db.Exec(`DELETE FROM vm_tombstones WHERE hs_name = ? AND vm_uuid = ?`, hsName, vmUUID)
 	return err
 }
 

@@ -227,14 +227,15 @@ EOF
     local ip token
     ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
     token="$(journalctl -u "${SERVICE_NAME}" -n 80 --no-pager 2>/dev/null \
-        | grep -o 'Bearer Token: .*' | tail -1 | sed 's/Bearer Token: //' || true)"
+        | grep -oE '(API|Bearer) Token: .*' | tail -1 | sed -E 's/(API|Bearer) Token: //' || true)"
 
     echo ""
     echo -e "${GREEN}OpenIDCS HostAgent 安装完成${NC}"
     echo -e "  安装目录: ${CYAN}${PREFIX}${NC}"
     echo -e "  数据目录: ${CYAN}${DATA_DIR}${NC}"
     echo -e "  访问地址: ${CYAN}http://${ip:-127.0.0.1}:${PORT}${NC}"
-    [[ -n "${token}" ]] && echo -e "  初始 Token: ${CYAN}${token}${NC}"
+    [[ -n "${token}" ]] && echo -e "  API Token: ${CYAN}${token}${NC}"
+    echo -e "  首次使用: 打开访问地址，按页面提示创建管理员密码与系统标题"
     echo ""
     echo -e "常用命令: ${CYAN}systemctl {status|restart|stop} ${SERVICE_NAME}${NC}"
     echo -e "查看日志: ${CYAN}journalctl -u ${SERVICE_NAME} -f${NC}"

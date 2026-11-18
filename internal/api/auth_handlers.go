@@ -53,7 +53,6 @@ func (app *App) handleLogin(c *gin.Context) {
 
 	var req struct {
 		LoginType string `json:"login_type"`
-		Token     string `json:"token"`
 		Username  string `json:"username"`
 		Password  string `json:"password"`
 		// AccessKey 虚拟机访问密钥（16 位字母数字）
@@ -72,80 +71,61 @@ func (app *App) handleLogin(c *gin.Context) {
 	}
 
 	var userInfo map[string]interface{}
-	var isTokenLogin bool
 
-	if req.LoginType == "token" {
-		// Token登录
-		sysToken := app.SystemSvc.GetToken()
-		if req.Token == "" || req.Token != sysToken {
-			auth.RecordLoginFailure(ip)
-			app.Logger.Event("auth", "用户登录").IP(ip).
-				Detail("login_type", "token").
-				Detail("reason", "invalid_token").
-				Warn("Token 登录失败：凭据无效")
-			utils.Fail(c, 401, "Token无效")
-			return
-		}
-		isTokenLogin = true
-		userInfo = map[string]interface{}{
-			"id": 1, "username": "admin", "is_admin": true,
-			"assigned_hosts": []string{},
-		}
-	} else {
-		// 用户名密码登录
-		if req.Username == "" || req.Password == "" {
-			utils.BadRequest(c, "用户名和密码不能为空")
-			return
-		}
-		user, err := app.DB.GetUserByUsername(req.Username)
-		if err != nil || user == nil {
-			auth.RecordLoginFailure(ip)
+	// 用户名密码登录。
+	// 系统 Token 只用于 API 的 Bearer 认证，不再作为 Web 登录方式。
+	if req.Username == "" || req.Password == "" {
+		utils.BadRequest(c, "用户名和密码不能为空")
+		return
+	}
+	user, err := app.DB.GetUserByUsername(req.Username)
+	if err != nil || user == nil {
+		auth.RecordLoginFailure(ip)
+		app.Logger.Event("auth", "用户登录").User(req.Username).IP(ip).
+			Detail("login_type", "password").
+			Detail("reason", "user_not_found").
+			Warn("登录失败：用户名或密码错误")
+		utils.Fail(c, 401, "用户名或密码错误")
+		return
+	}
+	// 检查账号是否启用
+	if !model.SafeGetBool(user, "is_active") {
+		app.Logger.Event("auth", "用户登录").User(req.Username).IP(ip).
+			Detail("login_type", "password").
+			Detail("reason", "account_disabled").
+			Warn("登录失败：账号已被禁用")
+		utils.Fail(c, 401, "账号已被禁用")
+		return
+	}
+	// 检查邮箱验证状态
+	settings, _ := app.SystemSvc.GetSettings()
+	if settings["email_verification_enabled"] == "1" {
+		if !model.SafeGetBool(user, "email_verified") {
 			app.Logger.Event("auth", "用户登录").User(req.Username).IP(ip).
 				Detail("login_type", "password").
-				Detail("reason", "user_not_found").
-				Warn("登录失败：用户名或密码错误")
-			utils.Fail(c, 401, "用户名或密码错误")
+				Detail("reason", "email_unverified").
+				Warn("登录失败：邮箱未验证")
+			utils.Fail(c, 403, "请先验证邮箱后再登录")
 			return
 		}
-		// 检查账号是否启用
-		if !model.SafeGetBool(user, "is_active") {
-			app.Logger.Event("auth", "用户登录").User(req.Username).IP(ip).
-				Detail("login_type", "password").
-				Detail("reason", "account_disabled").
-				Warn("登录失败：账号已被禁用")
-			utils.Fail(c, 401, "账号已被禁用")
-			return
-		}
-		// 检查邮箱验证状态
-		settings, _ := app.SystemSvc.GetSettings()
-		if settings["email_verification_enabled"] == "1" {
-			if !model.SafeGetBool(user, "email_verified") {
-				app.Logger.Event("auth", "用户登录").User(req.Username).IP(ip).
-					Detail("login_type", "password").
-					Detail("reason", "email_unverified").
-					Warn("登录失败：邮箱未验证")
-				utils.Fail(c, 403, "请先验证邮箱后再登录")
-				return
-			}
-		}
-		// 验证密码
-		password := model.SafeGetString(user, "password")
-		if !auth.CheckPassword(req.Password, password) {
-			auth.RecordLoginFailure(ip)
-			app.Logger.Event("auth", "用户登录").User(req.Username).IP(ip).
-				Detail("login_type", "password").
-				Detail("reason", "invalid_credential").
-				Warn("登录失败：用户名或密码错误")
-			utils.Fail(c, 401, "用户名或密码错误")
-			return
-		}
-		userInfo = user
-		// 更新最后登录时间。写库失败不影响本次登录，但必须留痕：
-		// 静默吞掉后「最后登录时间」长期不更新时无从排查。
-		if loginErr := app.DB.UpdateUserLastLogin(req.Username); loginErr != nil {
-			app.Logger.Event("auth", "用户登录").User(req.Username).IP(ip).
-				Err(loginErr).Warn("更新最后登录时间失败")
-		}
+	}
+	// 验证密码
+	password := model.SafeGetString(user, "password")
+	if !auth.CheckPassword(req.Password, password) {
+		auth.RecordLoginFailure(ip)
+		app.Logger.Event("auth", "用户登录").User(req.Username).IP(ip).
+			Detail("login_type", "password").
+			Detail("reason", "invalid_credential").
+			Warn("登录失败：用户名或密码错误")
+		utils.Fail(c, 401, "用户名或密码错误")
+		return
+	}
+	userInfo = user
+	// 更新最后登录时间。写库失败不影响本次登录，但必须留痕：
+	// 静默吞掉后「最后登录时间」长期不更新时无从排查。
+	if loginErr := app.DB.UpdateUserLastLogin(req.Username); loginErr != nil {
+		app.Logger.Event("auth", "用户登录").User(req.Username).IP(ip).
+			Err(loginErr).Warn("更新最后登录时间失败")
 	}
 
 	// 重置登录失败计数
@@ -155,14 +135,8 @@ func (app *App) handleLogin(c *gin.Context) {
 	session := sessions.Default(c)
 	username := model.SafeGetString(userInfo, "username")
 	session.Set(auth.SessionKeyUser, username)
-	if isTokenLogin {
-		// Token 登录没有对应用户口令，单独打标；
-		// 若按口令标记校验，该会话会在下一次请求被判为失效。
-		session.Set(auth.SessionKeyTokenLogin, true)
-	} else {
-		// 记录口令标记，口令变更后该会话自动失效
-		session.Set(auth.SessionKeyPasswordTag, auth.PasswordTag(model.SafeGetString(userInfo, "password")))
-	}
+	// 记录口令标记，口令变更后该会话自动失效
+	session.Set(auth.SessionKeyPasswordTag, auth.PasswordTag(model.SafeGetString(userInfo, "password")))
 	if err := session.Save(); err != nil {
 		app.Logger.Event("auth", "用户登录").User(username).IP(ip).Err(err).
 			Errorf("登录会话保存失败：%v", err)
@@ -170,12 +144,8 @@ func (app *App) handleLogin(c *gin.Context) {
 		return
 	}
 
-	loginType := "password"
-	if isTokenLogin {
-		loginType = "token"
-	}
 	app.Logger.Event("auth", "用户登录").User(username).IP(ip).
-		Detail("login_type", loginType).
+		Detail("login_type", "password").
 		Detail("is_admin", isAdminUser(userInfo)).
 		Info("用户 %s 登录成功", username)
 
@@ -190,18 +160,10 @@ func (app *App) handleLogin(c *gin.Context) {
 	loginUser := sanitizeUser(userInfo)
 	// 全局配额开关：前端据此隐藏配额相关的录入与展示
 	loginUser["quota_enabled"] = app.SystemSvc.QuotaEnabled()
-	respData := gin.H{
+	utils.Success(c, gin.H{
 		"redirect":  redirect,
 		"user_info": loginUser,
-		"is_token":  isTokenLogin,
-	}
-	// Token登录时，将Bearer Token返回给前端存入localStorage，用于后续认证
-	// 这样即使Session Cookie有问题，Bearer Token认证仍可正常工作
-	if isTokenLogin {
-		respData["token"] = app.SystemSvc.GetToken()
-	}
-
-	utils.Success(c, respData)
+	})
 }
 
 // handleLogout POST /api/logout

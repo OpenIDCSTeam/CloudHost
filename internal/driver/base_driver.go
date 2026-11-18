@@ -505,6 +505,12 @@ func (b *BaseDriver) GetScreenshot(vmUUID string) (string, error) {
 	return "", nil
 }
 
+// SetDiskBus 切换系统盘控制器（默认不支持，子类按平台能力覆盖）
+func (b *BaseDriver) SetDiskBus(vmUUID string, bus string) (*model.ZMessage, error) {
+	return &model.ZMessage{Success: false, Action: "VMDiskBus",
+		Message: "当前平台不支持切换磁盘控制器"}, nil
+}
+
 // GetOSImages 获取OS镜像列表（默认返回主机配置中的光盘镜像列表）
 func (b *BaseDriver) GetOSImages() (map[string]interface{}, error) {
 	result := make(map[string]interface{})

@@ -35,6 +35,10 @@ type HostDriver interface {
 	// GetScreenshot 获取虚拟机截图（返回base64）
 	GetScreenshot(vmUUID string) (string, error)
 
+	// SetDiskBus 切换系统盘控制器（sata/scsi/ide），
+	// 用于镜像与控制器不匹配导致的开机蓝屏修复
+	SetDiskBus(vmUUID string, bus string) (*model.ZMessage, error)
+
 	// GetStatus 获取主机状态
 	GetStatus() (*model.HWStatus, error)
 
@@ -195,12 +199,18 @@ func createDriver(cfg *model.HSConfig) HostDriver {
 	}
 }
 
-// PowerStatusMap 电源状态中文映射
+// PowerStatusMap 电源状态中文映射。
+// 中间态（启动中/关闭中/暂停中/重启中）必须一并映射：vmrest 等平台会返回
+// poweringOn/resetting 这类瞬时状态，缺映射时会被当成「未知」写回前端。
 var PowerStatusMap = map[string]model.VMPowers{
 	"运行中": model.VMPowerStarted,
 	"已关机": model.VMPowerStopped,
 	"已停止": model.VMPowerStopped,
 	"已暂停": model.VMPowerSuspend,
+	"启动中": model.VMPowerOnOpen,
+	"关闭中": model.VMPowerOnStop,
+	"暂停中": model.VMPowerOnSave,
+	"重启中": model.VMPowerOnWake,
 	"未知":  model.VMPowerUnknown,
 	"":    model.VMPowerUnknown,
 }

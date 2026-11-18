@@ -10,14 +10,12 @@ import (
 	"time"
 
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/model"
-	"github.com/OpenIDCSTeam/HostAgent-Go/internal/security"
 )
 
-// execLXC 执行 lxc 命令
+// execLXC 执行 lxc 命令（远程主机通过 SSH 在远端执行）
 func (d *LXDDriver) execLXC(args ...string) (string, error) {
 	full := append([]string{"lxc"}, args...)
-	out, _, err := security.SafeExecWithTimeout(full, 10*time.Minute)
-	return out, err
+	return d.execHostArgs(full, 10*time.Minute)
 }
 
 // lxdInstance lxc list JSON 条目
@@ -326,7 +324,7 @@ func (d *LXDDriver) SetPassword(vmUUID string, password string) (*model.ZMessage
 	}
 	d.mu.RUnlock()
 
-	out, err := runWithStdin(
+	out, err := d.execHostProc(
 		[]string{"lxc", "exec", vmUUID, "--", "chpasswd"},
 		user+":"+password+"\n", 30*time.Second)
 	if err != nil {

@@ -28,14 +28,8 @@ type sshExecResult struct {
 	ExitCode int
 }
 
-// RunSSHCommand 通过 SSH 执行一条命令（阻塞至执行结束）
-//
-// 用于需要在 PVE 节点上执行 qm 等命令行工具的场景：
-// Proxmox 的 REST API 无法执行任意 shell 命令，远程模式下必须走 SSH。
-func RunSSHCommand(cfg SSHExecConfig, cmd string) (*sshExecResult, error) {
-	if strings.TrimSpace(cfg.Host) == "" {
-		return nil, fmt.Errorf("SSH 主机地址为空")
-	}
+// normalizeSSHExecConfig 填充 SSH 执行参数的默认值
+func normalizeSSHExecConfig(cfg *SSHExecConfig) {
 	if cfg.Port <= 0 {
 		cfg.Port = 22
 	}
@@ -45,6 +39,14 @@ func RunSSHCommand(cfg SSHExecConfig, cmd string) (*sshExecResult, error) {
 	if strings.TrimSpace(cfg.User) == "" {
 		cfg.User = "root"
 	}
+}
+
+// dialSSHClient 建立 SSH 连接（调用方负责关闭）
+func dialSSHClient(cfg SSHExecConfig) (*ssh.Client, error) {
+	if strings.TrimSpace(cfg.Host) == "" {
+		return nil, fmt.Errorf("SSH 主机地址为空")
+	}
+	normalizeSSHExecConfig(&cfg)
 
 	clientCfg := &ssh.ClientConfig{
 		User: cfg.User,
@@ -69,6 +71,32 @@ func RunSSHCommand(cfg SSHExecConfig, cmd string) (*sshExecResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("SSH 连接 %s 失败: %w", addr, err)
 	}
+	return conn, nil
+}
+
+// RunSSHCommand 通过 SSH 执行一条命令（阻塞至执行结束）
+//
+// 用于需要在 PVE 节点上执行 qm 等命令行工具的场景：
+// Proxmox 的 REST API 无法执行任意 shell 命令，远程模式下必须走 SSH。
+func RunSSHCommand(cfg SSHExecConfig, cmd string) (*sshExecResult, error) {
+	return RunSSHCommandInput(cfg, cmd, "")
+}
+
+// RunSSHCommandInput 通过 SSH 执行命令，并把 stdin 内容写入远端进程标准输入。
+//
+// 容器平台改密（chpasswd）等场景需要管道输入，远程主机必须支持 stdin，
+// 否则只能退化为「无输入执行」，chpasswd 会因读不到数据而失败。
+func RunSSHCommandInput(cfg SSHExecConfig, cmd string, stdin string) (*sshExecResult, error) {
+	if strings.TrimSpace(cfg.Host) == "" {
+		return nil, fmt.Errorf("SSH 主机地址为空")
+	}
+	normalizeSSHExecConfig(&cfg)
+	timeout := cfg.Timeout
+
+	conn, err := dialSSHClient(cfg)
+	if err != nil {
+		return nil, err
+	}
 	defer conn.Close()
 
 	session, err := conn.NewSession()
@@ -80,6 +108,9 @@ func RunSSHCommand(cfg SSHExecConfig, cmd string) (*sshExecResult, error) {
 	var stdout, stderr bytes.Buffer
 	session.Stdout = &stdout
 	session.Stderr = &stderr
+	if stdin != "" {
+		session.Stdin = strings.NewReader(stdin)
+	}
 
 	done := make(chan error, 1)
 	go func() {
@@ -101,10 +132,10 @@ func RunSSHCommand(cfg SSHExecConfig, cmd string) (*sshExecResult, error) {
 		}
 		return res, nil
 
-	case <-time.After(cfg.Timeout):
+	case <-time.After(timeout):
 		_ = session.Signal(ssh.SIGKILL)
 		_ = session.Close()
-		return nil, fmt.Errorf("SSH 命令执行超时（%s）: %s", cfg.Timeout, cmd)
+		return nil, fmt.Errorf("SSH 命令执行超时（%s）: %s", timeout, cmd)
 	}
 }
 
@@ -118,7 +149,7 @@ func sshConfigFromHS(cfg *model.HSConfig) SSHExecConfig {
 		port = 22
 	}
 	return SSHExecConfig{
-		Host:     cfg.ServerAddr,
+		Host:     stripSSHScheme(cfg.ServerAddr),
 		Port:     port,
 		User:     cfg.ServerUser,
 		Password: cfg.ServerPass,

@@ -283,6 +283,31 @@ func (app *App) handleVMCreate(c *gin.Context) {
 	if v, ok := req["speed_d"]; ok {
 		cfg.SpeedD = toIntVal(v)
 	}
+	// 流量控制（手动创建时由前端表单提交；套餐模式下会被套餐值覆盖）
+	if v, ok := req["flu_num"]; ok {
+		cfg.FluNum = toIntVal(v)
+	}
+	if v, ok := req["flu_bill_dir"].(string); ok && v != "" {
+		cfg.FluBillDir = v
+	}
+	if v, ok := req["flu_rst_mode"].(string); ok && v != "" {
+		cfg.FluRstMode = v
+	}
+	if v, ok := req["flu_rst_unit"].(string); ok && v != "" {
+		cfg.FluRstUnit = v
+	}
+	if v, ok := req["flu_rst_num"]; ok {
+		cfg.FluRstNum = toIntVal(v)
+	}
+	if v, ok := req["flu_over_u"]; ok {
+		cfg.FluOverU = toIntVal(v)
+	}
+	if v, ok := req["flu_over_d"]; ok {
+		cfg.FluOverD = toIntVal(v)
+	}
+	if v, ok := req["flu_last_rst"]; ok {
+		cfg.FluLastRst = int64(toIntVal(v))
+	}
 
 	// 系统账号与密码：原实现完全没有解析这两个字段，
 	// 创建出来的虚拟机 os_pass / vc_pass 恒为空，
@@ -373,9 +398,40 @@ func (app *App) handleVMCreate(c *gin.Context) {
 		cfg.NatNum = plan.NatNum
 		cfg.WebNum = plan.WebNum
 		cfg.FluNum = plan.FluNum
-		if plan.FluRst != nil {
-			cfg.FluRst = plan.FluRst
+		// 流量策略随套餐下发；上次重置时间戳跟随虚拟机，创建时从当下开始计
+		cfg.FluBillDir = plan.FluBillDir
+		cfg.FluRstMode = plan.FluRstMode
+		cfg.FluRstUnit = plan.FluRstUnit
+		cfg.FluRstNum = plan.FluRstNum
+		cfg.FluOverU = plan.FluOverU
+		cfg.FluOverD = plan.FluOverD
+		cfg.NormalizeTraffic(strings.TrimSpace(plan.FluRstMode) == "")
+		// 网络配额随套餐下发：网卡总数与公网/内网 V4/V6 地址上限
+		cfg.CopyNetQuotaFrom(plan)
+	}
+	// 兼容旧接入方（如 WHMCS 插件）仍提交 flu_rst=[重置天数, 限速Mbps, 上次重置]：
+	// 没有 flu_rst_mode 时按旧格式迁移成「每 N 天重置」
+	if _, hasNewTraffic := req["flu_rst_mode"]; !hasNewTraffic {
+		if arr, ok := req["flu_rst"].([]interface{}); ok && len(arr) >= 3 {
+			legacy := make([]int, 0, len(arr))
+			for _, it := range arr {
+				legacy = append(legacy, toIntVal(it))
+			}
+			cfg.FluRst = legacy
+			cfg.NormalizeTraffic(true)
 		}
+	}
+	cfg.NormalizeTraffic(strings.TrimSpace(cfg.FluRstMode) == "")
+	// 新建虚拟机统一从创建时刻起算流量周期
+	if cfg.FluLastRst == 0 {
+		cfg.FluLastRst = time.Now().Unix()
+	}
+
+	// 网络配额：网卡总数不能超过套餐的最大网卡数量，
+	// 公网/内网各自的 V4、V6 地址总数不能超过对应上限。
+	if err := cfg.CheckNetQuota(); err != nil {
+		utils.Fail(c, 400, "超出套餐网络配额: "+err.Error())
+		return
 	}
 
 	// 设置所有者
@@ -385,8 +441,10 @@ func (app *App) handleVMCreate(c *gin.Context) {
 
 	// 创建虚拟用户（用于财务系统临时凭据访问）
 	// 虚拟用户名格式：{hs_name}-{vm_uuid}
+	// 掩码取主机的「链接权限」，未配置时回落到内置默认
 	virtualUser := hsName + "-" + vmUUID
-	cfg.OwnAll[virtualUser] = model.VirtualUserMask()
+	hostCfg, _ := app.HostSvc.GetHost(hsName)
+	cfg.OwnAll[virtualUser] = hostCfg.LinkUserMask()
 
 	d := app.HostSvc.GetDriver(hsName)
 	if d == nil {
@@ -485,6 +543,19 @@ func (app *App) handleVMUpdate(c *gin.Context) {
 		return
 	}
 
+	// 主机级「允许改配」开关：关闭后拒绝一切配置变更（开关机/改密/重装不受影响）
+	hostCfg, cfgErr := app.HostSvc.GetHost(hsName)
+	if cfgErr != nil || hostCfg == nil {
+		utils.NotFound(c, "主机不存在")
+		return
+	}
+	if !hostCfg.ReconfigureAllowed() {
+		app.logEvent(c, "vm", "修改虚拟机配置").Host(hsName).VM(vmUUID, "").
+			Warn("主机已关闭改配，拒绝配置变更：%s/%s", hsName, vmUUID)
+		utils.Fail(c, 403, "该主机已关闭改配，禁止修改虚拟机配置")
+		return
+	}
+
 	oldVM, err := app.loadVMConfig(hsName, vmUUID)
 	if err != nil {
 		utils.NotFound(c, "虚拟机不存在")
@@ -514,9 +585,35 @@ func (app *App) handleVMUpdate(c *gin.Context) {
 	if v, ok := req["speed_d"]; ok {
 		newVM.SpeedD = toIntVal(v)
 	}
+	if v, ok := req["flu_num"]; ok {
+		newVM.FluNum = toIntVal(v)
+	}
+	if v, ok := req["flu_bill_dir"].(string); ok && v != "" {
+		newVM.FluBillDir = v
+	}
+	if v, ok := req["flu_rst_mode"].(string); ok && v != "" {
+		newVM.FluRstMode = v
+	}
+	if v, ok := req["flu_rst_unit"].(string); ok && v != "" {
+		newVM.FluRstUnit = v
+	}
+	if v, ok := req["flu_rst_num"]; ok {
+		newVM.FluRstNum = toIntVal(v)
+	}
+	if v, ok := req["flu_over_u"]; ok {
+		newVM.FluOverU = toIntVal(v)
+	}
+	if v, ok := req["flu_over_d"]; ok {
+		newVM.FluOverD = toIntVal(v)
+	}
+	if v, ok := req["flu_last_rst"]; ok {
+		newVM.FluLastRst = int64(toIntVal(v))
+	}
 	if v, ok := req["os_name"].(string); ok {
 		newVM.OsName = v
 	}
+	// 旧数据的 flu_rst_mode 为空，按旧版 flu_rst 迁移
+	newVM.NormalizeTraffic(strings.TrimSpace(newVM.FluRstMode) == "")
 
 	// 配额校验：扩容场景必须在提交任务前拒绝
 	if err := app.checkQuotaForUser(uc, &newVM); err != nil {
@@ -626,8 +723,16 @@ func (app *App) handleVMDelete(c *gin.Context) {
 		return
 	}
 
+	// 计费归属：PrimaryOwner 会跳过 admin，管理员自建的虚拟机因此拿到空值。
+	// 创建时却按创建人无条件扣减配额（handleVMCreate 用 uc.Username），
+	// 两边不一致会让管理员的用量只增不减。这里在缺主所有者时回填操作者。
+	quotaUser := primaryOwner
+	if quotaUser == "" {
+		quotaUser = uc.Username
+	}
+
 	params, err := marshalTaskParams(map[string]interface{}{
-		taskParamQuotaUser:    primaryOwner,
+		taskParamQuotaUser:    quotaUser,
 		taskParamRemoveBackup: true,
 	})
 	if err != nil {
@@ -833,8 +938,148 @@ func (app *App) handleVMRemote(c *gin.Context) {
 	utils.Success(c, out)
 }
 
+// handleVMConsole 打开容器类平台的命令行控制台（TTY）。
+//
+// Docker / LXD 没有图形帧缓冲，所谓「VNC」实际是进入容器内的 shell；
+// SmolVM（Firecracker）只有串口日志。这里签发一个复用主机 SSH 通道的
+// 终端票据，并附带要执行的命令，前端用 xterm 渲染即可。
+func (app *App) handleVMConsole(c *gin.Context) {
+	hsName := c.Param("hs_name")
+	vmUUID := c.Param("vm_uuid")
+
+	d := app.HostSvc.GetDriver(hsName)
+	if d == nil {
+		utils.NotFound(c, "主机不存在或未启用")
+		return
+	}
+	cfg, err := app.HostSvc.GetHost(hsName)
+	if err != nil || cfg == nil {
+		utils.NotFound(c, "主机不存在")
+		return
+	}
+	if !cfg.EnableHost {
+		utils.BadRequest(c, "主机已禁用，无法打开控制台")
+		return
+	}
+	if !validVMIdent(vmUUID) {
+		utils.BadRequest(c, "虚拟机标识无效")
+		return
+	}
+	if app.SSHTerminal == nil || app.SSHPort <= 0 {
+		utils.BadRequest(c, "终端服务未启动")
+		return
+	}
+	if state := d.GetPower(vmUUID); state != "运行中" {
+		utils.BadRequest(c, "虚拟机未运行，无法打开控制台")
+		return
+	}
+
+	command := ""
+	readOnly := false
+	vmCfg, _ := app.loadVMConfig(hsName, vmUUID)
+	switch cfg.ServerType {
+	case "OCInterface":
+		command = "docker exec -it " + vmUUID + " sh"
+	case "LxContainer":
+		command = "lxc exec " + vmUUID + " -- sh"
+	case "SmolVM":
+		// 优先 SSH 进 guest 提供可交互终端；拿不到地址时退回只读串口日志。
+		guestIP := ""
+		if gp, ok := d.(interface{ GuestIP(string) string }); ok {
+			guestIP = gp.GuestIP(vmUUID)
+		}
+		password := ""
+		if vmCfg != nil {
+			password = vmCfg.OsPass
+		}
+		if guestIP != "" && password != "" {
+			command = fmt.Sprintf(
+				"sshpass -p %s ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 root@%s",
+				shellSingleQuote(password), guestIP)
+		} else {
+			dir := strings.TrimSpace(cfg.ExternPath)
+			if dir == "" {
+				dir = "/var/lib/smolvm"
+			}
+			command = "tail -n 200 -f " + shellSingleQuote(dir+"/"+vmUUID+"/fc.log")
+			readOnly = true
+		}
+	default:
+		utils.BadRequest(c, "当前平台使用图形控制台，请通过远程桌面打开 VNC")
+		return
+	}
+
+	host := strings.TrimSpace(cfg.ServerAddr)
+	if strings.HasPrefix(host, "ssh://") || host == "" || isLocalHostAddr(host) {
+		host = "127.0.0.1"
+	}
+	port := driver.SSHPortForHost(cfg)
+	user := strings.TrimSpace(cfg.ServerUser)
+	if user == "" {
+		user = "root"
+	}
+
+	token, err := randomToken(24)
+	if err != nil {
+		utils.InternalError(c, "生成终端票据失败")
+		return
+	}
+	app.SSHTerminal.RegisterToken(token, &SSHConnInfo{
+		Host:     host,
+		Port:     port,
+		User:     user,
+		Password: cfg.ServerPass,
+		Command:  command,
+	})
+
+	scheme := "ws"
+	if c.Request.TLS != nil {
+		scheme = "wss"
+	}
+	hostOnly := c.Request.Host
+	if h, _, splitErr := net.SplitHostPort(hostOnly); splitErr == nil {
+		hostOnly = h
+	}
+	wsURL := fmt.Sprintf("%s://%s:%d/ws?token=%s", scheme, hostOnly, app.SSHPort, token)
+
+	app.logEvent(c, "vm", "打开控制台").Host(hsName).VM(vmUUID, "").
+		Detail("console", "tty").Info("打开虚拟机命令行控制台：%s/%s", hsName, vmUUID)
+	utils.Success(c, gin.H{
+		"ws_url":    wsURL,
+		"token":     token,
+		"type":      "tty",
+		"command":   command,
+		"read_only": readOnly,
+	})
+}
+
+// validVMIdent 控制台命令会拼接虚拟机标识，只接受安全字符。
+func validVMIdent(s string) bool {
+	if s == "" || len(s) > 128 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// shellSingleQuote 单引号转义，避免路径中的特殊字符进入远端命令。
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // consoleUnavailableReason 说明为什么没有可用的图形控制台地址。
 func consoleUnavailableReason(results map[string]interface{}) string {
+	// 驱动可给出更精确的原因（如缺少扩展包、仅支持 RDP 等）
+	if reason := strOf(results["reason"]); reason != "" {
+		return reason
+	}
 	typ, _ := results["type"].(string)
 	switch strings.ToLower(typ) {
 	case "tty":
@@ -843,6 +1088,13 @@ func consoleUnavailableReason(results map[string]interface{}) string {
 		return "Hyper-V 需使用 VMConnect 客户端连接，浏览器控制台不可用"
 	case "vmrc", "webmks":
 		return "ESXi 需使用 VMRC 客户端连接，浏览器控制台不可用"
+	case "rdp":
+		host := strOf(results["host"])
+		port := toPortInt(results["port"])
+		if host != "" && port > 0 {
+			return fmt.Sprintf("VirtualBox 仅提供 VRDE（RDP 协议）远程桌面，浏览器控制台不可用，请用 RDP 客户端连接 %s:%d", host, port)
+		}
+		return "VirtualBox 仅提供 VRDE（RDP 协议）远程桌面，浏览器控制台不可用"
 	}
 	if toPortInt(results["port"]) <= 0 {
 		return "平台未返回可用的控制台端口，请确认虚拟机已启用 VNC"
@@ -893,7 +1145,11 @@ func (app *App) buildConsoleURL(c *gin.Context, d driver.HostDriver, hsName, vmU
 
 	// ESXi 的票据走 WebMKS（wss），websockify 只能做 TCP→VNC 转发，
 	// 拼出 noVNC 地址只会得到黑屏，如实交给 console_error 说明限制。
-	if typ, _ := results["type"].(string); strings.EqualFold(typ, "vmrc") || strings.EqualFold(typ, "webmks") {
+	// VirtualBox 的 VRDE 是 RDP 协议，同样无法用 noVNC 桥接。
+	// adb 是设备调试协议而不是 RFB，拼出 noVNC 地址同样只会黑屏。
+	if typ, _ := results["type"].(string); strings.EqualFold(typ, "vmrc") ||
+		strings.EqualFold(typ, "webmks") || strings.EqualFold(typ, "rdp") ||
+		strings.EqualFold(typ, "adb") || strings.EqualFold(typ, "none") {
 		return ""
 	}
 
@@ -2637,6 +2893,15 @@ func (app *App) applyNICChange(c *gin.Context, hsName, vmUUID string, d driver.H
 		}
 	}
 
+	// 网络配额校验：网卡总数不能超过最大网卡数量，
+	// 公网/内网各自的 V4、V6 地址总数不能超过对应上限。
+	// 放在自动分配之后，手动填写的地址也会被计入。
+	if err := newVM.CheckNetQuota(); err != nil {
+		app.Logger.Log(hsName, "WARNING", "网卡配置", "超出网络配额: "+err.Error(), false)
+		utils.Fail(c, 400, "超出套餐网络配额: "+err.Error())
+		return false
+	}
+
 	result, err := d.UpdateVM(newVM, oldVM)
 	if err != nil {
 		app.Logger.Log(hsName, "ERROR", "网卡配置", "平台下发失败: "+err.Error(), false)
@@ -3804,12 +4069,34 @@ func (app *App) handleOSImages(c *gin.Context) {
 
 	meta, _ := driver.EngineMetaOf(cfg.ServerType)
 
+	systemMaps := cfg.SystemMaps
+	imagesMaps := cfg.ImagesMaps
+	// MEmu 的「系统镜像」是安装目录 image/<安卓版本> 下的基础磁盘，
+	// 不在 system_maps 里。不在这里补充时，创建页面的操作系统下拉框为空。
+	if len(systemMaps) == 0 {
+		if d := app.HostSvc.GetOrCreateDriver(hsName); d != nil {
+			if images, err := d.GetOSImages(); err == nil && len(images) > 0 {
+				for name := range images {
+					systemMaps = append(systemMaps, model.OSConfig{
+						SysName: name,
+						// 安卓版本没有独立镜像文件，sys_file 直接用版本名称，
+						// 这样创建/编辑表单回填的值与实例标题保持一致。
+						SysFile: name,
+						SysType: "Android",
+						SysFlag: true,
+					})
+				}
+				sort.Slice(systemMaps, func(i, j int) bool { return systemMaps[i].SysName < systemMaps[j].SysName })
+			}
+		}
+	}
+
 	utils.Success(c, map[string]interface{}{
 		"host_name":    hsName,
 		"server_type":  cfg.ServerType,
 		"filter_name":  cfg.FilterName,
-		"system_maps":  service.OSListToArray(cfg.SystemMaps),
-		"images_maps":  service.OSListToArray(cfg.ImagesMaps),
+		"system_maps":  service.OSListToArray(systemMaps),
+		"images_maps":  service.OSListToArray(imagesMaps),
 		"ban_init":     meta.BanInit,
 		"ban_edit":     meta.BanEdit,
 		"messages":     meta.Messages,
@@ -3819,6 +4106,10 @@ func (app *App) handleOSImages(c *gin.Context) {
 		"ipaddr_ddns":  cfg.IPAddrDDNS,
 		"public_addr":  cfg.PublicAddr,
 		"capabilities": service.PlatformCapabilities(cfg.ServerType),
+		// 功能控制（管理员显式关闭的选项卡）与允许改配开关：
+		// 与 tab_lock（平台不支持）取并集后决定详情页展示哪些选项卡。
+		"disabled_tabs":     cfg.DisabledTabs,
+		"allow_reconfigure": cfg.ReconfigureAllowed(),
 	})
 }
 

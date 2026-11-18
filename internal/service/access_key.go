@@ -164,13 +164,19 @@ func (s *HostService) EnsureVMTempVirtualUser(hsName, vmUUID string) (string, er
 		vm.OwnAll = make(map[string]model.UserMask)
 	}
 
+	// 目标掩码来自主机「链接权限」；未配置时回落到内置默认。
+	// 每次登录都对齐一次，管理员改了链接权限后，下一次登录即生效。
+	desired := model.VirtualUserMask()
+	if hostCfg, err := s.GetHost(hsName); err == nil && hostCfg != nil {
+		desired = hostCfg.LinkUserMask()
+	}
+
 	changed := false
 	if mask, ok := vm.OwnAll[virtualUser]; !ok {
-		vm.OwnAll[virtualUser] = model.VirtualUserMask()
+		vm.OwnAll[virtualUser] = desired
 		changed = true
-	} else if mask.NicEdits {
-		mask.NicEdits = false
-		vm.OwnAll[virtualUser] = mask
+	} else if mask.ToBits() != desired.ToBits() {
+		vm.OwnAll[virtualUser] = desired
 		changed = true
 	}
 	if !changed {

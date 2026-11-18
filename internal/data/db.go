@@ -5,13 +5,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"strings"
 	"time"
-
-	"golang.org/x/crypto/bcrypt"
 
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/appconfig"
 
@@ -196,7 +195,19 @@ CREATE TABLE IF NOT EXISTS hs_config (
     n_mem_price REAL      DEFAULT 0,
     n_hdd_price REAL      DEFAULT 0,
     n_net_price REAL      DEFAULT 0,
+    n_dat_price REAL      DEFAULT 0,
+    n_speed_u_price REAL  DEFAULT 0,
+    n_speed_d_price REAL  DEFAULT 0,
+    n_flu_price REAL      DEFAULT 0,
+    n_nat_price REAL      DEFAULT 0,
+    n_web_price REAL      DEFAULT 0,
+    n_bak_price REAL      DEFAULT 0,
+    n_ip4_price REAL      DEFAULT 0,
+    n_ip6_price REAL      DEFAULT 0,
     server_plan TEXT      DEFAULT '{}',
+    allow_reconfigure TEXT DEFAULT 'allow',
+    disabled_tabs     TEXT DEFAULT '[]',
+    link_permission   INTEGER DEFAULT 0,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -440,6 +451,16 @@ func (d *DB) migrate() error {
 		`ALTER TABLE hs_config ADD COLUMN n_mem_price REAL DEFAULT 0`,
 		`ALTER TABLE hs_config ADD COLUMN n_hdd_price REAL DEFAULT 0`,
 		`ALTER TABLE hs_config ADD COLUMN n_net_price REAL DEFAULT 0`,
+		// 售价配置细分：数据盘、上/下行带宽、流量、NAT、反向代理、公网 IPv4/IPv6
+		`ALTER TABLE hs_config ADD COLUMN n_dat_price REAL DEFAULT 0`,
+		`ALTER TABLE hs_config ADD COLUMN n_speed_u_price REAL DEFAULT 0`,
+		`ALTER TABLE hs_config ADD COLUMN n_speed_d_price REAL DEFAULT 0`,
+		`ALTER TABLE hs_config ADD COLUMN n_flu_price REAL DEFAULT 0`,
+		`ALTER TABLE hs_config ADD COLUMN n_nat_price REAL DEFAULT 0`,
+		`ALTER TABLE hs_config ADD COLUMN n_web_price REAL DEFAULT 0`,
+		`ALTER TABLE hs_config ADD COLUMN n_bak_price REAL DEFAULT 0`,
+		`ALTER TABLE hs_config ADD COLUMN n_ip4_price REAL DEFAULT 0`,
+		`ALTER TABLE hs_config ADD COLUMN n_ip6_price REAL DEFAULT 0`,
 		// 反向代理模式与 VNC 对外地址：
 		//   proxy_mode  direct=主控与平台同机，Caddy 直连虚拟机内网 IP
 		//               relay =主控与平台分离，Caddy 经爱快公网地址中转
@@ -450,6 +471,13 @@ func (d *DB) migrate() error {
 		`ALTER TABLE hs_config ADD COLUMN relay_addr TEXT DEFAULT ''`,
 		`ALTER TABLE hs_config ADD COLUMN vnc_ip TEXT DEFAULT ''`,
 		`ALTER TABLE hs_config ADD COLUMN vnc_wan TEXT DEFAULT ''`,
+		// 主机级「允许改配 / 功能控制 / 链接权限」
+		//   allow_reconfigure: allow=允许改配（默认），deny=禁止修改虚拟机配置
+		//   disabled_tabs:     被显式关闭的虚拟机详情选项卡 key 列表（JSON 数组）
+		//   link_permission:   访问密钥/访问链接默认权限掩码（16 位，0=内置默认）
+		`ALTER TABLE hs_config ADD COLUMN allow_reconfigure TEXT DEFAULT 'allow'`,
+		`ALTER TABLE hs_config ADD COLUMN disabled_tabs TEXT DEFAULT '[]'`,
+		`ALTER TABLE hs_config ADD COLUMN link_permission INTEGER DEFAULT 0`,
 		// 异步任务增加主机与虚拟机标识，用于按资源过滤与并发互斥
 		`ALTER TABLE async_tasks ADD COLUMN hs_name TEXT DEFAULT ''`,
 		`ALTER TABLE async_tasks ADD COLUMN vm_uuid TEXT DEFAULT ''`,
@@ -681,14 +709,28 @@ type HSConfigRow struct {
 	NMemPrice  float64 `db:"n_mem_price"`
 	NHddPrice  float64 `db:"n_hdd_price"`
 	NNetPrice  float64 `db:"n_net_price"`
+	// 售价配置细分
+	NDatPrice    float64 `db:"n_dat_price"`
+	NSpeedUPrice float64 `db:"n_speed_u_price"`
+	NSpeedDPrice float64 `db:"n_speed_d_price"`
+	NFluPrice    float64 `db:"n_flu_price"`
+	NNatPrice    float64 `db:"n_nat_price"`
+	NWebPrice    float64 `db:"n_web_price"`
+	NBakPrice    float64 `db:"n_bak_price"`
+	NIp4Price    float64 `db:"n_ip4_price"`
+	NIp6Price    float64 `db:"n_ip6_price"`
 	ServerPlan string  `db:"server_plan"`
 	// 反向代理模式与 VNC 对外地址
 	ProxyMode string `db:"proxy_mode"`
 	RelayAddr string `db:"relay_addr"`
 	VncIP     string `db:"vnc_ip"`
 	VncWan    string `db:"vnc_wan"`
-	CreatedAt string `db:"created_at"`
-	UpdatedAt string `db:"updated_at"`
+	// 允许改配 / 功能控制 / 链接权限
+	AllowReconfigure string `db:"allow_reconfigure"`
+	DisabledTabs     string `db:"disabled_tabs"`
+	LinkPermission   int    `db:"link_permission"`
+	CreatedAt        string `db:"created_at"`
+	UpdatedAt        string `db:"updated_at"`
 }
 
 // GetAllHosts 获取所有主机配置
@@ -700,7 +742,11 @@ func (d *DB) GetAllHosts() ([]*HSConfigRow, error) {
 		system_maps, images_maps, public_addr, extend_data, limits_nums, ipaddr_maps,
 		ipaddr_ddns, enable_host, server_area,
 		COALESCE(n_cpu_price,0), COALESCE(n_mem_price,0), COALESCE(n_hdd_price,0), COALESCE(n_net_price,0),
+		COALESCE(n_dat_price,0), COALESCE(n_speed_u_price,0), COALESCE(n_speed_d_price,0), COALESCE(n_flu_price,0),
+		COALESCE(n_nat_price,0), COALESCE(n_web_price,0), COALESCE(n_bak_price,0),
+		COALESCE(n_ip4_price,0), COALESCE(n_ip6_price,0),
 		server_plan, COALESCE(proxy_mode,'direct'), COALESCE(relay_addr,''), COALESCE(vnc_ip,''), COALESCE(vnc_wan,''),
+		COALESCE(allow_reconfigure,'allow'), COALESCE(disabled_tabs,'[]'), COALESCE(link_permission,0),
 		created_at, updated_at
 		FROM hs_config ORDER BY id`)
 	if err != nil {
@@ -721,8 +767,11 @@ func (d *DB) GetAllHosts() ([]*HSConfigRow, error) {
 			&row.PublicAddr, &row.ExtendData, &row.LimitsNums, &row.IPAddrMaps, &row.IPAddrDDNS,
 			&row.EnableHost, &row.ServerArea,
 			&row.NCpuPrice, &row.NMemPrice, &row.NHddPrice, &row.NNetPrice,
+			&row.NDatPrice, &row.NSpeedUPrice, &row.NSpeedDPrice, &row.NFluPrice,
+			&row.NNatPrice, &row.NWebPrice, &row.NBakPrice, &row.NIp4Price, &row.NIp6Price,
 			&row.ServerPlan,
 			&row.ProxyMode, &row.RelayAddr, &row.VncIP, &row.VncWan,
+			&row.AllowReconfigure, &row.DisabledTabs, &row.LinkPermission,
 			&createdAt, &updatedAt,
 		); err != nil {
 			return nil, err
@@ -744,7 +793,11 @@ func (d *DB) GetHost(hsName string) (*HSConfigRow, error) {
 		system_maps, images_maps, public_addr, extend_data, limits_nums, ipaddr_maps,
 		ipaddr_ddns, enable_host, server_area,
 		COALESCE(n_cpu_price,0), COALESCE(n_mem_price,0), COALESCE(n_hdd_price,0), COALESCE(n_net_price,0),
+		COALESCE(n_dat_price,0), COALESCE(n_speed_u_price,0), COALESCE(n_speed_d_price,0), COALESCE(n_flu_price,0),
+		COALESCE(n_nat_price,0), COALESCE(n_web_price,0), COALESCE(n_bak_price,0),
+		COALESCE(n_ip4_price,0), COALESCE(n_ip6_price,0),
 		server_plan, COALESCE(proxy_mode,'direct'), COALESCE(relay_addr,''), COALESCE(vnc_ip,''), COALESCE(vnc_wan,''),
+		COALESCE(allow_reconfigure,'allow'), COALESCE(disabled_tabs,'[]'), COALESCE(link_permission,0),
 		created_at, updated_at
 		FROM hs_config WHERE hs_name = ?`, hsName).Scan(
 		&row.ID, &row.HsName, &row.ServerName, &row.ServerType, &row.ServerAddr,
@@ -755,8 +808,11 @@ func (d *DB) GetHost(hsName string) (*HSConfigRow, error) {
 		&row.PublicAddr, &row.ExtendData, &row.LimitsNums, &row.IPAddrMaps, &row.IPAddrDDNS,
 		&row.EnableHost, &row.ServerArea,
 		&row.NCpuPrice, &row.NMemPrice, &row.NHddPrice, &row.NNetPrice,
+		&row.NDatPrice, &row.NSpeedUPrice, &row.NSpeedDPrice, &row.NFluPrice,
+		&row.NNatPrice, &row.NWebPrice, &row.NBakPrice, &row.NIp4Price, &row.NIp6Price,
 		&row.ServerPlan,
 		&row.ProxyMode, &row.RelayAddr, &row.VncIP, &row.VncWan,
+		&row.AllowReconfigure, &row.DisabledTabs, &row.LinkPermission,
 		&createdAt, &updatedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -776,6 +832,9 @@ type hostConfigExecutor interface {
 }
 
 func createHostRow(executor hostConfigExecutor, row *HSConfigRow) error {
+	args := append([]interface{}{row.HsName}, hostRowArgs(row)...)
+	// 占位符按参数个数生成，避免手写 ? 数量与字段数对不上
+	placeholders := "?" + strings.Repeat(",?", len(args)-1)
 	_, err := executor.Exec(`INSERT INTO hs_config (hs_name, server_name, server_type, server_addr,
 		server_user, server_pass, server_port, images_path, dvdrom_path, system_path,
 		backup_path, extern_path, launch_path, network_nat, network_pub, filter_name,
@@ -783,36 +842,17 @@ func createHostRow(executor hostConfigExecutor, row *HSConfigRow) error {
 		system_maps, images_maps, public_addr, extend_data, limits_nums, ipaddr_maps,
 		ipaddr_ddns, enable_host, server_area,
 		n_cpu_price, n_mem_price, n_hdd_price, n_net_price,
-		server_plan, proxy_mode, relay_addr, vnc_ip, vnc_wan)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		row.HsName, row.ServerName, row.ServerType, row.ServerAddr,
-		row.ServerUser, row.ServerPass, row.ServerPort, row.ImagesPath, row.DvdromPath,
-		row.SystemPath, row.BackupPath, row.ExternPath, row.LaunchPath, row.NetworkNat,
-		row.NetworkPub, row.FilterName, row.IKuaiAddr, row.IKuaiUser, row.IKuaiPass, row.IKuaiToken,
-		row.PortsStart, row.PortsClose, row.RemotePort, row.SystemMaps, row.ImagesMaps,
-		row.PublicAddr, row.ExtendData, row.LimitsNums, row.IPAddrMaps, row.IPAddrDDNS,
-		row.EnableHost, row.ServerArea,
-		row.NCpuPrice, row.NMemPrice, row.NHddPrice, row.NNetPrice,
-		row.ServerPlan, row.ProxyMode, row.RelayAddr, row.VncIP, row.VncWan,
-	)
+		n_dat_price, n_speed_u_price, n_speed_d_price, n_flu_price,
+		n_nat_price, n_web_price, n_bak_price, n_ip4_price, n_ip6_price,
+		server_plan, proxy_mode, relay_addr, vnc_ip, vnc_wan,
+		allow_reconfigure, disabled_tabs, link_permission)
+		VALUES (`+placeholders+`)`, args...)
 	return err
 }
 
-// UpdateHost 更新主机配置
-func (d *DB) UpdateHost(row *HSConfigRow) error {
-	return updateHostRow(d.db, row)
-}
-
-func updateHostRow(executor hostConfigExecutor, row *HSConfigRow) error {
-	_, err := executor.Exec(`UPDATE hs_config SET server_name=?, server_type=?, server_addr=?,
-		server_user=?, server_pass=?, server_port=?, images_path=?, dvdrom_path=?, system_path=?,
-		backup_path=?, extern_path=?, launch_path=?, network_nat=?, network_pub=?, filter_name=?,
-		i_kuai_addr=?, i_kuai_user=?, i_kuai_pass=?, i_kuai_token=?, ports_start=?, ports_close=?, remote_port=?,
-		system_maps=?, images_maps=?, public_addr=?, extend_data=?, limits_nums=?, ipaddr_maps=?,
-		ipaddr_ddns=?, enable_host=?, server_area=?,
-		n_cpu_price=?, n_mem_price=?, n_hdd_price=?, n_net_price=?,
-		server_plan=?, proxy_mode=?, relay_addr=?, vnc_ip=?, vnc_wan=?, updated_at=CURRENT_TIMESTAMP
-		WHERE hs_name=?`,
+// hostRowArgs 返回 hs_config 插入/更新语句的参数，顺序与 updateHostRow 的 SET 子句一致。
+func hostRowArgs(row *HSConfigRow) []interface{} {
+	return []interface{}{
 		row.ServerName, row.ServerType, row.ServerAddr,
 		row.ServerUser, row.ServerPass, row.ServerPort, row.ImagesPath, row.DvdromPath,
 		row.SystemPath, row.BackupPath, row.ExternPath, row.LaunchPath, row.NetworkNat,
@@ -821,8 +861,32 @@ func updateHostRow(executor hostConfigExecutor, row *HSConfigRow) error {
 		row.PublicAddr, row.ExtendData, row.LimitsNums, row.IPAddrMaps, row.IPAddrDDNS,
 		row.EnableHost, row.ServerArea,
 		row.NCpuPrice, row.NMemPrice, row.NHddPrice, row.NNetPrice,
-		row.ServerPlan, row.ProxyMode, row.RelayAddr, row.VncIP, row.VncWan, row.HsName,
-	)
+		row.NDatPrice, row.NSpeedUPrice, row.NSpeedDPrice, row.NFluPrice,
+		row.NNatPrice, row.NWebPrice, row.NBakPrice, row.NIp4Price, row.NIp6Price,
+		row.ServerPlan, row.ProxyMode, row.RelayAddr, row.VncIP, row.VncWan,
+		row.AllowReconfigure, row.DisabledTabs, row.LinkPermission,
+	}
+}
+
+// UpdateHost 更新主机配置
+func (d *DB) UpdateHost(row *HSConfigRow) error {
+	return updateHostRow(d.db, row)
+}
+
+func updateHostRow(executor hostConfigExecutor, row *HSConfigRow) error {
+	args := append(hostRowArgs(row), row.HsName)
+	_, err := executor.Exec(`UPDATE hs_config SET server_name=?, server_type=?, server_addr=?,
+		server_user=?, server_pass=?, server_port=?, images_path=?, dvdrom_path=?, system_path=?,
+		backup_path=?, extern_path=?, launch_path=?, network_nat=?, network_pub=?, filter_name=?,
+		i_kuai_addr=?, i_kuai_user=?, i_kuai_pass=?, i_kuai_token=?, ports_start=?, ports_close=?, remote_port=?,
+		system_maps=?, images_maps=?, public_addr=?, extend_data=?, limits_nums=?, ipaddr_maps=?,
+		ipaddr_ddns=?, enable_host=?, server_area=?,
+		n_cpu_price=?, n_mem_price=?, n_hdd_price=?, n_net_price=?,
+		n_dat_price=?, n_speed_u_price=?, n_speed_d_price=?, n_flu_price=?,
+		n_nat_price=?, n_web_price=?, n_bak_price=?, n_ip4_price=?, n_ip6_price=?,
+		server_plan=?, proxy_mode=?, relay_addr=?, vnc_ip=?, vnc_wan=?,
+		allow_reconfigure=?, disabled_tabs=?, link_permission=?, updated_at=CURRENT_TIMESTAMP
+		WHERE hs_name=?`, args...)
 	return err
 }
 
@@ -1741,41 +1805,76 @@ func (d *DB) GetUserByResetToken(token string) (map[string]interface{}, error) {
 	return d.getUserBy("reset_token", token)
 }
 
-// InitDefaultAdmin 若不存在任何管理员用户，则以 bearerToken 为初始密码创建默认 admin 账号
-func (d *DB) InitDefaultAdmin(bearerToken string) error {
-	// 拒绝用空口令初始化管理员：登录流程不接受空密码，
-	// 一旦写入，系统将处于「有管理员但无法登录」的不可用状态。
-	if strings.TrimSpace(bearerToken) == "" {
-		return fmt.Errorf("初始管理员口令为空，已跳过创建：请在启动前先生成 Bearer Token")
+// ErrSystemInitialized 系统已完成初始化（已存在管理员账号）。
+var ErrSystemInitialized = errors.New("系统已初始化")
+
+// SystemInitialized 判断系统是否已完成初始化。
+//
+// 以「是否存在管理员账号」为唯一标准：没有管理员时任何人都无法登录后台，
+// 此时才允许通过初始化页面创建首个管理员。
+func (d *DB) SystemInitialized() (bool, error) {
+	var count int
+	if err := d.db.QueryRow("SELECT COUNT(*) FROM web_users WHERE is_admin = 1").Scan(&count); err != nil {
+		return false, fmt.Errorf("查询管理员用户失败: %w", err)
 	}
+	return count > 0, nil
+}
+
+// CreateInitialAdmin 创建首个管理员账号（用户名固定为 admin，口令由初始化页面提供）。
+//
+// 在事务内再次确认不存在管理员，避免并发初始化请求创建出两个初始账号；
+// 初始化完成后由调用方写入系统标题等站点信息。
+func (d *DB) CreateInitialAdmin(passwordHash string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 
 	var count int
-	err := d.db.QueryRow("SELECT COUNT(*) FROM web_users WHERE is_admin = 1").Scan(&count)
-	if err != nil {
+	if err := tx.QueryRow("SELECT COUNT(*) FROM web_users WHERE is_admin = 1").Scan(&count); err != nil {
 		return fmt.Errorf("查询管理员用户失败: %w", err)
 	}
 	if count > 0 {
-		return nil // 已存在管理员，跳过
-	}
-
-	// 用 bcrypt 对 bearerToken 做哈希作为初始密码
-	hashBytes, err := bcrypt.GenerateFromPassword([]byte(bearerToken), bcrypt.DefaultCost)
-	if err != nil {
-		return fmt.Errorf("密码哈希失败: %w", err)
+		return ErrSystemInitialized
 	}
 
 	hostsJSON, _ := json.Marshal([]string{})
-	_, err = d.db.Exec(`INSERT INTO web_users
-		(username, password, email, is_admin, is_active, email_verified,
-		 can_create_vm, can_modify_vm, can_delete_vm,
-		 quota_cpu, quota_ram, quota_ssd, quota_gpu,
-		 quota_nat_ports, quota_web_proxy, quota_nat_ips, quota_pub_ips,
-		 quota_bandwidth_up, quota_bandwidth_down, quota_traffic,
-		 assigned_hosts)
-		VALUES (?, ?, ?, 1, 1, 1, 1, 1, 1, 9999, 9999, 9999, 9999, 9999, 9999, 9999, 9999, 9999, 9999, 9999, ?)`,
-		"admin", string(hashBytes), "admin@localhost", string(hostsJSON))
-	if err != nil {
-		return fmt.Errorf("创建默认管理员失败: %w", err)
+
+	// 初始化接口在公网可达的窗口期内，可能已有人注册了同名普通账号（admin）。
+	// 此时直接提权并重置口令，而不是因唯一约束失败导致系统永久无法初始化。
+	var existingID int
+	queryErr := tx.QueryRow("SELECT id FROM web_users WHERE username = ?", "admin").Scan(&existingID)
+	switch {
+	case queryErr == nil:
+		if _, err := tx.Exec(`UPDATE web_users SET
+			password=?, is_admin=1, is_active=1, email_verified=1,
+			can_create_vm=1, can_modify_vm=1, can_delete_vm=1,
+			quota_cpu=9999, quota_ram=9999, quota_ssd=9999, quota_gpu=9999,
+			quota_nat_ports=9999, quota_web_proxy=9999, quota_nat_ips=9999, quota_pub_ips=9999,
+			quota_bandwidth_up=9999, quota_bandwidth_down=9999, quota_traffic=9999,
+			assigned_hosts=?, updated_at=CURRENT_TIMESTAMP
+			WHERE id=?`, passwordHash, string(hostsJSON), existingID); err != nil {
+			return fmt.Errorf("升级初始管理员失败: %w", err)
+		}
+	case errors.Is(queryErr, sql.ErrNoRows):
+		if _, err := tx.Exec(`INSERT INTO web_users
+			(username, password, email, is_admin, is_active, email_verified,
+			 can_create_vm, can_modify_vm, can_delete_vm,
+			 quota_cpu, quota_ram, quota_ssd, quota_gpu,
+			 quota_nat_ports, quota_web_proxy, quota_nat_ips, quota_pub_ips,
+			 quota_bandwidth_up, quota_bandwidth_down, quota_traffic,
+			 assigned_hosts)
+			VALUES (?, ?, ?, 1, 1, 1, 1, 1, 1, 9999, 9999, 9999, 9999, 9999, 9999, 9999, 9999, 9999, 9999, 9999, ?)`,
+			"admin", passwordHash, "admin@localhost", string(hostsJSON)); err != nil {
+			return fmt.Errorf("创建初始管理员失败: %w", err)
+		}
+	default:
+		return fmt.Errorf("查询初始管理员账号失败: %w", queryErr)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交初始化事务失败: %w", err)
 	}
 	return nil
 }
@@ -1982,6 +2081,18 @@ func (d *DB) GetHostByName(hsName string) (map[string]interface{}, error) {
 		"n_mem_price":  row.NMemPrice,
 		"n_hdd_price":  row.NHddPrice,
 		"n_net_price":  row.NNetPrice,
+		"n_dat_price": row.NDatPrice,
+		"n_speed_u_price": row.NSpeedUPrice,
+		"n_speed_d_price": row.NSpeedDPrice,
+		"n_flu_price": row.NFluPrice,
+		"n_nat_price": row.NNatPrice,
+		"n_web_price": row.NWebPrice,
+		"n_bak_price": row.NBakPrice,
+		"n_ip4_price": row.NIp4Price,
+		"n_ip6_price": row.NIp6Price,
+		"allow_reconfigure": row.AllowReconfigure,
+		"disabled_tabs":     row.DisabledTabs,
+		"link_permission":   row.LinkPermission,
 	}, nil
 }
 

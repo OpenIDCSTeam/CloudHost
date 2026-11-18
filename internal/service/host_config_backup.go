@@ -117,7 +117,11 @@ func validateBackupHost(cfg *model.HSConfig) error {
 	if cfg.LimitsNums < 0 {
 		return fmt.Errorf("虚拟机数量限制不能为负数")
 	}
-	for _, price := range []float64{cfg.NCpuPrice, cfg.NMemPrice, cfg.NHddPrice, cfg.NNetPrice} {
+	for _, price := range []float64{
+		cfg.NCpuPrice, cfg.NMemPrice, cfg.NHddPrice, cfg.NNetPrice,
+		cfg.NDatPrice, cfg.NSpeedUPrice, cfg.NSpeedDPrice, cfg.NFluPrice,
+		cfg.NNatPrice, cfg.NWebPrice, cfg.NBakPrice, cfg.NIp4Price, cfg.NIp6Price,
+	} {
 		if price < 0 || math.IsNaN(price) || math.IsInf(price, 0) {
 			return fmt.Errorf("单价须为非负有限数值")
 		}

@@ -108,8 +108,8 @@ func Credentials(name string) ([]Field, error) {
 		return append(base,
 			Field{Key: "server_type", Value: "MemuAndroid", Note: "仅 Windows 本机"},
 			Field{Key: "server_addr", Value: "localhost"},
-			Field{Key: "launch_path", Value: `C:\Program Files\Netease\MuMuPlayer-12.0\shell`},
-			Field{Key: "controller_cmd", Value: "opidcs host add --name mumu-01 --type MemuAndroid --addr localhost"},
+			Field{Key: "launch_path", Value: `%APPDATA%\Microvirt\MEmu`, Note: "memuc.exe 所在目录"},
+			Field{Key: "controller_cmd", Value: "opidcs host add --name memu-01 --type MemuAndroid --addr localhost"},
 		), nil
 	}
 	return base, nil

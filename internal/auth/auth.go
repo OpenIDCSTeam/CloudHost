@@ -184,10 +184,6 @@ const (
 	SessionKeyTempLogin = "temp_login"
 	SessionKeyTempHost  = "temp_hs_name"
 	SessionKeyTempVM    = "temp_vm_uuid"
-	// SessionKeyTokenLogin 系统 Token 登录标记。
-	// Token 登录不存在对应用户口令，无法用口令标记校验会话有效性，
-	// 必须单独识别，否则该会话会在下一次请求被判为失效。
-	SessionKeyTokenLogin = "token_login"
 )
 
 // PasswordTag 计算口令哈希的短标记，用于判断会话是否仍然有效。
@@ -252,23 +248,6 @@ func AuthMiddleware(loadUser UserLoader, getToken TokenGetter) gin.HandlerFunc {
 		session := sessions.Default(c)
 		username, ok := session.Get(SessionKeyUser).(string)
 		if ok && username != "" {
-			// 系统 Token 登录的会话不对应真实用户口令，
-			// 直接按管理员身份放行（与 Bearer 认证等价）。
-			if tokenLogin, _ := session.Get(SessionKeyTokenLogin).(bool); tokenLogin {
-				c.Set(ContextKeyUser, &UserContext{
-					Username: "admin",
-					IsAdmin:  true,
-					IsToken:  true,
-					UserData: map[string]interface{}{
-						"username": "admin",
-						"is_admin": true,
-						"is_active": true,
-					},
-				})
-				c.Next()
-				return
-			}
-
 			// 临时凭据会话不对应数据库用户，直接按会话中记录的范围放行；
 			// 具体可访问的资源由 HostVMAccessMiddleware 再次收紧。
 			if tempLogin, _ := session.Get(SessionKeyTempLogin).(bool); tempLogin {

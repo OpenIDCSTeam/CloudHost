@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -36,13 +37,17 @@ var probes = []probe{
 	{"qemu", "QEMU / KVM", []string{"virsh", "--version"}, firstLine},
 	{"virtualbox", "VirtualBox", []string{"VBoxManage", "--version"}, firstLine},
 	{"vmware", "VMware Workstation (vmrest)", []string{"vmrest", "-v"}, firstLine},
-	{"memu", "MuMu (memuc)", []string{"memuc", "version"}, firstLine},
+	{"memu", "MEmu (memuc)", []string{"memuc"}, firstLine},
 }
 
 // Detect 探测本机已安装的平台。
 func Detect() []Info {
 	result := make([]Info, 0, len(probes))
 	for _, p := range probes {
+		if p.name == "memu" {
+			result = append(result, detectMemu())
+			continue
+		}
 		path, err := exec.LookPath(p.cmd[0])
 		info := Info{Name: p.name, Label: p.label, Path: path}
 		if err != nil {
@@ -60,6 +65,34 @@ func Detect() []Info {
 		result = append(result, detectHyperV())
 	}
 	return result
+}
+
+// detectMemu 探测逍遥模拟器。
+//
+// memuc 不会加入 PATH，默认安装在 %APPDATA%\Microvirt\MEmu；
+// 另外 memuc 没有 version 子命令，直接执行并取帮助首行即可。
+func detectMemu() Info {
+	info := Info{Name: "memu", Label: "MEmu (memuc)"}
+	var candidates []string
+	if appData := strings.TrimSpace(os.Getenv("APPDATA")); appData != "" {
+		candidates = append(candidates, filepath.Join(appData, "Microvirt", "MEmu", "memuc.exe"))
+	}
+	if path, err := exec.LookPath("memuc"); err == nil {
+		candidates = append(candidates, path)
+	}
+	for _, path := range candidates {
+		if _, err := os.Stat(path); err != nil {
+			continue
+		}
+		info.Installed = true
+		info.Path = path
+		if out, err := run(path); err == nil {
+			info.Version = firstLine(out)
+		}
+		return info
+	}
+	info.Note = installHint("memu")
+	return info
 }
 
 func detectHyperV() Info {
@@ -181,7 +214,7 @@ func installHint(name string) string {
 	case "vmware":
 		return "安装 VMware Workstation Pro 并启动 vmrest"
 	case "memu":
-		return "安装 MuMu 模拟器并在设置中开启 ADB"
+		return "安装逍遥模拟器（https://www.memuplay.com/），并在主机配置中填写 memuc.exe 所在目录"
 	default:
 		return ""
 	}

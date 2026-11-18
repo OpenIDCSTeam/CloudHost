@@ -55,6 +55,19 @@ func (s *NATService) provider(hsName string) (driver.NatPortProvider, bool) {
 	return p, ok
 }
 
+// vmProvider 返回需要「按虚拟机」下发端口映射的驱动（VirtualBox NAT 转发）。
+func (s *NATService) vmProvider(hsName string) (driver.VMPortMapper, bool) {
+	if s.resolver == nil {
+		return nil, false
+	}
+	d := s.resolver(hsName)
+	if d == nil {
+		return nil, false
+	}
+	p, ok := d.(driver.VMPortMapper)
+	return p, ok
+}
+
 // client 获取（并缓存）指定路由器的客户端。
 // 缓存键使用归一化后的地址，避免大小写/末尾斜杠导致同一路由器被重复建连。
 // token 为爱快 4.0 的个人 API 令牌，参与缓存键：改令牌后必须拿到新客户端。
@@ -89,13 +102,20 @@ func (s *NATService) ApplyPortMap(hsName, vmUUID string, nat *model.PortData, us
 		return fmt.Errorf("端口映射参数为空")
 	}
 
+	vmProvider, hasVMProvider := s.vmProvider(hsName)
+	provider, hasProvider := s.provider(hsName)
+	hasProvider = hasProvider || hasVMProvider
+
 	// 内网地址兜底：前端/自动流程常常只给外网与内网端口，
 	// 爱快会直接以「参数错误: lan_addr」拒绝（整条规则下发失败）。
 	// 这里用虚拟机第一块已分配 IP 的网卡补齐。
-	if strings.TrimSpace(nat.LanAddr) == "" {
+	//
+	// VirtualBox 的 NAT 转发由虚拟机自行把宿主端口转到 guest 端口，
+	// 不需要（也没有）可管理的内网地址，因此不强制要求。
+	if strings.TrimSpace(nat.LanAddr) == "" && !hasVMProvider {
 		nat.LanAddr = s.vmPrimaryIP(hsName, vmUUID)
 	}
-	if strings.TrimSpace(nat.LanAddr) == "" {
+	if strings.TrimSpace(nat.LanAddr) == "" && !hasVMProvider {
 		return fmt.Errorf("缺少内网地址：虚拟机尚未分配 IP，请先为网卡分配 IP 后重试")
 	}
 
@@ -103,8 +123,6 @@ func (s *NATService) ApplyPortMap(hsName, vmUUID string, nat *model.PortData, us
 	if err != nil || host == nil {
 		return fmt.Errorf("主机 %s 不存在", hsName)
 	}
-
-	provider, hasProvider := s.provider(hsName)
 
 	// 路由器侧已占用的 WAN 端口：仅爱快通道需要（平台通道由云端自行管理端口）
 	var ikuai *ikuaiClient
@@ -133,9 +151,15 @@ func (s *NATService) ApplyPortMap(hsName, vmUUID string, nat *model.PortData, us
 		// 则需查询**宿主机 iptables 实际占用**才能选到真正可用的端口
 		// （对齐 Python 版 BasicServer.PortsMap_TTY 的 allocate_port 语义）。
 		// 指定了端口时驱动会自行校验宿主机占用。
-		msg, err := provider.PortsMap(nat, true)
-		if err != nil {
-			return err
+		var msg *model.ZMessage
+		var pErr error
+		if hasVMProvider {
+			msg, pErr = vmProvider.PortsMapVM(vmUUID, nat, true)
+		} else {
+			msg, pErr = provider.PortsMap(nat, true)
+		}
+		if pErr != nil {
+			return pErr
 		}
 		if msg != nil && !msg.Success {
 			return fmt.Errorf("%s", msg.Message)
@@ -172,6 +196,10 @@ func (s *NATService) ApplyPortMap(hsName, vmUUID string, nat *model.PortData, us
 
 // RevokePortMap 删除端口映射：下发删除后删库（下发失败不阻断，避免记录残留）
 func (s *NATService) RevokePortMap(hsName, vmUUID string, nat model.PortData) error {
+	if p, ok := s.vmProvider(hsName); ok {
+		_, _ = p.PortsMapVM(vmUUID, &nat, false)
+		return s.db.DeleteNATRule(hsName, vmUUID, nat.WanPort)
+	}
 	if p, ok := s.provider(hsName); ok {
 		_, _ = p.PortsMap(&nat, false)
 		return s.db.DeleteNATRule(hsName, vmUUID, nat.WanPort)

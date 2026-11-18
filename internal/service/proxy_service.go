@@ -329,19 +329,57 @@ func (s *ProxyService) Reload() error {
 	}
 
 	// 3) 回退：后台启动
-	startArgs := []string{
-		bin, "start",
-		"--config", s.configFile,
-		"--adapter", "caddyfile",
-	}
-	if out, _, err := security.SafeExecWithTimeout(startArgs, 30*time.Second); err != nil {
-		return fmt.Errorf("启动Caddy失败: %v (%s)", err, strings.TrimSpace(out))
+	//
+	// 注意不能走 CombinedOutput：`caddy start` 会拉起常驻子进程并让其继承
+	// stdout/stderr 管道，父进程即使退出，管道仍被守护进程持有，
+	// 读取端永远等不到 EOF —— 整个请求（以及 publishMu）会永久卡死。
+	// 这里改为重定向到日志文件，只等待直接子进程退出。
+	if err := s.startCaddyProcess(bin); err != nil {
+		return fmt.Errorf("启动Caddy失败: %v", err)
 	}
 	// start 是异步拉起进程：稍等 Admin API 就绪，避免「命令成功但配置尚未生效」
 	if err := s.waitAdminReady(3 * time.Second); err != nil {
 		log.Printf("[proxy] Caddy 已启动，但 Admin API 在 3s 内未就绪: %v", err)
 	}
 	return nil
+}
+
+// startCaddyProcess 以文件重定向方式启动 Caddy，避免管道被守护进程持有导致永久阻塞。
+func (s *ProxyService) startCaddyProcess(bin string) error {
+	logPath := filepath.Join(filepath.Dir(s.configFile), "caddy-start.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		logFile = nil
+	}
+
+	cmd := exec.Command(bin, "start", "--config", s.configFile, "--adapter", "caddyfile")
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.Stdin = nil
+	if err := cmd.Start(); err != nil {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		return err
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		return err
+	case <-time.After(30 * time.Second):
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		return fmt.Errorf("caddy start 超时（30s）")
+	}
 }
 
 // adminAlive 判断 Caddy Admin API 是否可用（本地探测，成本极低）。

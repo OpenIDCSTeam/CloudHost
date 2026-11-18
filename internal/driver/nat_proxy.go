@@ -21,3 +21,15 @@ type NatProxyProvider interface {
 	// ProxyMap 反向代理下发（add=true 添加，false 删除）
 	ProxyMap(vmUUID string, proxy model.WebProxy, add bool) (*model.ZMessage, error)
 }
+
+// VMPortMapper 需要「按虚拟机」下发端口映射的平台。
+//
+// 容器类平台（Docker/LXD/SmolVM）在宿主机 iptables 上做 DNAT，
+// 规则与具体虚拟机无直接关系，因此 NatPortProvider 不带虚拟机标识；
+// VirtualBox 的端口映射是虚拟机自身的 NAT 转发规则（natpf），
+// 必须知道是哪台虚拟机，故单独定义该接口。
+type VMPortMapper interface {
+	// PortsMapVM 端口映射下发（add=true 添加，false 删除）
+	// add 且 nat.WanPort 为 0 时由实现负责分配外网端口并回填
+	PortsMapVM(vmUUID string, nat *model.PortData, add bool) (*model.ZMessage, error)
+}

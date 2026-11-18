@@ -218,3 +218,57 @@ func TestNetCheckPoolExhausted(t *testing.T) {
 		t.Errorf("错误信息应说明地址池问题，实际 %q", err)
 	}
 }
+
+// 套餐限制内网 IPv4 为 1 时，第二张内网网卡不再分配 IPv4，
+// 否则「每张网卡自动配 IP」会把套餐里的地址额度撑破。
+func TestNetCheckRespectsV4Limit(t *testing.T) {
+	svc := newTestIPAllocService(t, testNatPool)
+	limit := 1
+	vm := &model.VMConfig{
+		VmUUID: "vm-1",
+		Ip4Pri: &limit,
+		NicAll: map[string]model.NCConfig{
+			"ethernet0": {NicName: "ethernet0", NicType: "nat"},
+			"ethernet1": {NicName: "ethernet1", NicType: "nat"},
+		},
+	}
+	if err := svc.NetCheck("h1", vm); err != nil {
+		t.Fatalf("分配失败: %v", err)
+	}
+	got := 0
+	for _, nic := range vm.NicAll {
+		if strings.TrimSpace(nic.IP4Addr) != "" {
+			got++
+		}
+	}
+	if got != 1 {
+		t.Errorf("内网 IPv4 上限为 1，实际分配了 %d 个", got)
+	}
+}
+
+// 公网 IPv6 上限为 0 时，公网网卡不应自动分配 IPv6（即使主机配置了 v6 池），
+// IPv4 仍按额度正常分配。
+func TestNetCheckRespectsV6Limit(t *testing.T) {
+	const pools = `{"pub":{"from":"1.1.1.100","nums":5,"type":"pub","vers":"ipv4",` +
+		`"gate":"1.1.1.1","mask":"255.255.255.0"},` +
+		`"pub6":{"from":"2408:8207:1234:5600::100","nums":10,"type":"pub","vers":"ipv6","prefix":64}}`
+	svc := newTestIPAllocService(t, pools)
+	zero := 0
+	vm := &model.VMConfig{
+		VmUUID: "vm-1",
+		Ip6Pub: &zero,
+		NicAll: map[string]model.NCConfig{
+			"ethernet0": {NicName: "ethernet0", NicType: "pub"},
+		},
+	}
+	if err := svc.NetCheck("h1", vm); err != nil {
+		t.Fatalf("分配失败: %v", err)
+	}
+	nic := vm.NicAll["ethernet0"]
+	if nic.IP4Addr == "" {
+		t.Error("公网 IPv4 在额度内，应正常分配")
+	}
+	if nic.IP6Addr != "" {
+		t.Errorf("公网 IPv6 上限为 0，不应分配，实际 %q", nic.IP6Addr)
+	}
+}

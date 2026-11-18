@@ -216,10 +216,46 @@ func (s *Scheduler) syncHost(hsName string, d driver.HostDriver) {
 			actualStatus := d.GetPower(vmUUID)
 			// 通过驱动锁内方法写回：快照对象是复制品，
 			// 直接修改不会生效，且与其它请求并发时会形成数据竞争。
-			if newState, ok := driver.PowerStatusMap[actualStatus]; ok {
+			newState, stateOK := driver.PowerStatusMap[actualStatus]
+			if stateOK {
 				d.SetVMPowerState(vmUUID, newState)
 			}
 			_ = vmCfg
+
+			// 容器/KVM 平台没有 guest Agent，vm_status 里没有任何指标记录，
+			// 详情页「资源用量」曲线会一直是空白。这里在运行中每分钟采一条，
+			// 让历史曲线有数据；Agent 平台（PVE/Hyper-V 等）不实现该接口，不受影响。
+			if stateOK && newState == "STARTED" {
+				if provider, ok := d.(driver.VMStatsProvider); ok {
+					if st, okStats := provider.GetVMStats(vmUUID); okStats && st != nil {
+						now := time.Now().Unix()
+						flu := int((st.NetUp + st.NetDown) / 1024 / 1024)
+						record := map[string]interface{}{
+							"ac_status": string(newState),
+							"vm_state":  string(newState),
+							"on_update": now,
+							"cpu_total": vmCfg.CpuNum,
+							"cpu_usage": st.CpuUsage,
+							"mem_total": st.MemTotal,
+							"mem_usage": st.MemUsage,
+							"hdd_total": st.HddTotal,
+							"hdd_usage": st.HddUsage,
+							"flu_total": vmCfg.FluNum,
+							"flu_usage": flu,
+						}
+						if record["mem_total"].(int) <= 0 {
+							record["mem_total"] = vmCfg.MemNum
+						}
+						if record["hdd_total"].(int) <= 0 {
+							record["hdd_total"] = vmCfg.HddNum
+						}
+						if err := s.db.AddVMStatus(hsName, vmUUID, record, string(newState), now, float64(flu)); err != nil {
+							s.log.Event("scheduler", "状态采集").Host(hsName).VM(vmUUID, vmUUID).
+								Warn("保存虚拟机 %s 指标失败: %v", vmUUID, err)
+						}
+					}
+				}
+			}
 
 			// 电源态只写回驱动内存，不写 vm_status。
 			//

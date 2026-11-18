@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/auth"
+	"github.com/OpenIDCSTeam/HostAgent-Go/internal/driver"
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/model"
 )
 
@@ -210,6 +211,10 @@ func (app *App) buildVMView(hsName, vmUUID string, vm *model.VMConfig, uc *auth.
 		}
 	}
 
+	// 容器平台（Docker/LXD）的 guest 内没有 Agent，历史指标恒为 0；
+	// 直接从运行时补一次实时用量，列表页才能看到 CPU/内存/硬盘占用。
+	statusList = app.withContainerVMStats(hsName, vmUUID, vm, statusList)
+
 	return map[string]interface{}{
 		"uuid":             vmUUID,
 		"config":           config,
@@ -217,4 +222,90 @@ func (app *App) buildVMView(hsName, vmUUID string, vm *model.VMConfig, uc *auth.
 		"user_permissions": mask.ToBits(),
 		"is_admin":         isAdmin,
 	}
+}
+
+// withContainerVMStats 用平台运行时数据补齐容器虚拟机的实时用量。
+//
+// Docker/LXD 的 guest 内没有 Agent，vm_status 历史里没有指标记录，
+// 列表页的 CPU/内存/硬盘/流量会一直是 0。这里在读取视图时现场采集一次，
+// 只影响展示，不写入历史（避免把外部采集的数据混进 Agent 上报序列）。
+func (app *App) withContainerVMStats(hsName, vmUUID string, vm *model.VMConfig, status []interface{}) []interface{} {
+	d := app.HostSvc.GetDriver(hsName)
+	if d == nil {
+		return status
+	}
+	provider, ok := d.(driver.VMStatsProvider)
+	if !ok {
+		return status
+	}
+
+	// 有缓存（即使已过期）先立即渲染，同时异步刷新。
+	// 首次加载无缓存时才同步等待，最多 3.5 秒。
+	if peeker, ok := provider.(driver.VMStatsCachedProvider); ok {
+		if cached, hit := peeker.PeekVMStats(vmUUID); hit {
+			go func() { _, _ = provider.GetVMStats(vmUUID) }()
+			return mergeVMStats(status, vm, cached)
+		}
+	}
+
+	type statsResult struct {
+		stats *driver.VMStats
+		ok    bool
+	}
+	ch := make(chan statsResult, 1)
+	go func() {
+		stats, ok := provider.GetVMStats(vmUUID)
+		ch <- statsResult{stats: stats, ok: ok}
+	}()
+	var stats *driver.VMStats
+	var statsOK bool
+	select {
+	case r := <-ch:
+		stats, statsOK = r.stats, r.ok
+	case <-time.After(3500 * time.Millisecond):
+		return status
+	}
+	if !statsOK || stats == nil {
+		return status
+	}
+	return mergeVMStats(status, vm, stats)
+}
+
+// mergeVMStats 把运行时用量写进 status[0]（没有则补一条）
+func mergeVMStats(status []interface{}, vm *model.VMConfig, stats *driver.VMStats) []interface{} {
+	var entry map[string]interface{}
+	if len(status) > 0 {
+		entry, _ = status[0].(map[string]interface{})
+	}
+	if entry == nil {
+		entry = map[string]interface{}{"on_update": time.Now().Unix()}
+		status = append([]interface{}{entry}, status...)
+	}
+
+	if vm != nil {
+		if vm.CpuNum > 0 {
+			entry["cpu_total"] = vm.CpuNum
+		}
+		if vm.MemNum > 0 {
+			entry["mem_total"] = vm.MemNum
+		}
+		if vm.HddNum > 0 {
+			entry["hdd_total"] = vm.HddNum
+		}
+		if vm.FluNum > 0 {
+			entry["flu_total"] = vm.FluNum
+		}
+	}
+	if stats.MemTotal > 0 {
+		entry["mem_total"] = stats.MemTotal
+	}
+	if stats.HddTotal > 0 {
+		entry["hdd_total"] = stats.HddTotal
+	}
+	entry["cpu_usage"] = stats.CpuUsage
+	entry["mem_usage"] = stats.MemUsage
+	entry["hdd_usage"] = stats.HddUsage
+	// 前端「流量」按 MB 展示，累计上下行合并计入
+	entry["flu_usage"] = int((stats.NetUp + stats.NetDown) / 1024 / 1024)
+	return status
 }

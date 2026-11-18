@@ -4,21 +4,19 @@ package driver
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
+	pathpkg "path"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/model"
-	"github.com/OpenIDCSTeam/HostAgent-Go/internal/security"
 )
 
 // execVirsh 执行 virsh 命令
 func (d *QEMUDriver) execVirsh(args ...string) (string, error) {
 	full := append([]string{"virsh"}, args...)
-	out, _, err := security.SafeExecWithTimeout(full, 30*time.Second)
+	out, err := d.execHostArgs(full, 30*time.Second)
 	return out, err
 }
 
@@ -32,7 +30,7 @@ func (d *QEMUDriver) diskDir() string {
 
 // diskPath 返回虚拟机的系统盘路径
 func (d *QEMUDriver) diskPath(vmUUID string) string {
-	return filepath.Join(d.diskDir(), vmUUID+".qcow2")
+	return pathpkg.Join(d.diskDir(), vmUUID+".qcow2")
 }
 
 // GetVMList 获取虚拟机列表（以 virsh 为准，同步电源状态）
@@ -40,7 +38,7 @@ func (d *QEMUDriver) GetVMList() (map[string]*model.VMConfig, error) {
 	// 优先使用内存中已加载的配置，避免扫描时丢失所有者等业务字段
 	result := d.GetVMSaving()
 
-	out, _, err := security.SafeExecWithTimeout(
+	out, err := d.execHostArgs(
 		[]string{"virsh", "list", "--all", "--name"}, 15*time.Second)
 	if err != nil {
 		return result, nil
@@ -105,25 +103,41 @@ func (d *QEMUDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 		sizeGB = 10
 	}
 
-	if _, err := os.Stat(disk); os.IsNotExist(err) {
+	if !d.hostFileExists(disk) {
 		if err := d.createDiskFromTemplate(cfg, disk, sizeGB); err != nil {
 			return &model.ZMessage{Success: false, Action: "VMCreate",
 				Message: "创建磁盘失败: " + err.Error()}, nil
 		}
 	}
 
+	// 生成 cloud-init NoCloud seed（设置 root 密码/主机名/网络），
+	// 否则 Debian/Ubuntu 云镜像不会配置网卡，也不会启用密码登录。
+	seedISO := d.writeCloudInitSeed(cfg)
+
 	// 生成并写入 domain XML
-	xml := d.buildDomainXML(cfg, disk)
-	xmlPath := filepath.Join(os.TempDir(), "hostagent-"+vmName+".xml")
-	if err := os.WriteFile(xmlPath, []byte(xml), 0644); err != nil {
+	xml := d.buildDomainXML(cfg, disk, seedISO)
+	xmlPath := "/tmp/hostagent-" + vmName + ".xml"
+	if err := d.writeHostFile(xmlPath, xml, 0644); err != nil {
 		return &model.ZMessage{Success: false, Action: "VMCreate",
 			Message: "写入XML失败: " + err.Error()}, nil
 	}
-	defer os.Remove(xmlPath)
+	defer func() { _, _ = d.execHostArgs([]string{"rm", "-f", xmlPath}, 10*time.Second) }()
 
 	if out, err := d.execVirsh("define", xmlPath); err != nil {
-		return &model.ZMessage{Success: false, Action: "VMCreate",
-			Message: fmt.Sprintf("定义虚拟机失败: %v (%s)", err, strings.TrimSpace(out))}, nil
+		// 声卡依赖宿主机音频后端：没有可用后端时 libvirt/QEMU 会拒绝带 <sound> 的域。
+		// 去掉声卡重试一次，保证虚拟机仍能建出来（宁可无声卡，也不能创建失败）。
+		detail := strings.ToLower(out + " " + err.Error())
+		if strings.Contains(detail, "audio") || strings.Contains(detail, "sound") {
+			if fallback := stripSoundCardXML(xml); fallback != xml {
+				if werr := d.writeHostFile(xmlPath, fallback, 0644); werr == nil {
+					out, err = d.execVirsh("define", xmlPath)
+				}
+			}
+		}
+		if err != nil {
+			return &model.ZMessage{Success: false, Action: "VMCreate",
+				Message: fmt.Sprintf("定义虚拟机失败: %v (%s)", err, strings.TrimSpace(out))}, nil
+		}
 	}
 
 	if out, err := d.execVirsh("start", vmName); err != nil {
@@ -150,16 +164,16 @@ func (d *QEMUDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 func (d *QEMUDriver) createDiskFromTemplate(cfg *model.VMConfig, disk string, sizeGB int) error {
 	imagesPath := strings.TrimSpace(d.Config.ImagesPath)
 	if cfg != nil && strings.TrimSpace(cfg.OsName) != "" && imagesPath != "" {
-		imFile := filepath.Join(imagesPath, cfg.OsName)
-		if _, statErr := os.Stat(imFile); statErr == nil {
+		imFile := pathpkg.Join(imagesPath, cfg.OsName)
+		if d.hostFileExists(imFile) {
 			// 首选：以模板为后端创建差量盘
-			if _, _, err := security.SafeExecWithTimeout(
+			if _, err := d.execHostArgs(
 				[]string{"qemu-img", "create", "-f", "qcow2", "-b", imFile, "-F", "qcow2", disk},
 				5*time.Minute); err == nil {
 				return nil
 			}
 			// 回退：完整转换一份独立副本
-			if _, _, err := security.SafeExecWithTimeout(
+			if _, err := d.execHostArgs(
 				[]string{"qemu-img", "convert", "-f", "qcow2", "-O", "qcow2", imFile, disk},
 				10*time.Minute); err == nil {
 				return nil
@@ -168,14 +182,14 @@ func (d *QEMUDriver) createDiskFromTemplate(cfg *model.VMConfig, disk string, si
 	}
 
 	// 无可用模板：创建空盘
-	_, _, err := security.SafeExecWithTimeout(
+	_, err := d.execHostArgs(
 		[]string{"qemu-img", "create", "-f", "qcow2", disk, fmt.Sprintf("%dG", sizeGB)},
 		2*time.Minute)
 	return err
 }
 
 // buildDomainXML 生成 libvirt domain XML
-func (d *QEMUDriver) buildDomainXML(cfg *model.VMConfig, disk string) string {
+func (d *QEMUDriver) buildDomainXML(cfg *model.VMConfig, disk string, seedISO string) string {
 	mem := cfg.MemNum
 	if mem <= 0 {
 		mem = 1024
@@ -234,17 +248,55 @@ func (d *QEMUDriver) buildDomainXML(cfg *model.VMConfig, disk string) string {
       <driver name='qemu' type='qcow2'/>
       <source file='%s'/>
       <target dev='vda' bus='virtio'/>
+    </disk>%s
+    <controller type='ide' index='0'/>
+    <controller type='usb' index='0' model='qemu-xhci'/>
+    <sound model='ich9'/>
+    <disk type='file' device='cdrom'>
+      <target dev='hdc' bus='ide'/>
+      <readonly/>
     </disk>
-%s    <graphics type='vnc' port='-1' autoport='yes' listen='0.0.0.0'/>
+%s    <serial type='pty'>
+      <target port='0'/>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+    <graphics type='vnc' port='-1' autoport='yes' listen='0.0.0.0'/>
   </devices>
-</domain>`, cfg.VmUUID, mem, cpu, disk, netXML.String())
+</domain>`, cfg.VmUUID, mem, cpu, disk, seedDiskXML(seedISO), netXML.String())
+}
+
+// stripSoundCardXML 去掉 <sound .../> 设备行。
+//
+// 宿主机没有可用音频后端时，libvirt 会拒绝定义带声卡的域；
+// 调用方据此在失败后去掉声卡重试，避免整台虚拟机创建失败。
+func stripSoundCardXML(xml string) string {
+	lines := strings.Split(xml, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.Contains(line, "<sound ") {
+			continue
+		}
+		out = append(out, line)
+	}
+	if len(out) == len(lines) {
+		return xml
+	}
+	return strings.Join(out, "\n")
 }
 
 // DeleteVM 删除虚拟机（强制关机 + undefine + 删除磁盘）
 func (d *QEMUDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMessage, error) {
 	_, _ = d.execVirsh("destroy", vmUUID)
 
-	args := []string{"undefine", vmUUID}
+	// seed iso 不属于 libvirt 存储卷，--remove-all-storage 不会清理
+	_, _ = d.execHostArgs([]string{"rm", "-f", d.seedPath(vmUUID)}, 10*time.Second)
+	// 有内部快照的域必须先删快照元数据，否则 undefine 会直接失败
+	args := []string{"undefine", vmUUID, "--snapshots-metadata", "--nvram"}
 	if removeBackup {
 		args = append(args, "--remove-all-storage")
 	}
@@ -252,6 +304,10 @@ func (d *QEMUDriver) DeleteVM(vmUUID string, removeBackup bool) (*model.ZMessage
 		return &model.ZMessage{Success: false, Action: "VMDelete",
 			Message: fmt.Sprintf("删除失败: %v (%s)", err, strings.TrimSpace(out))}, nil
 	}
+
+	// undefine --remove-all-storage 对「差量盘 + 外部 seed」并不总是生效，
+	// 这里显式清理系统盘，避免残留占用磁盘空间。
+	_, _ = d.execHostArgs([]string{"rm", "-f", d.diskPath(vmUUID)}, 15*time.Second)
 
 	d.mu.Lock()
 	delete(d.VmSaving, vmUUID)
@@ -300,15 +356,14 @@ func (d *QEMUDriver) ReinstallVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	_, _ = d.execVirsh("destroy", vmUUID)
 
 	disk := d.diskPath(vmUUID)
-	_ = os.Remove(disk)
+	_, _ = d.execHostArgs([]string{"rm", "-f", disk}, 15*time.Second)
 
 	sizeGB := cfg.HddNum / 1024
 	if sizeGB <= 0 {
 		sizeGB = 10
 	}
-	if _, _, err := security.SafeExecWithTimeout(
-		[]string{"qemu-img", "create", "-f", "qcow2", disk, fmt.Sprintf("%dG", sizeGB)},
-		2*time.Minute); err != nil {
+	// 重装必须重新套用系统模板，不能建空盘，否则 guest 无系统无法启动
+	if err := d.createDiskFromTemplate(cfg, disk, sizeGB); err != nil {
 		return &model.ZMessage{Success: false, Action: "VMReinstall",
 			Message: "重建磁盘失败: " + err.Error()}, nil
 	}
@@ -329,13 +384,18 @@ func (d *QEMUDriver) GetVNCInfo(vmUUID string, ipAddr string) (*model.ZMessage, 
 			Message: "获取VNC信息失败: " + err.Error()}, nil
 	}
 
-	// 形如 vnc://127.0.0.1:5900
+	// virsh domdisplay 返回 vnc://localhost:0，冒号后是「display 编号」而不是端口；
+	// 端口 = 5900 + display。原实现把它当端口，得到 port=0，前端直接判为不可用。
 	display := strings.TrimSpace(out)
 	host := d.Config.ServerAddr
 	port := 5900
 	if idx := strings.LastIndex(display, ":"); idx >= 0 {
-		if p, err := strconv.Atoi(display[idx+1:]); err == nil {
-			port = p
+		if n, err := strconv.Atoi(display[idx+1:]); err == nil {
+			if n >= 5900 {
+				port = n
+			} else {
+				port = 5900 + n
+			}
 		}
 	}
 	if host == "" {
@@ -375,15 +435,15 @@ func (d *QEMUDriver) MountHDD(vmUUID string, hdd *model.SDConfig, mount bool) (*
 		if dir == "" {
 			dir = d.diskDir()
 		}
-		path = filepath.Join(dir, hdd.HddName+".qcow2")
+		path = pathpkg.Join(dir, hdd.HddName+".qcow2")
 	}
 
-	if _, err := os.Stat(path); os.IsNotExist(err) {
+	if !d.hostFileExists(path) {
 		sizeGB := hdd.HddSize / 1024
 		if sizeGB <= 0 {
 			sizeGB = 10
 		}
-		if _, _, err := security.SafeExecWithTimeout(
+		if _, err := d.execHostArgs(
 			[]string{"qemu-img", "create", "-f", "qcow2", path, fmt.Sprintf("%dG", sizeGB)},
 			2*time.Minute); err != nil {
 			return &model.ZMessage{Success: false, Action: "HDDMount",
@@ -408,6 +468,21 @@ func (d *QEMUDriver) MountHDD(vmUUID string, hdd *model.SDConfig, mount bool) (*
 	return &model.ZMessage{Success: true, Action: "HDDMount", Message: "磁盘挂载成功"}, nil
 }
 
+// attachISO 把 ISO 放进 hdc 光驱。
+//
+// 创建虚拟机时已预置 IDE 光驱，优先换介质（运行中也能生效）；
+// 早期创建的虚拟机没有光驱，退回 attach-disk 现场添加。
+func (d *QEMUDriver) attachISO(vmUUID, path string) (string, error) {
+	if out, err := d.execVirsh("change-media", vmUUID, "hdc", path, "--insert"); err == nil {
+		return out, nil
+	}
+	if out, err := d.execVirsh("change-media", vmUUID, "hdc", path, "--update", "--force"); err == nil {
+		return out, nil
+	}
+	return d.execVirsh("attach-disk", vmUUID, path, "hdc",
+		"--type", "cdrom", "--mode", "readonly", "--persistent")
+}
+
 // MountISO 挂载 / 卸载 ISO（cdrom）
 func (d *QEMUDriver) MountISO(vmUUID string, iso *model.IMConfig, mount bool) (*model.ZMessage, error) {
 	if mount {
@@ -417,10 +492,9 @@ func (d *QEMUDriver) MountISO(vmUUID string, iso *model.IMConfig, mount bool) (*
 			if dir == "" {
 				dir = d.Config.ImagesPath
 			}
-			path = filepath.Join(dir, iso.IsoFile)
+			path = pathpkg.Join(dir, iso.IsoFile)
 		}
-		if out, err := d.execVirsh("attach-disk", vmUUID, path, "hdc",
-			"--type", "cdrom", "--mode", "readonly", "--persistent"); err != nil {
+		if out, err := d.attachISO(vmUUID, path); err != nil {
 			return &model.ZMessage{Success: false, Action: "ISOMount",
 				Message: fmt.Sprintf("挂载ISO失败: %v (%s)", err, strings.TrimSpace(out))}, nil
 		}
@@ -444,8 +518,10 @@ func (d *QEMUDriver) MountISO(vmUUID string, iso *model.IMConfig, mount bool) (*
 // CreateBackup 创建备份（基于 libvirt 快照）
 func (d *QEMUDriver) CreateBackup(vmUUID string, tips string) (*model.ZMessage, error) {
 	name := fmt.Sprintf("backup-%s", time.Now().Format("20060102-150405"))
+	// 使用内部快照（含内存/磁盘状态）。--disk-only 会产生外部快照，
+	// libvirt 明确不支持 snapshot-revert 外部快照，备份将无法还原。
 	if out, err := d.execVirsh("snapshot-create-as", vmUUID, name, tips,
-		"--disk-only", "--atomic"); err != nil {
+		"--atomic"); err != nil {
 		return &model.ZMessage{Success: false, Action: "VMBackup",
 			Message: fmt.Sprintf("创建快照失败: %v (%s)", err, strings.TrimSpace(out))}, nil
 	}
@@ -523,12 +599,12 @@ func (d *QEMUDriver) SetupUSB(vmUUID string, info *model.USBInfos, usbKey string
   </source>
 </hostdev>`, info.VidUUID, info.PidUUID)
 
-	xmlPath := filepath.Join(os.TempDir(), "hostagent-usb-"+usbKey+".xml")
-	if err := os.WriteFile(xmlPath, []byte(usbXML), 0644); err != nil {
+	xmlPath := "/tmp/hostagent-usb-" + usbKey + ".xml"
+	if err := d.writeHostFile(xmlPath, usbXML, 0644); err != nil {
 		return &model.ZMessage{Success: false, Action: "USBSetup",
 			Message: "写入XML失败: " + err.Error()}, nil
 	}
-	defer os.Remove(xmlPath)
+	defer func() { _, _ = d.execHostArgs([]string{"rm", "-f", xmlPath}, 10*time.Second) }()
 
 	action := "attach-device"
 	if !add {
@@ -581,6 +657,131 @@ func (d *QEMUDriver) SetPassword(vmUUID string, password string) (*model.ZMessag
 	}
 	d.mu.Unlock()
 	return &model.ZMessage{Success: true, Action: "VMPasswd", Message: "密码修改成功"}, nil
+}
+
+// seedPath cloud-init NoCloud seed ISO 路径
+func (d *QEMUDriver) seedPath(vmUUID string) string {
+	return pathpkg.Join(d.diskDir(), vmUUID+"-seed.iso")
+}
+
+// seedDiskXML 生成 seed ISO 的 cdrom 片段
+func seedDiskXML(seedISO string) string {
+	if seedISO == "" {
+		return ""
+	}
+	// Debian cloud 内核是精简内核，可能没有 AHCI/SATA 驱动，cdrom 在 guest 内不可见；
+	// 用 virtio 磁盘挂载 seed ISO（只读），cloud-init 同样能按 cidata 卷标识别。
+	return fmt.Sprintf(`
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <source file='%s'/>
+      <target dev='vdb' bus='virtio'/>
+      <readonly/>
+    </disk>`, seedISO)
+}
+
+// writeCloudInitSeed 生成 user-data/meta-data/network-config 并打包为 seed ISO。
+// 失败时返回空串，虚拟机仍可启动（只是没有自动配置密码/网络）。
+func (d *QEMUDriver) writeCloudInitSeed(cfg *model.VMConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	tmp := "/tmp/hostagent-ci-" + cfg.VmUUID
+	_, _ = d.execHostArgs([]string{"rm", "-rf", tmp}, 10*time.Second)
+	if _, err := d.execHostArgs([]string{"mkdir", "-p", tmp}, 10*time.Second); err != nil {
+		return ""
+	}
+	defer func() { _, _ = d.execHostArgs([]string{"rm", "-rf", tmp}, 10*time.Second) }()
+
+	password := strings.TrimSpace(cfg.OsPass)
+	user := strings.TrimSpace(cfg.OsUser)
+	if user == "" {
+		user = "root"
+	}
+	// cloud-init 的 netplan 配置在 Debian 云镜像里可能没有 netplan 渲染器，
+	// 直接写 systemd-networkd 配置最稳；同时保留 network-config 供支持的镜像使用。
+	nicName := "en*"
+	staticLine := ""
+	for _, nic := range cfg.NicAll {
+		if strings.TrimSpace(nic.IP4Addr) != "" {
+			prefix := "/24"
+			if strings.TrimSpace(nic.NicMask) != "" {
+				prefix = "/" + strings.TrimPrefix(strings.TrimSpace(nic.NicMask), "/")
+			}
+			gw := strings.TrimSpace(nic.NicGate)
+			staticLine = fmt.Sprintf("Address=%s%s\nGateway=%s\nDNS=%s\n", nic.IP4Addr, prefix, gw, gw)
+			break
+		}
+	}
+	netBody := "[Match]\nName=" + nicName + "\n[Network]\n"
+	if staticLine == "" {
+		netBody += "DHCP=yes\n"
+	} else {
+		netBody += staticLine
+	}
+
+	userData := fmt.Sprintf(`#cloud-config
+hostname: %s
+preserve_hostname: false
+ssh_pwauth: true
+users:
+  - name: %s
+    lock_passwd: false
+chpasswd:
+  expire: false
+  users:
+    - {name: %s, password: '%s', type: text}
+write_files:
+  - path: /etc/systemd/network/20-primary.network
+    permissions: '0644'
+    content: |
+%s
+runcmd:
+  - systemctl enable --now systemd-networkd
+  - systemctl restart systemd-networkd
+  - systemctl enable --now qemu-guest-agent
+`, cfg.VmUUID, user, user, password, indentLines(netBody, "      "))
+
+	metaData := fmt.Sprintf("instance-id: %s\nlocal-hostname: %s\n", cfg.VmUUID, cfg.VmUUID)
+
+	networkConfig := `version: 2
+ethernets:
+  primary:
+    match:
+      name: "en*"
+`
+	if staticLine == "" {
+		networkConfig += "    dhcp4: true\n"
+	} else {
+		networkConfig += "    dhcp4: false\n"
+	}
+	if err := d.writeHostFile(tmp+"/user-data", userData, 0600); err != nil {
+		return ""
+	}
+	if err := d.writeHostFile(tmp+"/meta-data", metaData, 0644); err != nil {
+		return ""
+	}
+	if err := d.writeHostFile(tmp+"/network-config", networkConfig, 0644); err != nil {
+		return ""
+	}
+
+	seed := d.seedPath(cfg.VmUUID)
+	if _, err := d.execHostArgs([]string{
+		"cloud-localds", "--network-config", tmp + "/network-config",
+		seed, tmp + "/user-data", tmp + "/meta-data",
+	}, 60*time.Second); err != nil {
+		return ""
+	}
+	return seed
+}
+
+// indentLines 给多行文本统一加缩进（用于 YAML 块）
+func indentLines(text, prefix string) string {
+	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
+	for i := range lines {
+		lines[i] = prefix + lines[i]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // splitLines 按行拆分并去除空白行

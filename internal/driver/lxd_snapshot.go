@@ -3,6 +3,7 @@ package driver
 import (
 	"encoding/json"
 	"fmt"
+	"path"
 	"strings"
 	"time"
 )
@@ -35,9 +36,30 @@ func (d *LXDDriver) ListSnapshots(vmUUID string) ([]SnapshotInfo, error) {
 		return nil, fmt.Errorf("读取快照列表失败: %v (%s)", err, strings.TrimSpace(out))
 	}
 
+	body := strings.TrimSpace(out)
 	var raw []lxdSnapshot
-	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &raw); err != nil {
-		return nil, fmt.Errorf("解析快照列表失败: %v", err)
+	if err := json.Unmarshal([]byte(body), &raw); err != nil {
+		// LXD 的 /snapshots 集合端点既可能返回对象数组，也可能只返回
+		// 快照 URL 数组（如 "/1.0/instances/xx/snapshots/s1"）。后者按
+		// 字符串数组解析并逐条查询详情，否则会直接报 JSON 类型错误。
+		var refs []string
+		if refErr := json.Unmarshal([]byte(body), &refs); refErr != nil {
+			return nil, fmt.Errorf("解析快照列表失败: %v", err)
+		}
+		for _, ref := range refs {
+			ref = strings.TrimSpace(ref)
+			if ref == "" {
+				continue
+			}
+			item := lxdSnapshot{Name: path.Base(ref)}
+			if detail, detailErr := d.execLXC("query", ref); detailErr == nil {
+				var parsed lxdSnapshot
+				if json.Unmarshal([]byte(strings.TrimSpace(detail)), &parsed) == nil && parsed.Name != "" {
+					item = parsed
+				}
+			}
+			raw = append(raw, item)
+		}
 	}
 
 	snapshots := make([]SnapshotInfo, 0, len(raw))

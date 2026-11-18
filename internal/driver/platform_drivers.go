@@ -31,8 +31,7 @@ func NewLXDDriver(cfg *model.HSConfig) *LXDDriver {
 }
 
 func (d *LXDDriver) GetPower(vmUUID string) string {
-	out, _, err := security.SafeExecWithTimeout(
-		[]string{"lxc", "info", vmUUID}, 10*time.Second)
+	out, err := d.execHostArgs([]string{"lxc", "info", vmUUID}, 10*time.Second)
 	if err != nil {
 		return "未知"
 	}
@@ -54,26 +53,36 @@ func (d *LXDDriver) GetPower(vmUUID string) string {
 // 与 Python 版 LXContainer.HSStatus 一致：优先解析 `lxc info` 的
 // CPU 核数与内存总量；原实现读取输出后直接丢弃，状态恒为空。
 func (d *LXDDriver) GetStatus() (*model.HWStatus, error) {
-	// 远程 LXD：必须通过 SSH 采集对端宿主机状态（与 Python 版一致），
-	// 否则会把 IDCClient 本机资源误报为该主机状态。
+	// 先采集宿主机通用指标（CPU 使用率/内存/磁盘），再用 lxc info 校正总量。
+	// 原实现只解析 lxc info 的 cpu_total/memory_total，硬盘与内存使用率恒为 0，
+	// 前端主机卡片因此显示不出磁盘占用。
+	var hw *model.HWStatus
 	if isRemoteTarget(d.Config) {
-		return d.remoteHWStatus(), nil
+		hw = d.remoteHWStatus()
+	} else {
+		hw = localHWStatus(d.Config)
 	}
-	hw := &model.HWStatus{OnUpdate: time.Now().Unix()}
-	out, _, err := security.SafeExecWithTimeout([]string{"lxc", "info"}, 15*time.Second)
-	if err != nil {
-		return localHWStatus(d.Config), nil
+	if hw == nil {
+		hw = &model.HWStatus{}
+	}
+	hw.OnUpdate = time.Now().Unix()
+
+	out, err := d.execHostArgs([]string{"lxc", "info"}, 15*time.Second)
+	if err != nil || strings.TrimSpace(out) == "" {
+		d.fillRootDisk(hw)
+		return hw, nil
 	}
 
-	var inCPU, inMem bool
 	for _, line := range strings.Split(out, "\n") {
 		trimmed := strings.TrimSpace(line)
 		switch {
-		case strings.HasPrefix(trimmed, "cpu_total") || strings.Contains(trimmed, "cpu_total"):
-			inCPU = true
-			fmt.Sscanf(strings.TrimSpace(strings.TrimPrefix(trimmed, "cpu_total:")), "%d", &hw.CpuTotal)
+		case strings.Contains(trimmed, "cpu_total"):
+			var cpus int
+			fmt.Sscanf(strings.TrimSpace(strings.TrimPrefix(trimmed, "cpu_total:")), "%d", &cpus)
+			if cpus > 0 {
+				hw.CpuTotal = cpus
+			}
 		case strings.HasPrefix(trimmed, "memory_total"):
-			inMem = true
 			var memBytes int64
 			fmt.Sscanf(strings.TrimSpace(strings.TrimPrefix(trimmed, "memory_total:")), "%d", &memBytes)
 			if memBytes > 0 {
@@ -81,9 +90,53 @@ func (d *LXDDriver) GetStatus() (*model.HWStatus, error) {
 			}
 		}
 	}
-	_ = inCPU
-	_ = inMem
+	d.fillRootDisk(hw)
 	return hw, nil
+}
+
+// rootDiskUsage 采集根分区容量（KB→MB）。
+//
+// Docker/LXD 的存储路径常常留空或使用 snap 私有目录（如 /var/lib/lxd 不存在），
+// hostDiskPaths 取不到任何可用路径时磁盘占用就恒为 0；此时回退到根分区。
+func (b *BaseDriver) rootDiskUsage() (totalMB, usedMB int, ok bool) {
+	out, err := b.execHostArgs([]string{"df", "-kP", "/"}, 10*time.Second)
+	if err != nil {
+		return 0, 0, false
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) < 2 {
+		return 0, 0, false
+	}
+	fields := strings.Fields(lines[len(lines)-1])
+	if len(fields) < 3 {
+		return 0, 0, false
+	}
+	var totalKB, usedKB int64
+	if _, e1 := fmt.Sscanf(fields[1], "%d", &totalKB); e1 != nil {
+		return 0, 0, false
+	}
+	if _, e2 := fmt.Sscanf(fields[2], "%d", &usedKB); e2 != nil {
+		return 0, 0, false
+	}
+	return int(totalKB / 1024), int(usedKB / 1024), true
+}
+
+// fillRootDisk 在未采集到磁盘总量时用根分区兜底
+func (b *BaseDriver) fillRootDisk(hw *model.HWStatus) {
+	if hw == nil || hw.HddTotal > 0 {
+		return
+	}
+	total, used, ok := b.rootDiskUsage()
+	if !ok {
+		return
+	}
+	hw.HddTotal, hw.HddUsage = total, used
+	if hw.DiskUsage == nil {
+		hw.DiskUsage = map[string][]int{}
+	}
+	if _, exists := hw.DiskUsage["system"]; !exists {
+		hw.DiskUsage["system"] = []int{total, used}
+	}
 }
 
 // ============================================================
@@ -98,7 +151,7 @@ func NewDockerDriver(cfg *model.HSConfig) *DockerDriver {
 }
 
 func (d *DockerDriver) GetPower(vmUUID string) string {
-	out, _, err := security.SafeExecWithTimeout(
+	out, err := d.execHostArgs(
 		[]string{"docker", "inspect", "--format={{.State.Status}}", vmUUID},
 		10*time.Second)
 	if err != nil {
@@ -121,39 +174,54 @@ func (d *DockerDriver) GetPower(vmUUID string) string {
 // NCPU / MemTotal / Containers 等真实字段。
 // 原实现把「运行中容器数」当成 CPU 核数写入 CpuTotal，属于字段错位。
 func (d *DockerDriver) GetStatus() (*model.HWStatus, error) {
-	// 远程 Docker：通过 SSH 采集对端宿主机状态（与 Python 版一致），
-	// 否则会把 IDCClient 本机资源误报为该主机状态。
+	// 先采集宿主机通用指标（CPU 使用率/内存/磁盘），再用 docker info 校正总量。
+	// 原实现只取 docker info 的 NCPU/MemTotal，内存使用率、硬盘容量与磁盘明细
+	// 全为 0，前端因此看不到 Docker 主机的内存占用和硬盘占用。
+	var hw *model.HWStatus
 	if isRemoteTarget(d.Config) {
-		return d.remoteHWStatus(), nil
+		hw = d.remoteHWStatus()
+	} else {
+		hw = localHWStatus(d.Config)
 	}
-	hw := &model.HWStatus{OnUpdate: time.Now().Unix()}
-	out, _, err := security.SafeExecWithTimeout([]string{
+	if hw == nil {
+		hw = &model.HWStatus{}
+	}
+	hw.OnUpdate = time.Now().Unix()
+
+	out, err := d.execHostArgs([]string{
 		"docker", "info", "--format",
 		"{{.NCPU}}|{{.MemTotal}}|{{.Containers}}|{{.ContainersRunning}}|{{.OperatingSystem}}",
 	}, 10*time.Second)
-	if err != nil {
-		// 本地 docker CLI 不可用时回退本机采集
-		return localHWStatus(d.Config), nil
+	if err != nil || strings.TrimSpace(out) == "" {
+		d.fillRootDisk(hw)
+		return hw, nil
 	}
 
 	parts := strings.Split(strings.TrimSpace(out), "|")
 	if len(parts) >= 2 {
-		fmt.Sscanf(strings.TrimSpace(parts[0]), "%d", &hw.CpuTotal)
+		var cpus int
+		fmt.Sscanf(strings.TrimSpace(parts[0]), "%d", &cpus)
+		if cpus > 0 {
+			hw.CpuTotal = cpus
+		}
 		var memBytes int64
 		fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &memBytes)
 		if memBytes > 0 {
 			hw.MemTotal = int(memBytes / 1024 / 1024)
 		}
 	}
-	if len(parts) >= 5 {
+	// 操作系统名不是 CPU 型号：保留 SSH/local 采集到的真实型号，
+	// 仅当型号为空时用发行版名称兜底。
+	if hw.CpuModel == "" && len(parts) >= 5 {
 		hw.CpuModel = strings.TrimSpace(parts[4])
 	}
+	d.fillRootDisk(hw)
 	return hw, nil
 }
 
 func (d *DockerDriver) GetVMList() (map[string]*model.VMConfig, error) {
-	out, _, err := security.SafeExecWithTimeout(
-		[]string{"docker", "ps", "-a", "--format={{.ID}}\t{{.Names}}\t{{.Status}}"},
+	out, err := d.execHostArgs(
+		[]string{"docker", "ps", "-a", "--format={{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Image}}"},
 		10*time.Second)
 	if err != nil {
 		return d.BaseDriver.GetVMList()
@@ -169,20 +237,34 @@ func (d *DockerDriver) GetVMList() (map[string]*model.VMConfig, error) {
 			continue
 		}
 		id, name, status := parts[0], parts[1], parts[2]
-		if cfg, ok := vms[id]; ok {
+		image := ""
+		if len(parts) >= 4 {
+			image = strings.TrimSpace(parts[3])
+		}
+		// 本项目以「容器名 = vm_uuid」纳管容器，docker ps 输出的 ID 只是
+		// 运行时标识；若按 ID 建索引，同一容器会被重复登记一次，
+		// 且后续 docker inspect/start 传 ID 与内存中的 vm_uuid 不一致。
+		key := name
+		if key == "" {
+			key = id
+		}
+		if cfg, ok := vms[key]; ok {
 			if strings.HasPrefix(status, "Up") {
 				cfg.VmFlag = model.VMPowerStarted
 			} else if strings.HasPrefix(status, "Exited") {
 				cfg.VmFlag = model.VMPowerStopped
 			}
+			if cfg.OsName == "" && image != "" {
+				cfg.OsName = image
+			}
 		} else {
 			cfg := model.NewVMConfig()
-			cfg.VmUUID = id
-			cfg.OsName = name
+			cfg.VmUUID = key
+			cfg.OsName = image
 			if strings.HasPrefix(status, "Up") {
 				cfg.VmFlag = model.VMPowerStarted
 			}
-			vms[id] = cfg
+			vms[key] = cfg
 		}
 	}
 	return vms, nil
@@ -336,7 +418,7 @@ func (d *QEMUDriver) GetStatus() (*model.HWStatus, error) {
 }
 
 func (d *QEMUDriver) GetPower(vmUUID string) string {
-	out, _, err := security.SafeExecWithTimeout(
+	out, err := d.execHostArgs(
 		[]string{"virsh", "domstate", vmUUID}, 10*time.Second)
 	if err != nil {
 		return "未知"
@@ -370,7 +452,7 @@ func (d *QEMUDriver) PowerControl(vmUUID string, action model.VMPowers) (*model.
 	default:
 		return d.BaseDriver.PowerControl(vmUUID, action)
 	}
-	_, _, err := security.SafeExecWithTimeout(cmd, 30*time.Second)
+	_, err := d.execHostArgs(cmd, 30*time.Second)
 	if err != nil {
 		return &model.ZMessage{Success: false, Action: "VMPowers", Message: err.Error()}, nil
 	}
@@ -404,14 +486,32 @@ func NewWorkstationDriver(cfg *model.HSConfig) *WorkstationDriver {
 }
 
 // GetPower 查询电源状态。
-// vmrest 的电源端点返回 JSON 字符串（"poweredOn"/"poweredOff"/"suspended"），
+// vmrest 的电源端点返回 JSON 对象（{"power_state":"poweredOn"}），
 // 且路径中的 id 是 vmrest 内部 id，需先用虚拟机名反查（与 selectVid 一致）。
+//
+// vmrest 的状态依赖它自己维护的 VM 通道：虚拟机在 Workstation GUI 里启动/重启
+// 时，它会长时间停留在 resetting 甚至直接报未知。这类情况用 vmrun list 复核，
+// 否则前端会一直显示「未知」。
 func (d *WorkstationDriver) GetPower(vmUUID string) string {
 	vmID := vmUUID
 	if id := d.selectVid(vmUUID); id != "" {
 		vmID = id
 	}
-	return d.wsGetPower(vmID)
+	return d.powerOf(vmID, vmUUID)
+}
+
+// powerOf 解析电源状态：vmrest 返回中间态/未知时用 vmrun list 复核。
+// 列表同步（GetVMList）、电源操作回写也必须走这里，否则同一轮调度里
+// 「GetPower 判定运行中 → Crontab 用 wsGetPower 判定重启中」会互相覆盖，
+// 表现为数据库是 STARTED、驱动内存却停在 ON_WAKE。
+func (d *WorkstationDriver) powerOf(vmID, vmName string) string {
+	state := d.wsGetPower(vmID)
+	if state == "未知" || state == "启动中" || state == "重启中" {
+		if d.vmrunIsRunning(vmName) {
+			return "运行中"
+		}
+	}
+	return state
 }
 
 // ============================================================
@@ -426,33 +526,44 @@ func NewVirtualBoxDriver(cfg *model.HSConfig) *VirtualBoxDriver {
 }
 
 func (d *VirtualBoxDriver) GetPower(vmUUID string) string {
-	out, _, err := security.SafeExecWithTimeout(
-		[]string{"VBoxManage", "showvminfo", vmUUID, "--machinereadable"},
-		10*time.Second)
+	out, err := d.execVBox("showvminfo", vmUUID, "--machinereadable")
 	if err != nil {
 		return "未知"
 	}
+	return parseVBoxVMState(out)
+}
+
+// parseVBoxVMState 从 showvminfo --machinereadable 解析电源状态。
+//
+// Windows 下 VBoxManage 输出为 CRLF，行尾的 \r 会让
+// `VMState="running"` 解析成 `running"\r`，状态恒为「未知」，
+// 因此必须先 TrimSpace 再比对。
+func parseVBoxVMState(out string) string {
 	for _, line := range strings.Split(out, "\n") {
-		if strings.HasPrefix(line, "VMState=") {
-			state := strings.Trim(strings.TrimPrefix(line, "VMState="), "\"")
-			switch state {
-			case "running":
-				return "运行中"
-			case "poweroff":
-				return "已关机"
-			case "paused":
-				return "已暂停"
-			case "saved":
-				return "已暂停"
-			}
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "VMState=") {
+			continue
+		}
+		switch strings.Trim(strings.TrimPrefix(line, "VMState="), "\"") {
+		case "running":
+			return "运行中"
+		case "poweroff":
+			return "已关机"
+		case "paused", "saved":
+			return "已暂停"
 		}
 	}
 	return "未知"
 }
 
+// GetVMList 列出 VirtualBox 虚拟机。
+//
+// 统一以**虚拟机名**作为唯一键：创建路径用 `createvm --name <vm_uuid>` 注册虚拟机，
+// 数据库与接口参数里的 vm_uuid 也是这个名字；若这里改用 `list vms` 输出的 UUID 作键，
+// 同一台虚拟机会在内存里出现两条记录（一条名字、一条 UUID），
+// 前端列表重复、电源状态也互相覆盖。UUID 键的历史记录就地迁移到名字键。
 func (d *VirtualBoxDriver) GetVMList() (map[string]*model.VMConfig, error) {
-	out, _, err := security.SafeExecWithTimeout(
-		[]string{"VBoxManage", "list", "vms"}, 10*time.Second)
+	out, err := d.execVBox("list", "vms")
 	if err != nil {
 		return d.BaseDriver.GetVMList()
 	}
@@ -468,21 +579,45 @@ func (d *VirtualBoxDriver) GetVMList() (map[string]*model.VMConfig, error) {
 			continue
 		}
 		name := strings.Trim(parts[0], "\"")
-		uuid := strings.Trim(parts[1], "{}")
-		if cfg, ok := result[uuid]; ok {
-			cfg.OsName = name
-		} else {
-			cfg := model.NewVMConfig()
-			cfg.VmUUID = uuid
-			cfg.OsName = name
-			result[uuid] = cfg
+		if name == "" {
+			continue
 		}
+		uuid := strings.Trim(parts[1], "{}")
+
+		cfg, ok := result[name]
+		if !ok && uuid != "" {
+			// 兼容旧数据：把 UUID 键迁移到名字键
+			if legacy, exists := result[uuid]; exists && legacy != nil {
+				delete(result, uuid)
+				legacy.VmUUID = name
+				result[name] = legacy
+				cfg, ok = legacy, true
+			}
+		}
+		if ok && cfg != nil {
+			if cfg.OsName == "" {
+				cfg.OsName = name
+			}
+			continue
+		}
+
+		cfg = model.NewVMConfig()
+		cfg.VmUUID = name
+		cfg.OsName = name
+		result[name] = cfg
 	}
 	// 批量获取状态
-	for uuid := range result {
-		power := d.GetPower(uuid)
-		if power == "运行中" {
-			result[uuid].VmFlag = model.VMPowerStarted
+	for key, cfg := range result {
+		if cfg == nil {
+			continue
+		}
+		switch d.GetPower(key) {
+		case "运行中":
+			cfg.VmFlag = model.VMPowerStarted
+		case "已关机":
+			cfg.VmFlag = model.VMPowerStopped
+		case "已暂停":
+			cfg.VmFlag = model.VMPowerSuspend
 		}
 	}
 	return result, nil

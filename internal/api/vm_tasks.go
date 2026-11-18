@@ -231,6 +231,13 @@ func (e *vmTaskExecutor) createVM(ctx context.Context, t *task.Task) error {
 		return fmt.Errorf("保存虚拟机配置失败: %w", err)
 	}
 
+	// 同名虚拟机重建后清掉历史删除墓碑：
+	// 墓碑按 (主机, 虚拟机名) 唯一，残留的 done 墓碑会让下一次删除直接跳过平台操作。
+	if err := e.app.DB.DeleteTombstone(t.HsName, cfg.VmUUID); err != nil {
+		e.taskLog(t, "创建虚拟机").VM(cfg.VmUUID, cfg.OsName).Err(err).
+			Warn("清理历史删除墓碑失败: %v", err)
+	}
+
 	// 创建成功后才扣减配额：失败路径无需回滚
 	if user := taskQuotaUser(t); user != "" {
 		if err := e.app.QuotaSvc.DeductQuota(user, cfg); err != nil {

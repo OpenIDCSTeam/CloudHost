@@ -170,7 +170,7 @@ type VNCProxyServer struct {
 
 // allowedOrigins VNC允许的Origin白名单。
 //
-// 必须覆盖前端实际使用的所有端口：Vite 开发端口为 5171
+// 必须覆盖前端实际使用的所有端口：Vite 开发端口为 5179
 // （见 FrontPage/vite.config.ts），后端 1881；5183/5173 为历史端口，
 // 保留以免影响已在用的本地环境。
 //
@@ -178,11 +178,11 @@ type VNCProxyServer struct {
 // 表现为「控制台打不开 / 终端连不上」，且只在浏览器控制台可见。
 var allowedOrigins = map[string]bool{
 	"http://localhost:1881": true,
-	"http://localhost:5171": true,
+	"http://localhost:5179": true,
 	"http://localhost:5173": true,
 	"http://localhost:5183": true,
 	"http://127.0.0.1:1881": true,
-	"http://127.0.0.1:5171": true,
+	"http://127.0.0.1:5179": true,
 	"http://127.0.0.1:5173": true,
 	"http://127.0.0.1:5183": true,
 }
@@ -558,6 +558,9 @@ type SSHConnInfo struct {
 	User     string `json:"user"`
 	Password string `json:"password"`
 	UseKey   bool   `json:"use_key,omitempty"`
+	// Command 非空时在 SSH 会话中直接执行该命令（容器平台 TTY 控制台），
+	// 为空时打开交互式登录 shell（主机终端）。
+	Command string `json:"command,omitempty"`
 }
 
 // SSHTerminalServer SSH终端WebSocket代理服务（ttyd功能）
@@ -751,7 +754,15 @@ func (s *SSHTerminalServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	stdoutPipe, _ := session.StdoutPipe()
 	stderrPipe, _ := session.StderrPipe()
 
-	if err := session.Shell(); err != nil {
+	if connInfo.Command != "" {
+		// 容器平台控制台：把 docker exec / lxc exec 作为会话命令执行。
+		// 仍保留 PTY，交互式命令（sh/bash）可正常收发。
+		if err := session.Start(connInfo.Command); err != nil {
+			log.Printf("[ssh-terminal] 启动控制台命令失败: %v", err)
+			return
+		}
+		go func() { _ = session.Wait() }()
+	} else if err := session.Shell(); err != nil {
 		log.Printf("[ssh-terminal] 启动Shell失败: %v", err)
 		return
 	}

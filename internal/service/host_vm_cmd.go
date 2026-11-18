@@ -29,6 +29,9 @@ func DecodeVMConfig(vmJSON string) (*model.VMConfig, error) {
 	if err := json.Unmarshal([]byte(trimmed), &vm); err != nil {
 		return nil, err
 	}
+	// 这里不做 NewVMConfig 的默认值填充（会覆盖合法空值），
+	// 只补齐流量字段：历史记录的 flu_rst_mode 为空，需按旧版 flu_rst 迁移。
+	vm.NormalizeTraffic(strings.TrimSpace(vm.FluRstMode) == "")
 	return &vm, nil
 }
 

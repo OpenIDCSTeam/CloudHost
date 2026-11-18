@@ -113,8 +113,8 @@ func run(cmd *cobra.Command, args []string) error {
 		Detail("db_level", logger.ParseLevel(logDBLevel).String()).
 		Info("HostAgent 启动，监听端口 %d", port)
 
-	// 输出初始Token；首次启动时先生成并持久化，
-	// 避免用空口令创建管理员（空口令无法登录，会造成系统不可用）
+	// API Bearer Token：首次启动时生成并持久化。
+	// 该 Token 只用于 API / CLI / 插件调用，不能作为 Web 登录凭据。
 	token := app.SystemSvc.GetToken()
 	if strings.TrimSpace(token) == "" {
 		generated, genErr := app.SystemSvc.ResetToken()
@@ -124,9 +124,13 @@ func run(cmd *cobra.Command, args []string) error {
 		token = generated
 	}
 
-	// 初始化默认管理员账号（首次启动时创建，初始密码为 Bearer Token）
-	if err := db.InitDefaultAdmin(token); err != nil {
-		app.Logger.Event("server", "初始化管理员").Err(err).Warn("初始化默认管理员失败: %v", err)
+	// 首次部署的初始化（创建管理员密码、设置系统标题）在 Web 初始化页完成，
+	// 不再用 Bearer Token 作为管理员初始口令。
+	initialized, initErr := db.SystemInitialized()
+	if initErr != nil {
+		app.Logger.Event("server", "初始化状态").Err(initErr).Warn("读取初始化状态失败: %v", initErr)
+	} else if !initialized {
+		app.Logger.Event("server", "初始化状态").Info("系统尚未初始化，请访问 Web 页面完成初始化")
 	}
 
 	// 诊断端点：只监听回环地址，用于抓取 goroutine 栈定位接口卡死。
@@ -155,7 +159,12 @@ func run(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  数据库: %s\n", db.Dialect())
 	fmt.Printf("  访问地址: http://localhost:%d\n", port)
 	fmt.Printf("  日志级别: 终端=%s 文件=%s 数据库=%s\n", consoleLevel, fileLevel, dbLevel)
-	fmt.Printf("  Bearer Token: %s\n", token)
+	fmt.Printf("  API Token: %s\n", token)
+	if initErr == nil && !initialized {
+		fmt.Printf("  初始化状态: 待初始化（请在浏览器打开访问地址创建管理员密码与系统标题）\n")
+	} else {
+		fmt.Printf("  初始化状态: 已完成\n")
+	}
 	fmt.Printf("========================================\n\n")
 
 	// 启动VNC代理服务（默认 6080）

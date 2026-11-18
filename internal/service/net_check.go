@@ -86,6 +86,18 @@ func (s *IPAllocService) NetCheck(hsName string, vm *model.VMConfig) error {
 	hasV4Pool := hasPoolVers(pools, "ipv4")
 	hasV6Pool := hasPoolVers(pools, "ipv6")
 
+	// 套餐网络配额的已用量：该侧地址数到上限后不再自动分配对应协议，
+	// 否则「每张网卡都自动配 IP」会把套餐里的公网/内网数量撑破。
+	usage := vm.NetUsage()
+	usedV4 := map[string]int{"pub": usage.PubV4, "nat": usage.PriV4}
+	usedV6 := map[string]int{"pub": usage.PubV6, "nat": usage.PriV6}
+	side := func(nicType string) string {
+		if nicType == "pub" {
+			return "pub"
+		}
+		return "nat"
+	}
+
 	for _, name := range names {
 		nic := vm.NicAll[name]
 		needV4 := strings.TrimSpace(nic.IP4Addr) == ""
@@ -98,10 +110,16 @@ func (s *IPAllocService) NetCheck(hsName string, vm *model.VMConfig) error {
 		}
 
 		nicType := nic.EffectiveNicType()
+		kind := side(nicType)
+		limitV4 := vm.NetLimitV4(nicType)
+		limitV6 := vm.NetLimitV6(nicType)
+		allowV4 := limitV4 == nil || usedV4[kind] < *limitV4
+		allowV6 := limitV6 == nil || usedV6[kind] < *limitV6
 
 		// 分配 IPv4：失败即返回错误（与 Python 一致）。
-		// 例外：主机只配置了 IPv6 池时属于纯 IPv6 网络，跳过 IPv4 分配。
-		if needV4 && (hasV4Pool || !hasV6Pool) {
+		// 例外：主机只配置了 IPv6 池时属于纯 IPv6 网络，跳过 IPv4 分配；
+		// 套餐已不允许该侧 IPv4 时同样跳过，避免超出配额。
+		if needV4 && allowV4 && (hasV4Pool || !hasV6Pool) {
 			ip, gate, mask, ok := allocateIP(pools, "ipv4", nicType, allocated)
 			if !ok {
 				return fmt.Errorf(
@@ -116,13 +134,14 @@ func (s *IPAllocService) NetCheck(hsName string, vm *model.VMConfig) error {
 				nic.NicMask = mask
 			}
 			allocated[ip] = true
+			usedV4[kind]++
 			if len(dns) > 0 {
 				nic.DNSAddr = append([]string(nil), dns...)
 			}
 		}
 
 		// 分配 IPv6：失败不报错（与 Python 一致）
-		if needV6 {
+		if needV6 && allowV6 {
 			if ip, _, prefix, ok := allocateIP(pools, "ipv6", nicType, allocated); ok {
 				nic.IP6Addr = ip
 				// 前缀长度供爱快下发 DHCPv6 静态绑定与前端展示；
@@ -131,6 +150,7 @@ func (s *IPAllocService) NetCheck(hsName string, vm *model.VMConfig) error {
 					nic.IP6Prefix = n
 				}
 				allocated[ip] = true
+				usedV6[kind]++
 			}
 		}
 

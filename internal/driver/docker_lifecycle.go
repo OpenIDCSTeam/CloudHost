@@ -8,14 +8,12 @@ import (
 	"time"
 
 	"github.com/OpenIDCSTeam/HostAgent-Go/internal/model"
-	"github.com/OpenIDCSTeam/HostAgent-Go/internal/security"
 )
 
-// execDocker 执行 docker 命令
+// execDocker 执行 docker 命令（远程主机通过 SSH 在远端执行）
 func (d *DockerDriver) execDocker(args ...string) (string, error) {
 	full := append([]string{"docker"}, args...)
-	out, _, err := security.SafeExecWithTimeout(full, 5*time.Minute)
-	return out, err
+	return d.execHostArgs(full, 5*time.Minute)
 }
 
 // ScanVMs 扫描并同步容器列表
@@ -81,12 +79,8 @@ func (d *DockerDriver) PowerControl(vmUUID string, action model.VMPowers) (*mode
 // SupportsGracefulShutdown docker stop 先发 SIGTERM，超时才 kill。
 func (d *DockerDriver) SupportsGracefulShutdown() bool { return true }
 
-// CreateVM 创建容器
-func (d *DockerDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
-	image := cfg.OsName
-	if image == "" {
-		image = "alpine:latest"
-	}
+// containerCreateArgs 生成 docker create 参数（创建与还原共用）
+func (d *DockerDriver) containerCreateArgs(cfg *model.VMConfig, image string) []string {
 	cpu := cfg.CpuNum
 	if cpu <= 0 {
 		cpu = 1
@@ -95,18 +89,27 @@ func (d *DockerDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
 	if mem <= 0 {
 		mem = 512
 	}
-
 	args := []string{
 		"create", "--name", cfg.VmUUID,
 		"--cpus", fmt.Sprintf("%d", cpu),
 		"--memory", fmt.Sprintf("%dm", mem),
 	}
-	if d.Config.NetworkNat != "" {
-		args = append(args, "--network", d.Config.NetworkNat)
+	if net := strings.TrimSpace(d.Config.NetworkNat); net != "" {
+		args = append(args, "--network", net)
 	} else {
 		args = append(args, "--network", "bridge")
 	}
-	args = append(args, image)
+	return append(args, image)
+}
+
+// CreateVM 创建容器
+func (d *DockerDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error) {
+	image := cfg.OsName
+	if image == "" {
+		image = "alpine:latest"
+	}
+
+	args := d.containerCreateArgs(cfg, image)
 
 	if out, err := d.execDocker(args...); err != nil {
 		return &model.ZMessage{Success: false, Action: "VMCreate",
@@ -230,7 +233,12 @@ func (d *DockerDriver) CreateBackup(vmUUID string, tips string) (*model.ZMessage
 
 // DeleteBackup 删除备份（删除镜像）
 func (d *DockerDriver) DeleteBackup(vmUUID string, backupName string) (*model.ZMessage, error) {
-	if out, err := d.execDocker("rmi", backupName); err != nil {
+	name, err := sanitizeFileName(backupName)
+	if err != nil || !strings.HasPrefix(name, vmUUID+"-backup-") {
+		return &model.ZMessage{Success: false, Action: "RMBackup",
+			Message: "备份名称无效或与目标虚拟机不匹配"}, nil
+	}
+	if out, err := d.execDocker("rmi", name); err != nil {
 		return &model.ZMessage{Success: false, Action: "RMBackup",
 			Message: fmt.Sprintf("删除镜像失败: %v (%s)", err, strings.TrimSpace(out))}, nil
 	}
@@ -248,6 +256,44 @@ func (d *DockerDriver) DeleteBackup(vmUUID string, backupName string) (*model.ZM
 	return &model.ZMessage{Success: true, Action: "RMBackup", Message: "备份删除成功"}, nil
 }
 
+// RestoreBackup 还原备份：用备份镜像重建同名容器
+//
+// 原实现未覆盖该方法，落回基类的「解压目录到 SystemPath」逻辑，
+// 与 docker commit 生成的镜像备份完全不匹配（必然失败或恢复空目录）。
+func (d *DockerDriver) RestoreBackup(vmUUID string, backupName string) (*model.ZMessage, error) {
+	name, err := sanitizeFileName(backupName)
+	if err != nil || !strings.HasPrefix(name, vmUUID+"-backup-") {
+		return &model.ZMessage{Success: false, Action: "Restores",
+			Message: "备份名称无效或与目标虚拟机不匹配"}, nil
+	}
+
+	d.mu.RLock()
+	src, ok := d.VmSaving[vmUUID]
+	d.mu.RUnlock()
+	cfg := &model.VMConfig{VmUUID: vmUUID, CpuNum: 1, MemNum: 512}
+	if ok && src != nil {
+		cp := *src
+		cfg = &cp
+	}
+
+	// 删除现有容器后按备份镜像重建
+	_, _ = d.execDocker("rm", "-f", vmUUID)
+	if out, err := d.execDocker(d.containerCreateArgs(cfg, name)...); err != nil {
+		return &model.ZMessage{Success: false, Action: "Restores",
+			Message: fmt.Sprintf("按备份镜像重建容器失败: %v (%s)", err, strings.TrimSpace(out))}, nil
+	}
+	if out, err := d.execDocker("start", vmUUID); err != nil {
+		return &model.ZMessage{Success: false, Action: "Restores",
+			Message: fmt.Sprintf("恢复后启动容器失败: %v (%s)", err, strings.TrimSpace(out))}, nil
+	}
+
+	cfg.VmFlag = model.VMPowerStarted
+	d.mu.Lock()
+	d.VmSaving[vmUUID] = cfg
+	d.mu.Unlock()
+	return &model.ZMessage{Success: true, Action: "Restores", Message: "备份还原成功"}, nil
+}
+
 // SetPassword 设置容器密码（docker exec chpasswd）
 func (d *DockerDriver) SetPassword(vmUUID string, password string) (*model.ZMessage, error) {
 	if d.GetPower(vmUUID) != "运行中" {
@@ -262,7 +308,7 @@ func (d *DockerDriver) SetPassword(vmUUID string, password string) (*model.ZMess
 	}
 	d.mu.RUnlock()
 
-	out, err := runWithStdin(
+	out, err := d.execHostProc(
 		[]string{"docker", "exec", "-i", vmUUID, "chpasswd"},
 		user+":"+password+"\n", 30*time.Second)
 	if err != nil {

@@ -172,7 +172,7 @@ func windowsInstall(name string) ([][]string, error) {
 	case "virtualbox":
 		return winget("Oracle.VirtualBox"), nil
 	case "memu":
-		return nil, errors.New("MuMu 需手动安装：https://mumu.163.com/，安装后开启 ADB")
+		return nil, errors.New("逍遥模拟器需手动安装：https://www.memuplay.com/，安装后在主机配置填写 memuc.exe 所在目录（默认 %APPDATA%\\Microvirt\\MEmu）")
 	}
 	return nil, fmt.Errorf("Windows 暂不支持安装 %s", name)
 }

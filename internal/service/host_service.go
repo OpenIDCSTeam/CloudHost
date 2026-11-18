@@ -801,6 +801,15 @@ func rowToHSConfig(row *data.HSConfigRow) (*model.HSConfig, error) {
 	cfg.NMemPrice = row.NMemPrice
 	cfg.NHddPrice = row.NHddPrice
 	cfg.NNetPrice = row.NNetPrice
+	cfg.NDatPrice = row.NDatPrice
+	cfg.NSpeedUPrice = row.NSpeedUPrice
+	cfg.NSpeedDPrice = row.NSpeedDPrice
+	cfg.NFluPrice = row.NFluPrice
+	cfg.NNatPrice = row.NNatPrice
+	cfg.NWebPrice = row.NWebPrice
+	cfg.NBakPrice = row.NBakPrice
+	cfg.NIp4Price = row.NIp4Price
+	cfg.NIp6Price = row.NIp6Price
 	// 反向代理 / VNC 对外配置。
 	// 这里不做「空 -> direct」的补默认值：默认语义在使用处处理，
 	// 否则导出/恢复往返时会把空值改成 direct，导致配置对比不一致。
@@ -830,6 +839,31 @@ func rowToHSConfig(row *data.HSConfigRow) (*model.HSConfig, error) {
 	}
 	if row.ServerPlan != "" && row.ServerPlan != "{}" {
 		_ = json.Unmarshal([]byte(row.ServerPlan), &cfg.ServerPlan)
+	}
+	// 套餐里的流量字段走的是 json.Unmarshal 的默认路径，不会经过 VMConfigFromJSON，
+	// 这里补一次归一化：没有 flu_rst_mode 的按旧版 flu_rst 迁移。
+	for _, plan := range cfg.ServerPlan {
+		if plan == nil {
+			continue
+		}
+		plan.NormalizeTraffic(plan.FluRstMode == "")
+	}
+
+	// 允许改配 / 功能控制 / 链接权限
+	cfg.AllowReconfigure = strings.TrimSpace(row.AllowReconfigure)
+	if cfg.AllowReconfigure != model.AllowReconfigureNo {
+		cfg.AllowReconfigure = model.AllowReconfigureYes
+	}
+	cfg.DisabledTabs = []string{}
+	if row.DisabledTabs != "" && row.DisabledTabs != "[]" {
+		_ = json.Unmarshal([]byte(row.DisabledTabs), &cfg.DisabledTabs)
+		if cfg.DisabledTabs == nil {
+			cfg.DisabledTabs = []string{}
+		}
+	}
+	cfg.LinkPermission = row.LinkPermission
+	if cfg.LinkPermission < 0 || cfg.LinkPermission > 0xFFFF {
+		cfg.LinkPermission = 0
 	}
 
 	return cfg, nil
@@ -978,10 +1012,20 @@ func hsConfigToRow(cfg *model.HSConfig) (*data.HSConfigRow, error) {
 	ipAddrMapsJSON, _ := json.Marshal(cfg.IPAddrMaps)
 	ipAddrDDNSJSON, _ := json.Marshal(cfg.IPAddrDDNS)
 	serverPlanJSON, _ := json.Marshal(cfg.ServerPlan)
+	disabledTabs := cfg.DisabledTabs
+	if disabledTabs == nil {
+		// nil 会被序列化成 null，读取端还得再兜一次，这里直接落 []
+		disabledTabs = []string{}
+	}
+	disabledTabsJSON, _ := json.Marshal(disabledTabs)
 
 	enableHost := 0
 	if cfg.EnableHost {
 		enableHost = 1
+	}
+	allowReconfigure := cfg.AllowReconfigure
+	if allowReconfigure != model.AllowReconfigureNo {
+		allowReconfigure = model.AllowReconfigureYes
 	}
 
 	return &data.HSConfigRow{
@@ -1015,17 +1059,29 @@ func hsConfigToRow(cfg *model.HSConfig) (*data.HSConfigRow, error) {
 		NMemPrice:  cfg.NMemPrice,
 		NHddPrice:  cfg.NHddPrice,
 		NNetPrice:  cfg.NNetPrice,
+		NDatPrice:    cfg.NDatPrice,
+		NSpeedUPrice: cfg.NSpeedUPrice,
+		NSpeedDPrice: cfg.NSpeedDPrice,
+		NFluPrice:    cfg.NFluPrice,
+		NNatPrice:    cfg.NNatPrice,
+		NWebPrice:    cfg.NWebPrice,
+		NBakPrice:    cfg.NBakPrice,
+		NIp4Price:    cfg.NIp4Price,
+		NIp6Price:    cfg.NIp6Price,
 		SystemMaps: string(systemMapsJSON),
 		ImagesMaps: string(imagesMapsJSON),
 		PublicAddr: string(publicAddrJSON),
 		ExtendData: string(extendDataJSON),
 		IPAddrMaps: string(ipAddrMapsJSON),
 		IPAddrDDNS: string(ipAddrDDNSJSON),
-		ServerPlan: string(serverPlanJSON),
-		ProxyMode:  cfg.ProxyMode,
-		RelayAddr:  cfg.RelayAddr,
-		VncIP:      cfg.VncIP,
-		VncWan:     cfg.VncWan,
+		ServerPlan:       string(serverPlanJSON),
+		ProxyMode:        cfg.ProxyMode,
+		RelayAddr:        cfg.RelayAddr,
+		VncIP:            cfg.VncIP,
+		VncWan:           cfg.VncWan,
+		AllowReconfigure: allowReconfigure,
+		DisabledTabs:     string(disabledTabsJSON),
+		LinkPermission:   cfg.LinkPermission,
 	}, nil
 }
 

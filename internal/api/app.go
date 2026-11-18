@@ -277,6 +277,8 @@ func (app *App) registerRoutes() {
 	r.GET("/api/i18n/languages", app.handleI18nLanguages)
 	r.GET("/api/i18n/translations/:lang_code", app.handleI18nTranslations)
 	r.GET("/api/public/turnstile-config", app.handleTurnstileConfig)
+	r.GET("/api/public/site-info", app.handleSiteInfo)     // 初始化状态与系统标题（无需认证）
+	r.POST("/api/system/init", app.handleInitializeSystem) // 首次部署初始化（无需认证，仅无管理员时可用）
 
 	// ============================================================
 	// 需要认证的路由（启用 CSRF 防护）
@@ -370,6 +372,9 @@ func (app *App) registerRoutes() {
 		api.POST("/server/ops/:hs_name/files/rename", adminMW, app.handleHostFileRename)
 		api.DELETE("/server/ops/:hs_name/files", adminMW, app.handleHostFileDelete)
 
+		// 平台运行环境自检与修复（MEmu：防火墙服务 + Hyper-V 磁盘 ACL）
+		api.POST("/server/repair/:hs_name", adminMW, app.handleHostRepair)
+
 		// 虚拟机管理
 		api.GET("/client/detail/:hs_name", app.handleVMList)
 		api.GET("/client/detail/:hs_name/:vm_uuid", app.handleVMDetail)
@@ -379,7 +384,12 @@ func (app *App) registerRoutes() {
 		api.POST("/client/powers/:hs_name/:vm_uuid", app.handleVMPowers)
 		api.POST("/client/reinstall/:hs_name/:vm_uuid", app.handleVMReinstall)
 		api.GET("/client/remote/:hs_name/:vm_uuid", app.handleVMRemote)
+		// 容器类平台（Docker/LXD/SmolVM）的命令行控制台票据
+		api.GET("/client/console/:hs_name/:vm_uuid", app.handleVMConsole)
+		api.POST("/client/console/:hs_name/:vm_uuid", app.handleVMConsole)
 		api.GET("/client/screenshot/:hs_name/:vm_uuid", app.handleVMScreenshot)
+		// 切换系统盘控制器（镜像与控制器不匹配导致开机蓝屏时的修复入口）
+		api.POST("/client/diskbus/:hs_name/:vm_uuid", app.handleVMDiskBus)
 		api.POST("/client/password/:hs_name/:vm_uuid", app.handleVMPassword)
 		api.GET("/client/status/:hs_name/:vm_uuid", app.handleVMStatus)
 		api.POST("/client/scaner/:hs_name", app.handleVMScan)
