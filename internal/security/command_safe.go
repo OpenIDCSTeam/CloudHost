@@ -3,6 +3,7 @@
 package security
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -186,6 +187,33 @@ func SafeExecWithTimeoutContext(parent context.Context, args []string, timeout t
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	return SafeExec(ctx, args)
+}
+
+// SafeExecBytesWithTimeout 与 SafeExecWithTimeout 相同，但以 []byte 返回输出。
+//
+// 用于二进制输出（如 adb screencap 的原始帧缓冲）：string 转换会整块复制，
+// 1280x720 每帧 3.7MB 在高帧率捕获时会产生大量无谓的垃圾。
+// stderr 单独收集，出错时随错误返回，便于定位问题。
+func SafeExecBytesWithTimeout(args []string, timeout time.Duration) ([]byte, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("命令参数为空")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			return stdout.Bytes(), fmt.Errorf("命令执行失败 [%s]: %w", strings.Join(args, " "), err)
+		}
+		return stdout.Bytes(), fmt.Errorf("命令执行失败 [%s]: %w（%s）",
+			strings.Join(args, " "), err, truncate(detail, 200))
+	}
+	return stdout.Bytes(), nil
 }
 
 // SafeShellExec 安全执行 shell 命令（带注入检查，仅限白名单命令）
