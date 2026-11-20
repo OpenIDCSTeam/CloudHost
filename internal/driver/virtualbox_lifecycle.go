@@ -230,6 +230,11 @@ func (d *VirtualBoxDriver) PowerControl(vmUUID string, action model.VMPowers) (*
 		if state == "运行中" {
 			return ok("虚拟机已在运行")
 		}
+		// 老版本创建的虚拟机固件恒为 BIOS，UEFI/GPT 系统盘会一直停在
+		// "No bootable medium found!"。关机状态下按磁盘分区表校正固件。
+		if state == "已关机" {
+			d.vboxAlignFirmware(vmUUID)
+		}
 		args = []string{"startvm", vmUUID, "--type", "headless"}
 	case model.VMPowerSClose:
 		if state == "已关机" {
@@ -392,6 +397,17 @@ func (d *VirtualBoxDriver) CreateVM(cfg *model.VMConfig) (*model.ZMessage, error
 		d.vboxDiscardVM(vmName)
 		return &model.ZMessage{Success: false, Action: "VMCreate",
 			Message: fmt.Sprintf("挂载磁盘失败: %v (%s)", err, strings.TrimSpace(out))}, nil
+	}
+
+	// 固件必须与系统盘分区表匹配：ostype 默认给的是 BIOS，而 GPT/UEFI 云镜像
+	// 在 BIOS 下开机会直接报 "No bootable medium found!"。克隆出的系统盘已经是
+	// VDI，直接读分区表决定固件，避免「创建成功但永远开不了机」。
+	if vdiBootFirmware(diskPath) == vboxFirmwareEFI {
+		if out, err := d.execVBox("modifyvm", vmName, "--firmware", vboxFirmwareEFI); err != nil {
+			d.vboxDiscardVM(vmName)
+			return &model.ZMessage{Success: false, Action: "VMCreate",
+				Message: fmt.Sprintf("设置 UEFI 固件失败: %v (%s)", err, strings.TrimSpace(out))}, nil
+		}
 	}
 
 	// 启动：PowerControl 把失败信息放在 ZMessage 里（error 恒为 nil），
