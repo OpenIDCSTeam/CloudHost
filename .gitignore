@@ -30,3 +30,7 @@ Thumbs.db
 /bin/caddy
 /bin/caddy.exe
 static
+
+# 本地调试临时文件（探针脚本、验证产物、二进制备份）
+/tmp*
+hostagent.exe.bak
